@@ -342,12 +342,11 @@ public:
         ModDescription = STR("Free movement + mouse look during NPC dialogue.");
     }
 
-    // We install post-hooks on every state-check that STALKER 2 might use to gate the pause
-    // menu during dialogue. During a lie window, they all return false, so whatever branch
-    // the game takes when it processes the pause action, it doesn't refuse.
+    // We install a post-hook on PC::IsInStaticDialog. Earlier attempt to also hook
+    // IsInteractionInProgress + IsInCinematic caused a launch crash — those UFunction
+    // paths likely aren't resolvable on the PC class and RegisterHook doesn't fail
+    // gracefully on missing functions. Sticking to the one hook that's proven to register.
     std::pair<int,int> m_hookIsInDialog{-1,-1};
-    std::pair<int,int> m_hookInteractionInProgress{-1,-1};
-    std::pair<int,int> m_hookInCinematic{-1,-1};
     void InstallStateLieHooks() {
         UnrealScriptFunctionCallable postFalse =
             [](UnrealScriptFunctionCallableContext& ctx, void*) {
@@ -358,12 +357,6 @@ public:
         m_hookIsInDialog = UObjectGlobals::RegisterHook(
             StringType(STR("/Script/Stalker2.PC:IsInStaticDialog")),
             UnrealScriptFunctionCallable{}, postFalse, nullptr);
-        m_hookInteractionInProgress = UObjectGlobals::RegisterHook(
-            StringType(STR("/Script/Stalker2.PC:IsInteractionInProgress")),
-            UnrealScriptFunctionCallable{}, postFalse, nullptr);
-        m_hookInCinematic = UObjectGlobals::RegisterHook(
-            StringType(STR("/Script/Stalker2.PC:IsInCinematic")),
-            UnrealScriptFunctionCallable{}, postFalse, nullptr);
     }
 
     auto on_unreal_init() -> void override {
@@ -372,15 +365,13 @@ public:
         LoadStalker2Settings();
         InstallStateLieHooks();
         Output::send<LogLevel::Verbose>(
-            STR("[ImmDlg] unreal init (mouse hook={}, xinput hook={}, mouseSens={}, padSens={}, invertY={}, dlgHook={},{} interactHook={},{} cineHook={},{})\n"),
+            STR("[ImmDlg] unreal init (mouse hook={}, xinput hook={}, mouseSens={}, padSens={}, invertY={}, dlgHook={},{})\n"),
             g_rawReady      ? STR("ok") : STR("FAILED"),
             g_xinputHooked  ? STR("ok") : STR("SKIPPED"),
             g_mouseSensCoef.load(),
             g_padSensCoef.load(),
             g_invertMouseY.load() ? STR("true") : STR("false"),
-            m_hookIsInDialog.first, m_hookIsInDialog.second,
-            m_hookInteractionInProgress.first, m_hookInteractionInProgress.second,
-            m_hookInCinematic.first, m_hookInCinematic.second);
+            m_hookIsInDialog.first, m_hookIsInDialog.second);
     }
 
     UObject* GetPawn() {
