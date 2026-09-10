@@ -729,22 +729,29 @@ public:
     void ResolveStateDataOffsets() {
         if (m_stateDataProp) return;
         if (!m_animInstance) return;
-        FProperty* sp = m_animInstance->GetPropertyByNameInChain(STR("state_data"));
-        if (!sp) return;
+        // Try both snake_case (dump form) and PascalCase (UE C++ form).
+        const wchar_t* sdNames[] = { STR("state_data"), STR("StateData") };
+        FProperty* sp = nullptr;
+        for (auto* n : sdNames) { sp = m_animInstance->GetPropertyByNameInChain(n); if (sp) break; }
+        if (!sp) {
+            Output::send<LogLevel::Verbose>(STR("[ImmDlg]   state_data prop NOT FOUND under any casing\n"));
+            return;
+        }
         m_stateDataProp = sp;
         FStructProperty* sfp = static_cast<FStructProperty*>(sp);
         UScriptStruct* stru = sfp->GetStruct();
         if (!stru) return;
-        auto lookup = [&](const wchar_t* nm) -> int32_t {
-            FProperty* p = stru->CustomFindProperty(FName(nm));
+        auto lookup = [&](const wchar_t* nameA, const wchar_t* nameB) -> int32_t {
+            FProperty* p = stru->CustomFindProperty(FName(nameA));
+            if (!p) p = stru->CustomFindProperty(FName(nameB));
             return p ? p->GetOffset_ForInternal() : -1;
         };
-        m_offWalkingOverride   = lookup(STR("walking_override"));
-        m_offJoggingOverride   = lookup(STR("jogging_override"));
-        m_offSprintingOverride = lookup(STR("sprinting_override"));
-        m_offCrouchingOverride = lookup(STR("crouching_override"));
-        m_offCombatMoveIdle    = lookup(STR("combat_move_idle"));
-        m_offCombatCrouchIdle  = lookup(STR("combat_crouch_idle"));
+        m_offWalkingOverride   = lookup(STR("walking_override"),   STR("WalkingOverride"));
+        m_offJoggingOverride   = lookup(STR("jogging_override"),   STR("JoggingOverride"));
+        m_offSprintingOverride = lookup(STR("sprinting_override"), STR("SprintingOverride"));
+        m_offCrouchingOverride = lookup(STR("crouching_override"), STR("CrouchingOverride"));
+        m_offCombatMoveIdle    = lookup(STR("combat_move_idle"),   STR("CombatMoveIdle"));
+        m_offCombatCrouchIdle  = lookup(STR("combat_crouch_idle"), STR("CombatCrouchIdle"));
         Output::send<LogLevel::Verbose>(
             STR("[ImmDlg]   state_data offsets: walk={}, jog={}, sprint={}, crouch={}, combatMoveIdle={}, combatCrouchIdle={}\n"),
             m_offWalkingOverride, m_offJoggingOverride, m_offSprintingOverride,
