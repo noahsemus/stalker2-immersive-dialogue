@@ -851,34 +851,47 @@ public:
             if (it == m_locomotionOffsets.end()) return;
             *reinterpret_cast<bool*>(base + it->second) = val;
         };
-        float speed = moving ? 1.5f : 0.0f; // "walking" speed magnitude
-        writeF(STR("Velocity"),         speed);
         writeF(STR("MovementPlayRate"), moving ? 1.0f : 0.0f);
         writeF(STR("LegIKAlpha"),       1.0f);
         writeB(STR("bLegIKEnabled"),    true);
         writeB(STR("bEnablePlayRateCurves"), true);
-        if (moving) {
-            // Direction angle in degrees. atan2(strafe, fwd) — forward=0, right=+90, back=180, left=-90.
-            double angRad = std::atan2(inputStrafe, inputFwd);
-            float  angDeg = (float)(angRad * 180.0 / 3.14159265358979323846);
-            writeF(STR("AngleDirection"),   angDeg);
-            writeF(STR("ClampedDirection"), angDeg);
-            // Also write the byte enum. Guessing the standard UE ECardinalDirection ordering:
-            // 0=Forward, 1=Right, 2=Back, 3=Left. Quantize the angle into 4 cardinals.
-            uint8_t dirEnum;
-            const double pi = 3.14159265358979323846;
-            if      (angRad > -pi/4 && angRad <  pi/4) dirEnum = 0; // Forward
-            else if (angRad >=  pi/4 && angRad < 3*pi/4) dirEnum = 1; // Right
-            else if (angRad >= 3*pi/4 || angRad < -3*pi/4) dirEnum = 2; // Back
-            else                                        dirEnum = 3; // Left
-            auto writeByte = [&](const wchar_t* name, uint8_t val) {
-                auto it = m_locomotionOffsets.find(name);
-                if (it == m_locomotionOffsets.end()) return;
-                *reinterpret_cast<uint8_t*>(base + it->second) = val;
-            };
-            writeByte(STR("Direction"),   dirEnum);
-            writeByte(STR("BPDirection"), dirEnum);
+        if (!moving) {
+            writeF(STR("Velocity"), 0.0f);
+            return;
         }
+        // Direction/velocity values below come from the outside-dialogue ground-truth dump:
+        //   - Velocity is cm/s (~150 forward walk; backward walk is much slower ~85)
+        //   - Direction is a BITMASK enum: 1=Fwd, 2=Back, 4=Left, 8=Right
+        //   - BPDirection is 4-way: 1=Fwd, 2=Back, 3=Left, 4=Right
+        //   - AngleDirection is atan2(strafe, fwd) in degrees
+        double angRad = std::atan2(inputStrafe, inputFwd);
+        float  angDeg = (float)(angRad * 180.0 / 3.14159265358979323846);
+        writeF(STR("AngleDirection"),   angDeg);
+        writeF(STR("ClampedDirection"), angDeg);
+        // Match game's natural backward-walk being slower than forward. Use magnitude of the
+        // forward component to interpolate: fully forward = 150, fully back = 85, strafe = 150.
+        float velCms = 150.0f;
+        if (inputFwd < 0.0) {
+            // 0..1 how "backward" we are (1 = straight back, 0 = pure strafe)
+            float backT = (float)(-inputFwd);
+            if (backT > 1.0f) backT = 1.0f;
+            velCms = 150.0f * (1.0f - backT) + 85.0f * backT;
+        }
+        writeF(STR("Velocity"), velCms);
+
+        uint8_t dirBitmask, bpDir;
+        const double pi = 3.14159265358979323846;
+        if      (angRad > -pi/4 && angRad <  pi/4)     { dirBitmask = 1; bpDir = 1; } // Fwd
+        else if (angRad >=  pi/4 && angRad < 3*pi/4)   { dirBitmask = 8; bpDir = 4; } // Right
+        else if (angRad >= 3*pi/4 || angRad < -3*pi/4) { dirBitmask = 2; bpDir = 2; } // Back
+        else                                            { dirBitmask = 4; bpDir = 3; } // Left
+        auto writeByte = [&](const wchar_t* name, uint8_t val) {
+            auto it = m_locomotionOffsets.find(name);
+            if (it == m_locomotionOffsets.end()) return;
+            *reinterpret_cast<uint8_t*>(base + it->second) = val;
+        };
+        writeByte(STR("Direction"),   dirBitmask);
+        writeByte(STR("BPDirection"), bpDir);
     }
 
     // Drive shadow_data. bShouldUseBHLocomotion is the key — off = shadow uses static pose,
@@ -994,8 +1007,7 @@ public:
         w(STR("bCutscene"),  false);
         w(STR("bInCombat"),  false);
         w(STR("bCrouching"), false);
-        // Override inputs — if the struct has them, force walking on / others off.
-        w(STR("bWalkingOverride"),   moving);
+        // Override inputs — bWalkingOverride left OFF (ground truth: 0 outside dialogue).
         w(STR("bJoggingOverride"),   false);
         w(STR("bSprintingOverride"), false);
         w(STR("bCrouchingOverride"), false);
@@ -1017,8 +1029,10 @@ public:
         write(m_offInAirOverride,     false);
         write(m_offCombatMoveIdle,    false);
         write(m_offCombatCrouchIdle,  false);
-        // Walking-override drives the state-machine transition to walk state.
-        write(m_offWalkingOverride,   moving);
+        // Ground-truth dump: bWalkingOverride is 0 when walking works outside dialogue.
+        // Forcing it to 1 was masking the underlying walk state — leave it off; the raw
+        // bMoving/bWalking writes below carry the state transition.
+        write(m_offWalkingOverride,   false);
         // Also force the raw state flags from the parent AnimStateData struct, in case the
         // anim graph reads those directly rather than through the *_override inputs.
         write(m_offAlive,      true);
@@ -1199,7 +1213,9 @@ public:
             double r = yawDeg * 3.14159265358979323846 / 180.0;
             double fX = std::cos(r), fY = std::sin(r);
             double rX = -std::sin(r), rY = std::cos(r);
-            if (fwd    != 0.0) AddMovement(pawn, fX, fY, (float)(fwd    * WALK_SCALE));
+            // Backward walking is naturally ~55% of forward speed in-game — mirror that.
+            float fwdScale = (fwd < 0.0) ? (WALK_SCALE * 0.55f) : WALK_SCALE;
+            if (fwd    != 0.0) AddMovement(pawn, fX, fY, (float)(fwd    * fwdScale));
             if (strafe != 0.0) AddMovement(pawn, rX, rY, (float)(strafe * WALK_SCALE));
         }
         MaybeFireFootstep(moving);
@@ -1208,7 +1224,9 @@ public:
         if (inDlg) {
             ForceAnimState(moving);
             ForceLocomotionData(moving, fwd, strafe);
-            ForceShadowData(moving, fwd, strafe);
+            // ForceShadowData removed — ground-truth dump shows shadow.bBHLoco=0 and
+            // PlayRate=0 outside dialogue when the shadow animates fine, so writing
+            // those to 1 was breaking the shadow rather than driving it.
         }
         // Comparison logging: dumps current anim-instance values every 500ms in BOTH dialogue
         // and non-dialogue. Walk outside dialogue -> see what "correct walking" looks like;
