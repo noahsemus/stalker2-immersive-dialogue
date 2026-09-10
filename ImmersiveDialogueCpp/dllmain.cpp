@@ -553,25 +553,13 @@ public:
         m_ftAkComponent->ProcessEvent(m_ftSetSwitchFn, &p);
     }
 
-    // Fire a synthetic footstep sound via the pawn's AkComponent, at walk cadence.
-    // Set MovementType + SurfaceMaterial + ArmorType + Wetness switches by UObject pointer
-    // so Wwise's switch container picks the right variant (walk on dirt, no sprint, etc.).
-    void MaybeFireFootstep(bool moving) {
-        if (!m_ftFootstepEvent || !m_ftAkComponent || !m_ftPostEventFn) return;
-        if (!moving) { m_ftNextStepAtMs = 0; return; }
-        uint64_t now = GetTickCount64();
-        if (m_ftNextStepAtMs == 0) { m_ftNextStepAtMs = now + FT_STEP_INTERVAL_MS / 2; return; }
-        if (now < m_ftNextStepAtMs) return;
-        m_ftNextStepAtMs = now + FT_STEP_INTERVAL_MS;
-
-        SetAkSwitch(m_swWalk);
-        SetAkSwitch(m_swMedium);
-        SetAkSwitch(m_swDirt);
-        SetAkSwitch(m_swDry);
-
-        alignas(8) char buf[128] = {};
-        *reinterpret_cast<UObject**>(buf) = m_ftFootstepEvent;
-        m_ftAkComponent->ProcessEvent(m_ftPostEventFn, buf);
+    // Footstep timer is now DISABLED — with the walk animation actually playing
+    // (state_data.bWalkingOverride writes finally lit it up), the game's own foot-plant
+    // anim notifies fire native footsteps at correct cadence + volume. Our fixed 450ms
+    // timer would only double them and cause the "sound doesn't line up" symptom.
+    // The probe + Ak component lookup stays (harmless), just the fire path skipped.
+    void MaybeFireFootstep(bool /*moving*/) {
+        // no-op
     }
 
     // Walking anim in dialogue: attack via direct AnimInstance UPROPERTY writes.
@@ -712,6 +700,10 @@ public:
         }
         // Write state_data override bools.
         ForceStateDataOverrides(moving);
+        // Also drive locomotion_data and shadow_data with the same walking-state pattern —
+        // upper-body twist + shadow motion come from those data structs.
+        ForceStructWalkState(m_locomotionDataProp, m_locomotionOffsets, moving);
+        ForceStructWalkState(m_shadowDataProp,     m_shadowOffsets,     moving);
     }
     FProperty* m_dialogDataProp = nullptr;
 
@@ -720,6 +712,10 @@ public:
     // bool members INSIDE it. We resolve their inner offsets once via UScriptStruct's
     // CustomFindProperty and then write per-frame.
     FProperty* m_stateDataProp = nullptr;
+    FProperty* m_locomotionDataProp = nullptr;
+    FProperty* m_shadowDataProp = nullptr;
+    std::map<StringType, int32_t> m_locomotionOffsets;  // name -> offset (parents included)
+    std::map<StringType, int32_t> m_shadowOffsets;      // name -> offset (parents included)
     // Direct children of AnimPlayerStateData (see log dump: state_data.b* off=N).
     int32_t m_offWalkingOverride = -1;   // bWalkingOverride
     int32_t m_offJoggingOverride = -1;   // bJoggingOverride
@@ -791,21 +787,72 @@ public:
             m_offWalkingOverride, m_offJoggingOverride, m_offSprintingOverride,
             m_offCrouchingOverride, m_offCombatMoveIdle, m_offCombatCrouchIdle);
 
-        // Diagnostic: dump EVERY property on the state_data struct (name + offset). Walk
-        // parent structs too so inherited members show up. This tells us exactly what
-        // the names are so future lookups match.
-        int printed = 0;
-        UStruct* s = stru;
-        while (s) {
-            for (FProperty* p : TFieldRange<FProperty>(s, EFieldIterationFlags::None)) {
-                if (!p) continue;
-                Output::send<LogLevel::Verbose>(STR("[ImmDlg]     state_data.{} off={}\n"),
-                                                 p->GetName(), p->GetOffset_ForInternal());
-                if (++printed >= 40) break;
+        // Also resolve + dump locomotion_data and shadow_data properties, same technique.
+        auto resolveAndDump = [&](const wchar_t* n1, const wchar_t* n2, const wchar_t* label,
+                                  FProperty*& outProp, std::map<StringType, int32_t>& outMap) {
+            FProperty* pp = m_animInstance->GetPropertyByNameInChain(n1);
+            if (!pp) pp = m_animInstance->GetPropertyByNameInChain(n2);
+            if (!pp) {
+                Output::send<LogLevel::Verbose>(STR("[ImmDlg]   {} prop NOT FOUND\n"), label);
+                return;
             }
-            if (printed >= 40) break;
-            s = s->GetSuperStruct();
-        }
+            outProp = pp;
+            FStructProperty* sfp2 = static_cast<FStructProperty*>(pp);
+            UScriptStruct* stru2 = sfp2->GetStruct();
+            if (!stru2) return;
+            UStruct* walker2 = stru2;
+            int printed2 = 0;
+            while (walker2) {
+                for (FProperty* p : TFieldRange<FProperty>(walker2, EFieldIterationFlags::None)) {
+                    if (!p) continue;
+                    outMap[p->GetName()] = p->GetOffset_ForInternal();
+                    if (printed2 < 40) {
+                        Output::send<LogLevel::Verbose>(STR("[ImmDlg]     {}.{} off={}\n"),
+                                                         label, p->GetName(), p->GetOffset_ForInternal());
+                        printed2++;
+                    }
+                }
+                walker2 = walker2->GetSuperStruct();
+            }
+        };
+        resolveAndDump(STR("locomotion_data"), STR("LocomotionData"), STR("locomotion_data"),
+                       m_locomotionDataProp, m_locomotionOffsets);
+        resolveAndDump(STR("shadow_data"),     STR("ShadowData"),     STR("shadow_data"),
+                       m_shadowDataProp, m_shadowOffsets);
+    }
+
+    // Apply the same set of "walking, alive, not-in-air/combat/cutscene" writes to any
+    // struct whose name→offset map we resolved. Locomotion + shadow both benefit from
+    // knowing "walking + moving, everything else off" so their anim states follow.
+    void ForceStructWalkState(FProperty* structProp,
+                              const std::map<StringType, int32_t>& offMap,
+                              bool moving) {
+        if (!structProp || !m_animInstance) return;
+        uint8_t* base = structProp->ContainerPtrToValuePtr<uint8_t>(m_animInstance);
+        if (!base) return;
+        auto w = [&](const wchar_t* name, bool val) {
+            auto it = offMap.find(name);
+            if (it == offMap.end()) return;
+            *reinterpret_cast<bool*>(base + it->second) = val;
+        };
+        w(STR("bAlive"),     true);
+        w(STR("bMoving"),    moving);
+        w(STR("bWalking"),   moving);
+        w(STR("bIsWalking"), moving);
+        w(STR("bIsMoving"),  moving);
+        w(STR("bRunning"),   false);
+        w(STR("bSprinting"), false);
+        w(STR("bJogging"),   false);
+        w(STR("bInAir"),     false);
+        w(STR("bCutscene"),  false);
+        w(STR("bInCombat"),  false);
+        w(STR("bCrouching"), false);
+        // Override inputs — if the struct has them, force walking on / others off.
+        w(STR("bWalkingOverride"),   moving);
+        w(STR("bJoggingOverride"),   false);
+        w(STR("bSprintingOverride"), false);
+        w(STR("bCrouchingOverride"), false);
+        w(STR("bInAirOverride"),     false);
     }
 
     void ForceStateDataOverrides(bool moving) {
