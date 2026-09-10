@@ -923,21 +923,47 @@ public:
             }
         }
 
-        // Log dummy_animation / dummy_blueprint values on the main AnimInstance. These are
-        // Read-Write props on AnimInstanceBase. If dummy_animation is a walk-forward asset
-        // that displays in dialogue, we've found the source of forward-only visibility.
+        // Both AnimGraphNode_LinkedAnimLayer nodes are 200-byte struct properties on the
+        // main AnimInstance. Dump each as 8-byte pointer slots; any slot that looks like
+        // a UAnimInstance* is the currently-linked layer. Scan every 500ms in/out of
+        // dialogue to see if it swaps.
         if (m_animInstance) {
-            FProperty* da = m_animInstance->GetPropertyByNameInChain(STR("dummy_animation"));
-            FProperty* db = m_animInstance->GetPropertyByNameInChain(STR("dummy_blueprint"));
-            UObject* daVal = nullptr;
-            UObject* dbVal = nullptr;
-            if (da) { UObject** s = da->ContainerPtrToValuePtr<UObject*>(m_animInstance); if (s) daVal = *s; }
-            if (db) { UObject** s = db->ContainerPtrToValuePtr<UObject*>(m_animInstance); if (s) dbVal = *s; }
-            Output::send<LogLevel::Verbose>(
-                STR("[ImmDlg] MAIN-AI inDlg={} dummy_animation={} dummy_blueprint={}\n"),
-                inDlg ? 1 : 0,
-                daVal ? daVal->GetFullName() : StringType(STR("(null)")),
-                dbVal ? dbVal->GetFullName() : StringType(STR("(null)")));
+            const wchar_t* slotNames[] = {
+                STR("AnimGraphNode_LinkedAnimLayer"), STR("AnimGraphNode_LinkedAnimLayer_1")
+            };
+            for (auto* nm : slotNames) {
+                FProperty* p = m_animInstance->GetPropertyByNameInChain(nm);
+                if (!p) continue;
+                uint8_t* base = p->ContainerPtrToValuePtr<uint8_t>(m_animInstance);
+                if (!base) continue;
+                int sz = p->GetSize();
+                for (int off = 0; off + 8 <= sz; off += 8) {
+                    UObject* candidate = *reinterpret_cast<UObject**>(base + off);
+                    if (!candidate) continue;
+                    // Sanity: pointer must be aligned and in reasonable range.
+                    if ((reinterpret_cast<uintptr_t>(candidate) & 0x7) != 0) continue;
+                    if (reinterpret_cast<uintptr_t>(candidate) < 0x10000) continue;
+                    // Try to read the class pointer safely — if it explodes, we're not
+                    // pointing at a UObject. In practice this is a raw read, so
+                    // guard by only calling GetClassPrivate on known safe pointers.
+                    // Cheap heuristic: check whether it matches any of our known
+                    // AnimInstances or the mesh.
+                    if (candidate != m_animInstance &&
+                        candidate != m_bhAnimInstance &&
+                        candidate != m_dummyAnimInstance &&
+                        candidate != m_shadowAnimInstance &&
+                        candidate != m_pawnMesh) continue;
+                    const wchar_t* label = STR("?");
+                    if      (candidate == m_animInstance)      label = STR("MAIN");
+                    else if (candidate == m_bhAnimInstance)    label = STR("BH");
+                    else if (candidate == m_dummyAnimInstance) label = STR("DUMMY");
+                    else if (candidate == m_shadowAnimInstance) label = STR("SHADOW");
+                    else if (candidate == m_pawnMesh)          label = STR("MESH");
+                    Output::send<LogLevel::Verbose>(
+                        STR("[ImmDlg] LAYER-SLOT inDlg={} node={} off={} -> {}\n"),
+                        inDlg ? 1 : 0, nm, off, label);
+                }
+            }
         }
     }
 
@@ -961,6 +987,10 @@ public:
     std::map<StringType, int32_t> m_bhStateOffs;
     std::map<StringType, int32_t> m_bhLocoOffs;
     bool m_bhTriedResolve = false;
+    // Also cache dummy_C (the "dummy" placeholder anim instance) — it's a candidate for
+    // being swapped in during dialogue. If GetLinkedAnimLayerInstanceByClass(dummy) returns
+    // non-null in dialogue, we've found the layer STALKER 2 links to disable strafe.
+    UObject* m_dummyAnimInstance = nullptr;
 
     void ResolveShadowChain(UObject* pawn) {
         if (m_shadowAnimInstance) return;
@@ -1026,13 +1056,15 @@ public:
         StringType pawnPath = (sp != StringType::npos) ? pawnFull.substr(sp + 1) : pawnFull;
         UObject* found = nullptr;
         UObjectGlobals::ForEachUObject([&](UObject* obj, int32_t, int32_t) -> LoopAction {
-            if (!obj || found) return LoopAction::Continue;
+            if (!obj) return LoopAction::Continue;
             UClass* cls = obj->GetClassPrivate();
             if (!cls) return LoopAction::Continue;
-            if (cls->GetName() != StringType(STR("AnimBP_player_bh_C"))) return LoopAction::Continue;
+            StringType clsName = cls->GetName();
             StringType full = obj->GetFullName();
             if (full.find(pawnPath) == StringType::npos) return LoopAction::Continue;
-            found = obj;
+            if (!found && clsName == StringType(STR("AnimBP_player_bh_C"))) found = obj;
+            if (!m_dummyAnimInstance && clsName == StringType(STR("AnimBP_player_dummy_C")))
+                m_dummyAnimInstance = obj;
             return LoopAction::Continue;
         });
         if (!found) {
@@ -1040,6 +1072,9 @@ public:
             return;
         }
         m_bhAnimInstance = found;
+        Output::send<LogLevel::Verbose>(
+            STR("[ImmDlg] dummy anim instance cached: {}\n"),
+            m_dummyAnimInstance ? m_dummyAnimInstance->GetFullName() : StringType(STR("(missing)")));
         // Same struct names as main AnimInstance.
         const wchar_t* sdNames[] = { STR("state_data"), STR("StateData") };
         for (auto* n : sdNames) { m_bhStateProp = m_bhAnimInstance->GetPropertyByNameInChain(n); if (m_bhStateProp) break; }
@@ -1663,6 +1698,86 @@ public:
             readStateBoolByName(STR("bIsLeftHandBusy")),
             dialogBit
         );
+
+        // ALL-INSTANCES probe: dump the same 11 key fields on all 4 anim instances (main,
+        // dummy, bh, shadow) plus dialog_data.dialog. One log line per instance per tick,
+        // so ONE test session reveals which instance has values differing from what we
+        // expect. No more "run the test again to check one more field" loops.
+        auto readInStruct = [&](UObject* inst, FProperty* structProp, const wchar_t* fieldName,
+                                int mode) -> float {
+            // mode: 0=bool, 1=byte, 2=float. Returns -999 if inst/prop/field missing.
+            if (!inst || !structProp) return -999.0f;
+            uint8_t* base = structProp->ContainerPtrToValuePtr<uint8_t>(inst);
+            if (!base) return -999.0f;
+            FStructProperty* sfp = static_cast<FStructProperty*>(structProp);
+            UScriptStruct* stru = sfp->GetStruct();
+            FProperty* p = nullptr;
+            UStruct* w = stru;
+            while (w && !p) {
+                for (FProperty* pp : TFieldRange<FProperty>(w, EFieldIterationFlags::None)) {
+                    if (pp && pp->GetName() == fieldName) { p = pp; break; }
+                }
+                w = w->GetSuperStruct();
+            }
+            if (!p) return -999.0f;
+            uint8_t* slot = base + p->GetOffset_ForInternal();
+            if (mode == 0) return *reinterpret_cast<bool*>(slot) ? 1.0f : 0.0f;
+            if (mode == 1) return (float)*reinterpret_cast<uint8_t*>(slot);
+            if (mode == 2) return *reinterpret_cast<float*>(slot);
+            return -999.0f;
+        };
+        auto dumpInstance = [&](UObject* inst, const wchar_t* label) {
+            if (!inst) {
+                Output::send<LogLevel::Verbose>(STR("[ImmDlg] ALL {} inDlg={} (missing)\n"),
+                    label, inDlg ? 1 : 0);
+                return;
+            }
+            // Try both snake_case and PascalCase — the existing resolver does this too.
+            auto findProp = [&](const wchar_t* a, const wchar_t* b) -> FProperty* {
+                FProperty* p = inst->GetPropertyByNameInChain(a);
+                if (!p) p = inst->GetPropertyByNameInChain(b);
+                return p;
+            };
+            FProperty* sd = findProp(STR("state_data"),      STR("StateData"));
+            FProperty* ld = findProp(STR("locomotion_data"), STR("LocomotionData"));
+            FProperty* dd = findProp(STR("dialog_data"),     STR("DialogData"));
+            int dialogBit = -1;
+            if (dd) {
+                uint8_t* dm = dd->ContainerPtrToValuePtr<uint8_t>(inst);
+                if (dm) dialogBit = *dm ? 1 : 0;
+            }
+            Output::send<LogLevel::Verbose>(
+                STR("[ImmDlg] ALL {} inDlg={} | sd={} ld={} dd={} | bMov={} bWlk={} bWlkOvr={} bRun={} bJog={} bSpr={} bInAir={} bCut={} bCmb={} dynG={} crvG={} enG={} | V={} AngDir={} ClpDir={} Dir={} BPDir={} PR={} LegIK={} bLegIK={} | dialog={}\n"),
+                label, inDlg ? 1 : 0,
+                sd ? STR("ok") : STR("null"),
+                ld ? STR("ok") : STR("null"),
+                dd ? STR("ok") : STR("null"),
+                readInStruct(inst, sd, STR("bMoving"),           0),
+                readInStruct(inst, sd, STR("bWalking"),          0),
+                readInStruct(inst, sd, STR("bWalkingOverride"),  0),
+                readInStruct(inst, sd, STR("bRunning"),          0),
+                readInStruct(inst, sd, STR("bJogging"),          0),
+                readInStruct(inst, sd, STR("bSprinting"),        0),
+                readInStruct(inst, sd, STR("bInAir"),            0),
+                readInStruct(inst, sd, STR("bCutscene"),         0),
+                readInStruct(inst, sd, STR("bInCombat"),         0),
+                readInStruct(inst, sd, STR("DynamicGaitValue"),  2),
+                readInStruct(inst, sd, STR("CurveGaitValue"),    2),
+                readInStruct(inst, sd, STR("EnumGaitState"),     1),
+                readInStruct(inst, ld, STR("Velocity"),          2),
+                readInStruct(inst, ld, STR("AngleDirection"),    2),
+                readInStruct(inst, ld, STR("ClampedDirection"),  2),
+                readInStruct(inst, ld, STR("Direction"),         1),
+                readInStruct(inst, ld, STR("BPDirection"),       1),
+                readInStruct(inst, ld, STR("MovementPlayRate"),  2),
+                readInStruct(inst, ld, STR("LegIKAlpha"),        2),
+                readInStruct(inst, ld, STR("bLegIKEnabled"),     0),
+                dialogBit);
+        };
+        dumpInstance(m_animInstance,       STR("MAIN"));
+        dumpInstance(m_dummyAnimInstance,  STR("DUMMY"));
+        dumpInstance(m_bhAnimInstance,     STR("BH"));
+        dumpInstance(m_shadowAnimInstance, STR("SHADOW"));
     }
 
     // Apply the same set of "walking, alive, not-in-air/combat/cutscene" writes to any
