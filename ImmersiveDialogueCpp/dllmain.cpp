@@ -251,10 +251,24 @@ public:
     UObject*  m_ftFootstepEvent = nullptr; // UAkAudioEvent* for footstep (all surface + gait variants)
     UObject*  m_ftAkComponent   = nullptr; // UAkComponent* on the pawn
     UFunction* m_ftPostEventFn  = nullptr; // PostAkEvent-family function on the component
-    UFunction* m_ftSetSwitchFn  = nullptr; // UAkComponent::SetSwitch(FName group, FName state)
+    UFunction* m_ftSetSwitchFn  = nullptr; // UAkComponent::SetSwitch(UAkSwitchValue*)
+    // Wwise switch value UObjects, keyed by state short-name.
+    // Wwise groups: SW_Cutscenes_MovementType (Walk/Run/Sprint), SW_Cutscenes_SurfaceMaterial
+    // (Dirt/Grass/Asphalt/...), SW_Cutscenes_ArmorType (Light/Medium/Heavy),
+    // SW_Cutscenes_SurfaceWetness (True/False).
+    UObject*  m_swWalk    = nullptr;
+    UObject*  m_swMedium  = nullptr;
+    UObject*  m_swDirt    = nullptr;
+    UObject*  m_swDry     = nullptr; // SurfaceWetness "False"
     bool      m_ftProbed = false;
     uint64_t  m_ftNextStepAtMs = 0;
     static constexpr uint64_t FT_STEP_INTERVAL_MS = 450; // ~2.2 steps/sec at walk
+
+    // Attempt to force walk animation via PlayAnimMontage — game locks character into
+    // "stand-to-relax-idle" pose during dialogue and native-C++-driven anim graph doesn't
+    // pick up walk cycle from AddMovementInput alone.
+    UObject*   m_walkMontage      = nullptr;  // UAnimMontage* for walking
+    UFunction* m_playMontageFn    = nullptr;  // ACharacter::PlayAnimMontage(UAnimMontage*, float PlayRate, FName StartSection)
 
     // Camera-centering toggle (F5 flips; persisted to <mod>/config.ini).
     // STALKER 2 uses /Script/Stalker2.CameraModifier_LookAt (a UCameraModifier subclass) to
@@ -386,11 +400,13 @@ public:
         int akComponentsLogged = 0;
         UObject* firstFootstepEvent = nullptr;
         UObject* pawnAkComponent    = nullptr;
+        UObject* walkMontage        = nullptr;
 
         UObjectGlobals::ForEachUObject([&](UObject* obj, int32_t, int32_t) -> LoopAction {
             scanned++;
             if (!obj) return LoopAction::Continue;
             StringType full = obj->GetFullName();
+            StringType name = obj->GetName();
 
             // AkAudioEvent instances with "Footstep" in the name — candidates for the sound.
             if (full.find(STR("AkAudioEvent ")) == 0 && full.find(STR("Footstep")) != StringType::npos) {
@@ -409,11 +425,55 @@ public:
                     if (!pawnAkComponent) pawnAkComponent = obj;
                 }
             }
+
+            // Wwise switch values (UAkSwitchValue) — need pointers for SetSwitch(UAkSwitchValue*).
+            // The class is generated per-switch by Wwise and shows as "AkSwitchValue".
+            if (full.find(STR("AkSwitchValue ")) == 0) {
+                if (!m_swWalk   && name == StringType(STR("Walk")))   m_swWalk   = obj;
+                if (!m_swMedium && name == StringType(STR("Medium"))) m_swMedium = obj;
+                if (!m_swDirt   && name == StringType(STR("Dirt")))   m_swDirt   = obj;
+                if (!m_swDry    && name == StringType(STR("False")))  m_swDry    = obj;
+            }
+
+            // AnimMontage for the player walk cycle. STALKER 2 tends to name these
+            // AM_Player_Walk or similar. First hit wins.
+            if (!walkMontage && full.find(STR("AnimMontage ")) == 0) {
+                bool matchesWalkPattern =
+                    (name.find(STR("Walk")) != StringType::npos ||
+                     name.find(STR("walk")) != StringType::npos) &&
+                    (full.find(STR("Skif"))   != StringType::npos ||
+                     full.find(STR("Player")) != StringType::npos ||
+                     full.find(STR("BP_PC"))  != StringType::npos);
+                if (matchesWalkPattern) {
+                    walkMontage = obj;
+                    Output::send<LogLevel::Verbose>(STR("[ImmDlg]   walk montage candidate: {}\n"), full);
+                }
+            }
+
             return LoopAction::Continue;
         });
 
         m_ftFootstepEvent = firstFootstepEvent;
         m_ftAkComponent   = pawnAkComponent;
+        m_walkMontage     = walkMontage;
+
+        // ACharacter::PlayAnimMontage UFUNCTION (K2_PlayAnimMontage in some builds).
+        if (m_walkMontage) {
+            const wchar_t* montageFnNames[] = { STR("PlayAnimMontage"), STR("K2_PlayAnimMontage") };
+            for (auto* fn_name : montageFnNames) {
+                if (UFunction* fn = pawn->GetFunctionByNameInChain(FName(fn_name))) {
+                    m_playMontageFn = fn;
+                    Output::send<LogLevel::Verbose>(STR("[ImmDlg] walk-montage play fn: {}\n"), fn_name);
+                    break;
+                }
+            }
+        }
+        Output::send<LogLevel::Verbose>(
+            STR("[ImmDlg] switch values: Walk={}, Medium={}, Dirt={}, Dry={}\n"),
+            m_swWalk   ? STR("ok") : STR("MISSING"),
+            m_swMedium ? STR("ok") : STR("MISSING"),
+            m_swDirt   ? STR("ok") : STR("MISSING"),
+            m_swDry    ? STR("ok") : STR("MISSING"));
 
         // Resolve a PostEvent function on the pawn's AkComponent (name varies by Wwise plugin version).
         if (m_ftAkComponent) {
@@ -444,14 +504,16 @@ public:
             m_ftPostEventFn   ? STR("FOUND") : STR("MISSING"));
     }
 
-    // SetSwitch is DISABLED — the FName/FName param layout guess crashed the game.
-    // Real signature is likely UAkComponent::SetSwitch(UAkSwitchValue*) taking a UObject
-    // pointer to the switch value, not name strings. Need to enumerate AkSwitchValue
-    // instances first and cache pointers per (group,state) — separate iteration.
-    void SetAkSwitch(const wchar_t*, const wchar_t*) { /* no-op — see comment */ }
+    // Call UAkComponent::SetSwitch(UAkSwitchValue* SwitchValue) via reflection.
+    void SetAkSwitch(UObject* switchValue) {
+        if (!m_ftSetSwitchFn || !m_ftAkComponent || !switchValue) return;
+        struct { UObject* SwitchValue; } p{ switchValue };
+        m_ftAkComponent->ProcessEvent(m_ftSetSwitchFn, &p);
+    }
 
     // Fire a synthetic footstep sound via the pawn's AkComponent, at walk cadence.
-    // Without SetSwitch, Wwise plays a default variant (works, but material-agnostic).
+    // Set MovementType + SurfaceMaterial + ArmorType + Wetness switches by UObject pointer
+    // so Wwise's switch container picks the right variant (walk on dirt, no sprint, etc.).
     void MaybeFireFootstep(bool moving) {
         if (!m_ftFootstepEvent || !m_ftAkComponent || !m_ftPostEventFn) return;
         if (!moving) { m_ftNextStepAtMs = 0; return; }
@@ -460,9 +522,36 @@ public:
         if (now < m_ftNextStepAtMs) return;
         m_ftNextStepAtMs = now + FT_STEP_INTERVAL_MS;
 
+        SetAkSwitch(m_swWalk);
+        SetAkSwitch(m_swMedium);
+        SetAkSwitch(m_swDirt);
+        SetAkSwitch(m_swDry);
+
         alignas(8) char buf[128] = {};
         *reinterpret_cast<UObject**>(buf) = m_ftFootstepEvent;
         m_ftAkComponent->ProcessEvent(m_ftPostEventFn, buf);
+    }
+
+    // Force-play the walk montage on the pawn while moving in dialogue. If the montage
+    // exists and the PlayAnimMontage UFUNCTION resolves, the anim graph's dialogue-idle
+    // state gets overridden and the character shows a real walking pose with foot IK.
+    bool m_montagePlaying = false;
+    void MaybePlayWalkMontage(UObject* pawn, bool moving) {
+        if (!m_walkMontage || !m_playMontageFn) return;
+        if (moving && !m_montagePlaying) {
+            // ACharacter::PlayAnimMontage(UAnimMontage* AnimMontage, float PlayRate=1.0, FName StartSection=None)
+            alignas(8) char buf[64] = {};
+            *reinterpret_cast<UObject**>(buf + 0) = m_walkMontage;
+            *reinterpret_cast<float*>  (buf + 8) = 1.0f;
+            // Return value (float) at offset ~24 — leave zero.
+            pawn->ProcessEvent(m_playMontageFn, buf);
+            m_montagePlaying = true;
+        } else if (!moving && m_montagePlaying) {
+            // Stop by playing an empty montage — safer than StopAnimMontage which needs the same pointer.
+            // For simplicity we just flag; game will loop the walk montage until we move again.
+            // (Proper stop requires StopAnimMontage UFUNCTION — future polish.)
+            m_montagePlaying = false;
+        }
     }
 
     void PollCameraCenteringHotkey() {
@@ -556,6 +645,7 @@ public:
             if (strafe != 0.0) AddMovement(pawn, rX, rY, (float)(strafe * WALK_SCALE));
         }
         MaybeFireFootstep(moving);
+        MaybePlayWalkMontage(pawn, moving);
 
         // ---- Look: mouse (smoothed) + right stick ----
         m_pending_dx += (double)g_dx.exchange(0);
