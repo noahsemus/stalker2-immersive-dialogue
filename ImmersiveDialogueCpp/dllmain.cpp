@@ -24,6 +24,9 @@
 #include <Unreal/UClass.hpp>
 #include <Unreal/UFunction.hpp>
 #include <Unreal/NameTypes.hpp>
+#include <Constructs/Loop.hpp>
+
+#include <vector>
 
 #include <Windows.h>
 #include <Xinput.h>
@@ -241,6 +244,17 @@ public:
     double m_pending_dy = 0.0;
     bool   m_prevInDialog = false;
 
+    // Footstep audio (best-effort: fire PostEvent on cadence while character moves in dialogue).
+    // We enumerate at first dialogue entry — game's anim graph doesn't play walk cycles during
+    // dialogue (native C++ path we can't hook via reflection), so foot notifies never fire, so
+    // no footstep audio ever plays. We manually trigger Wwise events instead.
+    UObject*  m_ftFootstepEvent = nullptr; // UAkAudioEvent* for footstep (grass/dirt/whatever the game has)
+    UObject*  m_ftAkComponent   = nullptr; // UAkComponent* on the pawn
+    UFunction* m_ftPostEventFn  = nullptr; // Function to call PostEvent on the component
+    bool      m_ftProbed = false;
+    uint64_t  m_ftNextStepAtMs = 0;
+    static constexpr uint64_t FT_STEP_INTERVAL_MS = 450; // ~2.2 steps/sec at walk
+
     ImmersiveDialogue() {
         ModName        = STR("ImmersiveDialogue");
         ModVersion     = STR("1.0");
@@ -304,6 +318,94 @@ public:
         o->ProcessEvent(fn, &p);
     }
 
+    // Scan every loaded UObject once to find: a footstep AkAudioEvent + an AkComponent on
+    // our pawn's actor hierarchy + a PostAkEvent / PostEvent UFunction to call. Log what's
+    // available so we can iterate if the first combination doesn't fire audio.
+    void ProbeFootstepAudio(UObject* pawn) {
+        if (m_ftProbed) return;
+        m_ftProbed = true;
+
+        // Get pawn's full path prefix so we can identify components owned by it.
+        StringType pawnFull = pawn->GetFullName();
+        // Full name format: "ClassName /Path/To/Pawn". Strip class prefix for outer-match.
+        size_t sp = pawnFull.find(STR(' '));
+        StringType pawnPath = (sp != StringType::npos) ? pawnFull.substr(sp + 1) : pawnFull;
+
+        int scanned = 0;
+        int akEventsLogged = 0;
+        int akComponentsLogged = 0;
+        UObject* firstFootstepEvent = nullptr;
+        UObject* pawnAkComponent    = nullptr;
+
+        UObjectGlobals::ForEachUObject([&](UObject* obj, int32_t, int32_t) -> LoopAction {
+            scanned++;
+            if (!obj) return LoopAction::Continue;
+            StringType full = obj->GetFullName();
+
+            // AkAudioEvent instances with "Footstep" in the name — candidates for the sound.
+            if (full.find(STR("AkAudioEvent ")) == 0 && full.find(STR("Footstep")) != StringType::npos) {
+                if (akEventsLogged < 20) {
+                    Output::send<LogLevel::Verbose>(STR("[ImmDlg]   footstep evt: {}\n"), full);
+                    akEventsLogged++;
+                }
+                if (!firstFootstepEvent) firstFootstepEvent = obj;
+            }
+
+            // AkComponent instances whose full path starts with our pawn's path — pawn's audio component.
+            if (full.find(STR("AkComponent ")) == 0 || full.find(STR("AkSubmixInputComponent ")) == 0) {
+                if (akComponentsLogged < 20 && full.find(pawnPath) != StringType::npos) {
+                    Output::send<LogLevel::Verbose>(STR("[ImmDlg]   pawn ak component: {}\n"), full);
+                    akComponentsLogged++;
+                    if (!pawnAkComponent) pawnAkComponent = obj;
+                }
+            }
+            return LoopAction::Continue;
+        });
+
+        m_ftFootstepEvent = firstFootstepEvent;
+        m_ftAkComponent   = pawnAkComponent;
+
+        // Resolve a PostEvent function on the pawn's AkComponent (name varies by Wwise plugin version).
+        if (m_ftAkComponent) {
+            const wchar_t* names[] = {
+                STR("PostAkEvent"),
+                STR("PostAssociatedAkEvent"),
+                STR("PostEvent"),
+                STR("PostEventByName"),
+            };
+            for (auto* n : names) {
+                if (UFunction* fn = m_ftAkComponent->GetFunctionByNameInChain(FName(n))) {
+                    m_ftPostEventFn = fn;
+                    Output::send<LogLevel::Verbose>(STR("[ImmDlg] footstep post-fn on ak component: {}\n"), n);
+                    break;
+                }
+            }
+        }
+
+        Output::send<LogLevel::Verbose>(
+            STR("[ImmDlg] footstep probe: scanned={}, events(Footstep)={}, pawnComps={}, event={}, comp={}, postFn={}\n"),
+            scanned, akEventsLogged, akComponentsLogged,
+            m_ftFootstepEvent ? STR("FOUND") : STR("MISSING"),
+            m_ftAkComponent   ? STR("FOUND") : STR("MISSING"),
+            m_ftPostEventFn   ? STR("FOUND") : STR("MISSING"));
+    }
+
+    // Fire a synthetic footstep sound via the pawn's AkComponent, at walk cadence.
+    void MaybeFireFootstep(bool moving) {
+        if (!m_ftFootstepEvent || !m_ftAkComponent || !m_ftPostEventFn) return;
+        if (!moving) { m_ftNextStepAtMs = 0; return; }
+        uint64_t now = GetTickCount64();
+        if (m_ftNextStepAtMs == 0) { m_ftNextStepAtMs = now + FT_STEP_INTERVAL_MS / 2; return; }
+        if (now < m_ftNextStepAtMs) return;
+        m_ftNextStepAtMs = now + FT_STEP_INTERVAL_MS;
+
+        // Best-effort ProcessEvent — parameter layouts vary by Wwise plugin version. We
+        // pass the event pointer as the first field with a generous zero-padded frame.
+        alignas(8) char buf[128] = {};
+        *reinterpret_cast<UObject**>(buf) = m_ftFootstepEvent;
+        m_ftAkComponent->ProcessEvent(m_ftPostEventFn, buf);
+    }
+
     auto on_update() -> void override {
         UObject* pawn = GetPawn();
         if (!pawn) return;
@@ -320,6 +422,7 @@ public:
         // Refresh in-game sensitivity on each dialogue entry.
         if (!m_prevInDialog) {
             LoadStalker2Settings();
+            ProbeFootstepAudio(pawn);
             m_prevInDialog = true;
         }
 
@@ -338,7 +441,8 @@ public:
         double strafe = (d ? 1.0 : 0.0) - (a ? 1.0 : 0.0);
         if (padMoveY != 0.0) fwd    = padMoveY;
         if (padMoveX != 0.0) strafe = padMoveX;
-        if (fwd != 0.0 || strafe != 0.0) {
+        bool moving = (fwd != 0.0 || strafe != 0.0);
+        if (moving) {
             double yawDeg = ControlRotation(pawn).Yaw;
             double r = yawDeg * 3.14159265358979323846 / 180.0;
             double fX = std::cos(r), fY = std::sin(r);
@@ -346,6 +450,7 @@ public:
             if (fwd    != 0.0) AddMovement(pawn, fX, fY, (float)(fwd    * WALK_SCALE));
             if (strafe != 0.0) AddMovement(pawn, rX, rY, (float)(strafe * WALK_SCALE));
         }
+        MaybeFireFootstep(moving);
 
         // ---- Look: mouse (smoothed) + right stick ----
         m_pending_dx += (double)g_dx.exchange(0);
