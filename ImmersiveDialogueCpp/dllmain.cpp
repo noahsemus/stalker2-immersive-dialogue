@@ -815,6 +815,22 @@ public:
                        m_locomotionDataProp, m_locomotionOffsets);
         resolveAndDump(STR("shadow_data"),     STR("ShadowData"),     STR("shadow_data"),
                        m_shadowDataProp, m_shadowOffsets);
+
+        // One-time overview: list every top-level property on the AnimInstance so we see
+        // which sibling data structs might drive upper-body/shadow behavior we haven't hit.
+        {
+            int lim = 0;
+            UClass* aic = m_animInstance->GetClassPrivate();
+            UStruct* w2 = aic;
+            while (w2 && lim < 40) {
+                for (FProperty* p : TFieldRange<FProperty>(w2, EFieldIterationFlags::None)) {
+                    if (!p) continue;
+                    Output::send<LogLevel::Verbose>(STR("[ImmDlg]   AI top-level: {}\n"), p->GetName());
+                    if (++lim >= 40) break;
+                }
+                w2 = w2->GetSuperStruct();
+            }
+        }
     }
 
     // Drive locomotion_data (numeric — Velocity, AngleDirection, MovementPlayRate, LegIK).
@@ -847,6 +863,21 @@ public:
             float  angDeg = (float)(angRad * 180.0 / 3.14159265358979323846);
             writeF(STR("AngleDirection"),   angDeg);
             writeF(STR("ClampedDirection"), angDeg);
+            // Also write the byte enum. Guessing the standard UE ECardinalDirection ordering:
+            // 0=Forward, 1=Right, 2=Back, 3=Left. Quantize the angle into 4 cardinals.
+            uint8_t dirEnum;
+            const double pi = 3.14159265358979323846;
+            if      (angRad > -pi/4 && angRad <  pi/4) dirEnum = 0; // Forward
+            else if (angRad >=  pi/4 && angRad < 3*pi/4) dirEnum = 1; // Right
+            else if (angRad >= 3*pi/4 || angRad < -3*pi/4) dirEnum = 2; // Back
+            else                                        dirEnum = 3; // Left
+            auto writeByte = [&](const wchar_t* name, uint8_t val) {
+                auto it = m_locomotionOffsets.find(name);
+                if (it == m_locomotionOffsets.end()) return;
+                *reinterpret_cast<uint8_t*>(base + it->second) = val;
+            };
+            writeByte(STR("Direction"),   dirEnum);
+            writeByte(STR("BPDirection"), dirEnum);
         }
     }
 
