@@ -1158,6 +1158,16 @@ public:
             g_dx.exchange(0); g_dy.exchange(0);
             m_pending_dx = 0.0; m_pending_dy = 0.0;
             m_prevInDialog = false;
+            // Log outside-dialogue anim state too — need this to compare against in-dialogue.
+            // We don't know if user is moving outside dialogue at this point (WASD not sampled
+            // here), so pass 'moving' as -1 sentinel via any non-zero: reflect actual movement
+            // by peeking key state.
+            bool wOut = (GetAsyncKeyState('W') & 0x8000) != 0;
+            bool aOut = (GetAsyncKeyState('A') & 0x8000) != 0;
+            bool sOut = (GetAsyncKeyState('S') & 0x8000) != 0;
+            bool dOut = (GetAsyncKeyState('D') & 0x8000) != 0;
+            bool movingOut = wOut || aOut || sOut || dOut;
+            LogAnimStateOnce(false, movingOut);
             return;
         }
 
