@@ -29,6 +29,7 @@
 #include <Constructs/Loop.hpp>
 
 #include <vector>
+#include <map>
 
 #include <Windows.h>
 #include <Xinput.h>
@@ -719,12 +720,24 @@ public:
     // bool members INSIDE it. We resolve their inner offsets once via UScriptStruct's
     // CustomFindProperty and then write per-frame.
     FProperty* m_stateDataProp = nullptr;
-    int32_t m_offWalkingOverride = -1;
-    int32_t m_offJoggingOverride = -1;
-    int32_t m_offSprintingOverride = -1;
-    int32_t m_offCrouchingOverride = -1;
-    int32_t m_offCombatMoveIdle = -1;
-    int32_t m_offCombatCrouchIdle = -1;
+    // Direct children of AnimPlayerStateData (see log dump: state_data.b* off=N).
+    int32_t m_offWalkingOverride = -1;   // bWalkingOverride
+    int32_t m_offJoggingOverride = -1;   // bJoggingOverride
+    int32_t m_offSprintingOverride = -1; // bSprintingOverride
+    int32_t m_offCrouchingOverride = -1; // bCrouchingOverride
+    int32_t m_offInAirOverride = -1;     // bInAirOverride
+    int32_t m_offCombatMoveIdle = -1;    // bCombatMoveIdle
+    int32_t m_offCombatCrouchIdle = -1;  // bCombatCrouchIdle
+    // Parent struct AnimStateData bools (low offsets 0..9).
+    int32_t m_offAlive = -1;             // bAlive
+    int32_t m_offMoving = -1;            // bMoving
+    int32_t m_offWalking = -1;           // bWalking
+    int32_t m_offRunning = -1;           // bRunning
+    int32_t m_offSprinting = -1;         // bSprinting
+    int32_t m_offJogging = -1;           // bJogging
+    int32_t m_offInAir = -1;             // bInAir
+    int32_t m_offCutscene = -1;          // bCutscene
+    int32_t m_offInCombat = -1;          // bInCombat
 
     void ResolveStateDataOffsets() {
         if (m_stateDataProp) return;
@@ -741,17 +754,38 @@ public:
         FStructProperty* sfp = static_cast<FStructProperty*>(sp);
         UScriptStruct* stru = sfp->GetStruct();
         if (!stru) return;
-        auto lookup = [&](const wchar_t* nameA, const wchar_t* nameB) -> int32_t {
-            FProperty* p = stru->CustomFindProperty(FName(nameA));
-            if (!p) p = stru->CustomFindProperty(FName(nameB));
-            return p ? p->GetOffset_ForInternal() : -1;
+        // Walk this struct + all parent structs, building a name -> offset map from the real
+        // property list (rather than guessing at names). This handles both the direct child
+        // b* props on AnimPlayerStateData and the inherited ones on AnimStateData parent.
+        std::map<StringType, int32_t> offMap;
+        UStruct* walker = stru;
+        while (walker) {
+            for (FProperty* p : TFieldRange<FProperty>(walker, EFieldIterationFlags::None)) {
+                if (!p) continue;
+                offMap[p->GetName()] = p->GetOffset_ForInternal();
+            }
+            walker = walker->GetSuperStruct();
+        }
+        auto off = [&](const wchar_t* name) -> int32_t {
+            auto it = offMap.find(name);
+            return it == offMap.end() ? -1 : it->second;
         };
-        m_offWalkingOverride   = lookup(STR("walking_override"),   STR("WalkingOverride"));
-        m_offJoggingOverride   = lookup(STR("jogging_override"),   STR("JoggingOverride"));
-        m_offSprintingOverride = lookup(STR("sprinting_override"), STR("SprintingOverride"));
-        m_offCrouchingOverride = lookup(STR("crouching_override"), STR("CrouchingOverride"));
-        m_offCombatMoveIdle    = lookup(STR("combat_move_idle"),   STR("CombatMoveIdle"));
-        m_offCombatCrouchIdle  = lookup(STR("combat_crouch_idle"), STR("CombatCrouchIdle"));
+        m_offWalkingOverride   = off(STR("bWalkingOverride"));
+        m_offJoggingOverride   = off(STR("bJoggingOverride"));
+        m_offSprintingOverride = off(STR("bSprintingOverride"));
+        m_offCrouchingOverride = off(STR("bCrouchingOverride"));
+        m_offInAirOverride     = off(STR("bInAirOverride"));
+        m_offCombatMoveIdle    = off(STR("bCombatMoveIdle"));
+        m_offCombatCrouchIdle  = off(STR("bCombatCrouchIdle"));
+        m_offAlive             = off(STR("bAlive"));
+        m_offMoving            = off(STR("bMoving"));
+        m_offWalking           = off(STR("bWalking"));
+        m_offRunning           = off(STR("bRunning"));
+        m_offSprinting         = off(STR("bSprinting"));
+        m_offJogging           = off(STR("bJogging"));
+        m_offInAir             = off(STR("bInAir"));
+        m_offCutscene          = off(STR("bCutscene"));
+        m_offInCombat          = off(STR("bInCombat"));
         Output::send<LogLevel::Verbose>(
             STR("[ImmDlg]   state_data offsets: walk={}, jog={}, sprint={}, crouch={}, combatMoveIdle={}, combatCrouchIdle={}\n"),
             m_offWalkingOverride, m_offJoggingOverride, m_offSprintingOverride,
@@ -782,12 +816,26 @@ public:
             if (off < 0) return;
             *reinterpret_cast<bool*>(structBase + off) = val;
         };
-        write(m_offJoggingOverride,   false); // never jogging in dialogue
-        write(m_offSprintingOverride, false); // never sprinting
-        write(m_offCrouchingOverride, false); // no crouch state changes
+        // Override flags: never jog/sprint/crouch/in-air/combat-idle in dialogue.
+        write(m_offJoggingOverride,   false);
+        write(m_offSprintingOverride, false);
+        write(m_offCrouchingOverride, false);
+        write(m_offInAirOverride,     false);
         write(m_offCombatMoveIdle,    false);
         write(m_offCombatCrouchIdle,  false);
-        write(m_offWalkingOverride,   moving); // walking only when actually moving
+        // Walking-override drives the state-machine transition to walk state.
+        write(m_offWalkingOverride,   moving);
+        // Also force the raw state flags from the parent AnimStateData struct, in case the
+        // anim graph reads those directly rather than through the *_override inputs.
+        write(m_offAlive,      true);
+        write(m_offInAir,      false);
+        write(m_offCutscene,   false);
+        write(m_offInCombat,   false);
+        write(m_offRunning,    false);
+        write(m_offSprinting,  false);
+        write(m_offJogging,    false);
+        write(m_offMoving,     moving);
+        write(m_offWalking,    moving);
     }
 
     // Resolve pawn camera + FOV property (once, on first dialogue entry).
