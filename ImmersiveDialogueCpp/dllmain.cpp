@@ -350,6 +350,7 @@ public:
     // gracefully on missing functions. Sticking to the one hook that's proven to register.
     std::pair<int,int> m_hookIsInDialog{-1,-1};
     std::pair<int,int> m_hookIsRelaxIdle{-1,-1};
+    std::pair<int,int> m_hookSetRelaxIdle{-1,-1};
     void InstallStateLieHooks() {
         UnrealScriptFunctionCallable postFalseWhilePauseLie =
             [](UnrealScriptFunctionCallableContext& ctx, void*) {
@@ -361,10 +362,7 @@ public:
             StringType(STR("/Script/Stalker2.PC:IsInStaticDialog")),
             UnrealScriptFunctionCallable{}, postFalseWhilePauseLie, nullptr);
 
-        // Footsteps: dialogue system re-asserts IsStandToRelaxIdle=true each frame after our
-        // setter. Hook the getter itself to always return false for our pawn while we're in
-        // dialogue — anim graph then sees "not in relax-idle" and plays normal locomotion,
-        // which fires the walk-cycle foot-IK notify that plays footstep audio.
+        // Footsteps — post-hook on getter (in case anim graph reads via UFUNCTION):
         UnrealScriptFunctionCallable postRelaxIdleFalseForOurPawn =
             [](UnrealScriptFunctionCallableContext& ctx, void*) {
                 if (ctx.Context == g_hookPawn.load(std::memory_order_relaxed)
@@ -375,6 +373,23 @@ public:
         m_hookIsRelaxIdle = UObjectGlobals::RegisterHook(
             StringType(STR("/Script/Stalker2.Obj:IsStandToRelaxIdle")),
             UnrealScriptFunctionCallable{}, postRelaxIdleFalseForOurPawn, nullptr);
+
+        // Footsteps — pre-hook on setter: when the dialogue system tries to set the flag
+        // TRUE for our pawn during dialogue, mutate the param to FALSE in place. That way
+        // the underlying bool never gets set to true, no matter how often they call the
+        // setter. Combined with our own set(false) every frame, the field stays false.
+        UnrealScriptFunctionCallable preCoerceSetToFalse =
+            [](UnrealScriptFunctionCallableContext& ctx, void*) {
+                if (ctx.Context == g_hookPawn.load(std::memory_order_relaxed)
+                    && g_inDialogue.load(std::memory_order_relaxed)) {
+                    struct P { bool NewValue; };
+                    P& p = ctx.GetParams<P>();
+                    p.NewValue = false;
+                }
+            };
+        m_hookSetRelaxIdle = UObjectGlobals::RegisterHook(
+            StringType(STR("/Script/Stalker2.Obj:SetStandToRelaxIdle")),
+            preCoerceSetToFalse, UnrealScriptFunctionCallable{}, nullptr);
     }
 
     auto on_unreal_init() -> void override {
@@ -446,9 +461,33 @@ public:
         return true;
     }
 
-    // Diagnostic: walk EVERY loaded UObject once and log those whose name or full path
-    // suggests they're pause-menu related — WBP class objects, view widgets, IPUs, etc.
-    // FindAllOf("Class") returns 0 in this UE4SS version so we go through ForEachUObject.
+    // Diagnostic: find the BP_SML (Screen Management Layer) instance and log every UFunction
+    // whose full path starts with its class prefix. One of them should be a "show/push/
+    // activate view" method that actually renders a widget through the game's manager
+    // (vs. our direct AddToViewport which the manager overrides).
+    bool m_smlEnumerated = false;
+    void EnumerateBP_SML_Once() {
+        if (m_smlEnumerated) return;
+        m_smlEnumerated = true;
+        UObject* sml = UObjectGlobals::FindFirstOf(STR("BP_SML_C"));
+        if (!sml) { Output::send<LogLevel::Verbose>(STR("[ImmDlg] BP_SML instance not found\n")); return; }
+        StringType smlName = sml->GetName();
+        Output::send<LogLevel::Verbose>(STR("[ImmDlg] BP_SML instance: {}\n"), smlName);
+        // Enumerate all UFunctions whose full path contains "BP_SML" — those are its class's methods.
+        int found = 0;
+        UObjectGlobals::ForEachUObject([&](UObject* obj, int32_t, int32_t) -> LoopAction {
+            if (!obj) return LoopAction::Continue;
+            StringType full = obj->GetFullName();
+            if (full.find(STR("Function ")) == 0 && full.find(STR("BP_SML")) != StringType::npos) {
+                StringType n = obj->GetName();
+                Output::send<LogLevel::Verbose>(STR("[ImmDlg]   SML fn: {}\n"), n);
+                if (++found >= 60) { Output::send<LogLevel::Verbose>(STR("[ImmDlg]   (truncated)\n")); return LoopAction::Break; }
+            }
+            return LoopAction::Continue;
+        });
+        Output::send<LogLevel::Verbose>(STR("[ImmDlg] BP_SML functions logged: {}\n"), found);
+    }
+
     bool m_menuClassesLogged = false;
     UObject* m_discoveredPauseWidgetClass = nullptr;
     void LogMenuClassesOnce() {
@@ -753,6 +792,7 @@ public:
             LoadStalker2Settings();
             LogInputActionsOnce();
             LogMenuClassesOnce();
+            EnumerateBP_SML_Once();
             m_prevInDialog = true;
         }
 
