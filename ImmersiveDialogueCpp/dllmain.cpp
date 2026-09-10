@@ -423,6 +423,82 @@ public:
         struct { float Val; } p{v};
         o->ProcessEvent(fn, &p);
     }
+    // PC::set_move_vector(FVector) — the UFUNCTION the game's own input pipeline calls
+    // to feed WASD/stick into the movement + animation system. In dialogue, this pipeline
+    // is gated, so strafe animations receive zero input even though we're calling
+    // AddMovementInput directly. Calling set_move_vector ourselves restores the natural
+    // anim/body-rotation behavior (body orients to movement, forward-walk anim plays).
+    void SetMoveVector(UObject* o, double x, double y, double z) {
+        UFunction* fn = Fn(o, STR("SetMoveVector"));
+        if (!fn) fn = Fn(o, STR("set_move_vector"));
+        if (!fn) return;
+        struct { FVectorD MoveVector; } p{{x, y, z}};
+        o->ProcessEvent(fn, &p);
+    }
+
+    // PC::set_allowed_movement_types(PlayerMovementType) — lifts any dialogue-imposed
+    // movement lock (in-dialogue the game sets this to a restricted subset). Passing ALL
+    // (highest enum value; if it's a bitmask, 0xFF covers everything).
+    void SetAllowedMovementTypes(UObject* pc, uint8_t types) {
+        UFunction* fn = Fn(pc, STR("SetAllowedMovementTypes"));
+        if (!fn) fn = Fn(pc, STR("set_allowed_movement_types"));
+        if (!fn) return;
+        struct { uint8_t T; } p{types};
+        pc->ProcessEvent(fn, &p);
+    }
+    void SetForbiddenMovementTypes(UObject* pc, uint8_t types) {
+        UFunction* fn = Fn(pc, STR("SetForbiddenMovementTypes"));
+        if (!fn) fn = Fn(pc, STR("set_forbidden_movement_types"));
+        if (!fn) return;
+        struct { uint8_t T; } p{types};
+        pc->ProcessEvent(fn, &p);
+    }
+    void DisableCinematicMode(UObject* pc) {
+        UFunction* fn = Fn(pc, STR("DisableCinematicMode"));
+        if (!fn) fn = Fn(pc, STR("disable_cinematic_mode"));
+        if (!fn) return;
+        char none[1]; pc->ProcessEvent(fn, none);
+    }
+
+    // PC::stop_dialog_gesture — kills the "dialog gesture" the game plays when talking.
+    // If the gesture is a montage that overrides locomotion, this should let strafe
+    // blends surface through. Zero-arg UFUNCTION.
+    void StopDialogGesture(UObject* pc) {
+        UFunction* fn = Fn(pc, STR("stop_dialog_gesture"));
+        if (!fn) fn = Fn(pc, STR("StopDialogGesture"));
+        if (!fn) return;
+        char none[1]; pc->ProcessEvent(fn, none);
+    }
+
+    // UAnimInstance::Montage_Stop(float InBlendOutTime, UAnimMontage* Montage=nullptr).
+    // Passing null Montage stops the currently-active montage. Called blindly every
+    // frame in dialogue to test whether a masked montage is what's overriding strafe.
+    void MontageStopAll(UObject* animInstance) {
+        if (!animInstance) return;
+        UFunction* fn = Fn(animInstance, STR("Montage_Stop"));
+        if (!fn) return;
+        struct { float InBlendOutTime; UObject* Montage; } p{0.0f, nullptr};
+        animInstance->ProcessEvent(fn, &p);
+    }
+
+    // USceneComponent::K2_SetRelativeRotation(FRotator, bool bSweep, FHitResult, ETeleportType) → bool.
+    // We only need to write the rotation for a mesh subcomponent. Layout for the params:
+    //   FRotatorD NewRotation (24 bytes)
+    //   bool bSweep (1 byte, padded)
+    //   FHitResult SweepHitResult (~100 bytes) — we don't care, pass zeroed buffer
+    //   ETeleportType Teleport (1 byte)
+    //   bool ReturnValue
+    // Rather than model FHitResult exactly, we pass a big zero buffer sized generously.
+    void SetMeshRelativeYaw(UObject* meshComp, double yawDeg) {
+        if (!meshComp) return;
+        UFunction* fn = Fn(meshComp, STR("K2_SetRelativeRotation"));
+        if (!fn) return;
+        struct { FRotatorD NewRotation; bool bSweep; uint8_t pad[7]; uint8_t hit[200]; uint8_t teleport; uint8_t pad2[7]; bool ReturnValue; } p{};
+        p.NewRotation = {0.0, yawDeg, 0.0};
+        p.bSweep = false;
+        p.teleport = 0;
+        meshComp->ProcessEvent(fn, &p);
+    }
 
     // Scan every loaded UObject once to find: a footstep AkAudioEvent + an AkComponent on
     // our pawn's actor hierarchy + a PostAkEvent / PostEvent UFunction to call. Log what's
@@ -553,6 +629,60 @@ public:
         m_ftAkComponent->ProcessEvent(m_ftSetSwitchFn, &p);
     }
 
+    // Diagnostic: enumerate every UObject whose class inherits from UAnimInstance AND
+    // whose full name path contains our pawn's path. Reveals sub/linked/post-process
+    // anim instances beyond the main + shadow we already track. Prints each hit's class
+    // name + full name so we can find the one actually driving the visible dialogue pose.
+    void ProbeAllAnimInstances(UObject* pawn) {
+        if (!pawn) return;
+        StringType pawnFull = pawn->GetFullName();
+        size_t sp = pawnFull.find(STR(' '));
+        StringType pawnPath = (sp != StringType::npos) ? pawnFull.substr(sp + 1) : pawnFull;
+        int hits = 0;
+        UObjectGlobals::ForEachUObject([&](UObject* obj, int32_t, int32_t) -> LoopAction {
+            if (!obj) return LoopAction::Continue;
+            UClass* cls = obj->GetClassPrivate();
+            if (!cls) return LoopAction::Continue;
+            // Walk class chain looking for AnimInstance.
+            bool isAnimInst = false;
+            for (UStruct* w = cls; w; w = w->GetSuperStruct()) {
+                if (w->GetName() == StringType(STR("AnimInstance"))) { isAnimInst = true; break; }
+            }
+            if (!isAnimInst) return LoopAction::Continue;
+            StringType full = obj->GetFullName();
+            // Only interested in ones tied to our pawn.
+            if (full.find(pawnPath) == StringType::npos) return LoopAction::Continue;
+            Output::send<LogLevel::Verbose>(
+                STR("[ImmDlg] ANIM-INST hit: class={} full={}\n"),
+                cls->GetName(), full);
+            hits++;
+            return LoopAction::Continue;
+        });
+        Output::send<LogLevel::Verbose>(STR("[ImmDlg] ANIM-INST probe: {} anim instances tied to pawn\n"), hits);
+    }
+
+    // One-shot: dump every UPROPERTY on the main AnimInstance's own class (top level,
+    // not inside the sub-structs we already know about). Any bool/enum/float here could
+    // be the "in dialogue" gate that switches the anim graph off strafe blends.
+    bool m_mainAnimPropsDumped = false;
+    void DumpMainAnimInstanceProps() {
+        if (m_mainAnimPropsDumped) return;
+        if (!m_animInstance) return;
+        m_mainAnimPropsDumped = true;
+        UClass* cls = m_animInstance->GetClassPrivate();
+        if (!cls) return;
+        Output::send<LogLevel::Verbose>(STR("[ImmDlg] MAIN-AI class props (class={}):\n"), cls->GetName());
+        int n = 0;
+        for (UStruct* w = cls; w && n < 250; w = w->GetSuperStruct()) {
+            for (FProperty* p : TFieldRange<FProperty>(w, EFieldIterationFlags::None)) {
+                if (!p || n >= 250) break;
+                Output::send<LogLevel::Verbose>(STR("[ImmDlg]   MAIN prop: {}\n"), p->GetName());
+                n++;
+            }
+        }
+    }
+
+
     // Footstep timer is now DISABLED — with the walk animation actually playing
     // (state_data.bWalkingOverride writes finally lit it up), the game's own foot-plant
     // anim notifies fire native footsteps at correct cadence + volume. Our fixed 450ms
@@ -678,6 +808,466 @@ public:
             (int)m_animBoolProps.size(),
             m_dialogDataProp ? STR("ok") : STR("null"),
             m_stateDataProp ? STR("ok") : STR("null"));
+    }
+
+    // Character rotation control. On ACharacter/APawn:
+    //   - bUseControllerRotationYaw (on pawn root): if true, pawn yaw is force-synced to
+    //     controller yaw every tick — fights any manual rotation.
+    //   - CharacterMovement.bOrientRotationToMovement: if true, CMC rotates pawn yaw toward
+    //     velocity direction each tick (this is what makes STALKER 2's strafe/diagonal
+    //     walk look natural outside dialogue).
+    // In dialogue the game likely sets bUseControllerRotationYaw=true + orient-to-movement=false
+    // (body locked to camera) — we override to the opposite so the game's natural strafe
+    // behavior kicks in.
+    UObject*   m_charMoveComp = nullptr;
+    FProperty* m_propUseCtrlYaw = nullptr;   // on pawn — bool
+    FProperty* m_propOrientToMove = nullptr; // on CMC   — bool
+    bool m_rotationCtrlResolved = false;
+
+    void ResolveRotationControl(UObject* pawn) {
+        if (m_rotationCtrlResolved) return;
+        m_rotationCtrlResolved = true;
+        // bUseControllerRotationYaw is on APawn directly.
+        m_propUseCtrlYaw = pawn->GetPropertyByNameInChain(STR("bUseControllerRotationYaw"));
+        // CharacterMovement UPROPERTY on ACharacter → UCharacterMovementComponent.
+        const wchar_t* cmcNames[] = { STR("CharacterMovement"), STR("character_movement"), STR("MovementComponent") };
+        for (auto* n : cmcNames) {
+            if (FProperty* p = pawn->GetPropertyByNameInChain(n)) {
+                UObject** slot = p->ContainerPtrToValuePtr<UObject*>(pawn);
+                if (slot && *slot) { m_charMoveComp = *slot; break; }
+            }
+        }
+        if (m_charMoveComp) {
+            m_propOrientToMove = m_charMoveComp->GetPropertyByNameInChain(STR("bOrientRotationToMovement"));
+        }
+        Output::send<LogLevel::Verbose>(
+            STR("[ImmDlg] rotation control resolved: bUseCtrlYaw prop={}, CMC={}, bOrientToMove prop={}\n"),
+            m_propUseCtrlYaw ? STR("ok") : STR("null"),
+            m_charMoveComp   ? STR("ok") : STR("null"),
+            m_propOrientToMove ? STR("ok") : STR("null"));
+    }
+
+    // In dialogue: flip pawn's rotation control so body follows movement direction (like
+    // it does outside dialogue) instead of being locked to camera yaw.
+    void ApplyDialogueRotationControl(UObject* pawn) {
+        if (m_propUseCtrlYaw) {
+            bool* slot = m_propUseCtrlYaw->ContainerPtrToValuePtr<bool>(pawn);
+            if (slot) *slot = false;
+        }
+        if (m_propOrientToMove && m_charMoveComp) {
+            bool* slot = m_propOrientToMove->ContainerPtrToValuePtr<bool>(m_charMoveComp);
+            if (slot) *slot = true;
+        }
+    }
+    void RestoreOutsideDialogueRotationControl(UObject* pawn) {
+        // Restore the defaults the game expects outside dialogue: body follows camera,
+        // no orient-to-movement (STALKER 2 is FPS, camera IS the body yaw).
+        if (m_propUseCtrlYaw) {
+            bool* slot = m_propUseCtrlYaw->ContainerPtrToValuePtr<bool>(pawn);
+            if (slot) *slot = true;
+        }
+        if (m_propOrientToMove && m_charMoveComp) {
+            bool* slot = m_propOrientToMove->ContainerPtrToValuePtr<bool>(m_charMoveComp);
+            if (slot) *slot = false;
+        }
+    }
+
+    // Once-per-500ms diagnostic: log the dialogue-suspicion levers we can read on the pawn,
+    // so we can see what the game changes when entering dialogue.
+    uint64_t m_lastPcDiagMs = 0;
+    void LogPcState(UObject* pawn, bool inDlg) {
+        if (!pawn) return;
+        uint64_t now = GetTickCount64();
+        if (now - m_lastPcDiagMs < 500) return;
+        m_lastPcDiagMs = now;
+        auto readU8  = [&](const wchar_t* n) -> int {
+            FProperty* p = pawn->GetPropertyByNameInChain(n); if (!p) return -1;
+            uint8_t* s = p->ContainerPtrToValuePtr<uint8_t>(pawn); return s ? (int)*s : -1;
+        };
+        auto readI32 = [&](const wchar_t* n) -> int {
+            FProperty* p = pawn->GetPropertyByNameInChain(n); if (!p) return -1;
+            int32_t* s = p->ContainerPtrToValuePtr<int32_t>(pawn); return s ? *s : -1;
+        };
+        auto readBool = [&](const wchar_t* n) -> int {
+            FProperty* p = pawn->GetPropertyByNameInChain(n); if (!p) return -1;
+            bool* s = p->ContainerPtrToValuePtr<bool>(pawn); return s ? (*s ? 1 : 0) : -1;
+        };
+        int amt = readU8(STR("allowed_movement_actions"));
+        int cmc = readI32(STR("cinematic_mode_counter"));
+        int cs  = readBool(STR("cinematic_sequence"));
+        int useCtrlYaw = readBool(STR("bUseControllerRotationYaw"));
+        int immob = readBool(STR("immobilized"));
+        int ctxAct = readBool(STR("contextual_action"));
+        int orientMove = -1;
+        if (m_charMoveComp && m_propOrientToMove) {
+            bool* s = m_propOrientToMove->ContainerPtrToValuePtr<bool>(m_charMoveComp);
+            if (s) orientMove = *s ? 1 : 0;
+        }
+        Output::send<LogLevel::Verbose>(
+            STR("[ImmDlg] PC inDlg={} | allowedMove={} cineCntr={} cineSeq={} useCtrlYaw={} orientToMove={} immob={} ctxAct={}\n"),
+            inDlg ? 1 : 0, amt, cmc, cs, useCtrlYaw, orientMove, immob, ctxAct);
+
+        // Log which AnimInstance is currently sitting on CharacterMesh0.AnimScriptInstance
+        // in AND out of dialogue. If it swaps (e.g. Player_C -> dummy_C on dialogue entry),
+        // we've found how strafe gets disabled.
+        if (m_pawnMesh) {
+            FProperty* aip = m_pawnMesh->GetPropertyByNameInChain(STR("AnimScriptInstance"));
+            if (aip) {
+                UObject** slot = aip->ContainerPtrToValuePtr<UObject*>(m_pawnMesh);
+                UObject* curAI = (slot ? *slot : nullptr);
+                UClass* aicls = curAI ? curAI->GetClassPrivate() : nullptr;
+                Output::send<LogLevel::Verbose>(
+                    STR("[ImmDlg] MESH-AI inDlg={} AnimScriptInstance class={}\n"),
+                    inDlg ? 1 : 0,
+                    aicls ? aicls->GetName() : StringType(STR("(null)")));
+            }
+        }
+
+        // Log dummy_animation / dummy_blueprint values on the main AnimInstance. These are
+        // Read-Write props on AnimInstanceBase. If dummy_animation is a walk-forward asset
+        // that displays in dialogue, we've found the source of forward-only visibility.
+        if (m_animInstance) {
+            FProperty* da = m_animInstance->GetPropertyByNameInChain(STR("dummy_animation"));
+            FProperty* db = m_animInstance->GetPropertyByNameInChain(STR("dummy_blueprint"));
+            UObject* daVal = nullptr;
+            UObject* dbVal = nullptr;
+            if (da) { UObject** s = da->ContainerPtrToValuePtr<UObject*>(m_animInstance); if (s) daVal = *s; }
+            if (db) { UObject** s = db->ContainerPtrToValuePtr<UObject*>(m_animInstance); if (s) dbVal = *s; }
+            Output::send<LogLevel::Verbose>(
+                STR("[ImmDlg] MAIN-AI inDlg={} dummy_animation={} dummy_blueprint={}\n"),
+                inDlg ? 1 : 0,
+                daVal ? daVal->GetFullName() : StringType(STR("(null)")),
+                dbVal ? dbVal->GetFullName() : StringType(STR("(null)")));
+        }
+    }
+
+    // Shadow chain: PC has `shadow_mesh_component` (a SkeletalMeshComponent) with its OWN
+    // AnimInstance (AnimInstancePlayerShadow), which has its own `state_data` struct. Writes
+    // to the main mesh's AnimInstance state_data don't reach the shadow's, so we need to
+    // resolve + drive it separately for the shadow to visibly walk.
+    UObject* m_shadowMeshComp = nullptr;
+    UObject* m_shadowAnimInstance = nullptr;
+    FProperty* m_shadowStateProp = nullptr;
+    std::map<StringType, int32_t> m_shadowStateOffs;
+
+    // BH chain: the main mesh has a linked/sub anim instance `AnimBP_player_bh_C` in
+    // addition to the top-level `AnimBP_Player_C`. "bh" = body handler / locomotion layer.
+    // Discovered via ANIM-INST probe: writes to the top-level instance don't reach the
+    // linked layer, so directional locomotion data (Direction, BPDirection, gait) never
+    // affects the visible pose in dialogue — matching the observed forward-only symptom.
+    UObject* m_bhAnimInstance = nullptr;
+    FProperty* m_bhStateProp = nullptr;
+    FProperty* m_bhLocoProp = nullptr;
+    std::map<StringType, int32_t> m_bhStateOffs;
+    std::map<StringType, int32_t> m_bhLocoOffs;
+    bool m_bhTriedResolve = false;
+
+    void ResolveShadowChain(UObject* pawn) {
+        if (m_shadowAnimInstance) return;
+        if (!pawn) return;
+        // pawn.shadow_mesh_component (ObjectProperty → SkeletalMeshComponent).
+        FProperty* smcProp = pawn->GetPropertyByNameInChain(STR("shadow_mesh_component"));
+        if (!smcProp) smcProp = pawn->GetPropertyByNameInChain(STR("ShadowMeshComponent"));
+        if (!smcProp) {
+            Output::send<LogLevel::Verbose>(STR("[ImmDlg] shadow probe: shadow_mesh_component prop MISSING on pawn\n"));
+            return;
+        }
+        UObject** smcSlot = smcProp->ContainerPtrToValuePtr<UObject*>(pawn);
+        if (!smcSlot || !*smcSlot) return;
+        m_shadowMeshComp = *smcSlot;
+        // Get AnimInstance on the shadow mesh (via GetAnimInstance UFUNCTION or AnimScriptInstance UPROPERTY).
+        if (UFunction* getAI = m_shadowMeshComp->GetFunctionByNameInChain(FName(STR("GetAnimInstance")))) {
+            struct { UObject* Ret; } p{nullptr};
+            m_shadowMeshComp->ProcessEvent(getAI, &p);
+            m_shadowAnimInstance = p.Ret;
+        }
+        if (!m_shadowAnimInstance) {
+            if (FProperty* aip = m_shadowMeshComp->GetPropertyByNameInChain(STR("AnimScriptInstance"))) {
+                UObject** slot = aip->ContainerPtrToValuePtr<UObject*>(m_shadowMeshComp);
+                if (slot) m_shadowAnimInstance = *slot;
+            }
+        }
+        if (!m_shadowAnimInstance) {
+            Output::send<LogLevel::Verbose>(STR("[ImmDlg] shadow probe: AnimInstance not found on shadow mesh\n"));
+            return;
+        }
+        // state_data offsets on the shadow AnimInstance.
+        const wchar_t* sdNames[] = { STR("state_data"), STR("StateData") };
+        FProperty* sp = nullptr;
+        for (auto* n : sdNames) { sp = m_shadowAnimInstance->GetPropertyByNameInChain(n); if (sp) break; }
+        if (!sp) {
+            Output::send<LogLevel::Verbose>(STR("[ImmDlg] shadow probe: state_data prop MISSING on shadow AnimInstance\n"));
+            return;
+        }
+        m_shadowStateProp = sp;
+        FStructProperty* sfp = static_cast<FStructProperty*>(sp);
+        UScriptStruct* stru = sfp->GetStruct();
+        if (!stru) return;
+        UStruct* walker = stru;
+        while (walker) {
+            for (FProperty* p : TFieldRange<FProperty>(walker, EFieldIterationFlags::None)) {
+                if (p) m_shadowStateOffs[p->GetName()] = p->GetOffset_ForInternal();
+            }
+            walker = walker->GetSuperStruct();
+        }
+        Output::send<LogLevel::Verbose>(
+            STR("[ImmDlg] shadow chain resolved: shadowAI={}, state_data props={}\n"),
+            m_shadowAnimInstance->GetFullName(), (int)m_shadowStateOffs.size());
+    }
+
+    // Locate AnimBP_player_bh_C on our pawn's mesh hierarchy and cache its state_data +
+    // locomotion_data struct offsets. This is a linked/sub AnimInstance living on the SAME
+    // main mesh as AnimBP_Player_C — writes to the top-level instance don't reach it.
+    void ResolveBhChain(UObject* pawn) {
+        if (m_bhTriedResolve || !pawn) return;
+        m_bhTriedResolve = true;
+        StringType pawnFull = pawn->GetFullName();
+        size_t sp = pawnFull.find(STR(' '));
+        StringType pawnPath = (sp != StringType::npos) ? pawnFull.substr(sp + 1) : pawnFull;
+        UObject* found = nullptr;
+        UObjectGlobals::ForEachUObject([&](UObject* obj, int32_t, int32_t) -> LoopAction {
+            if (!obj || found) return LoopAction::Continue;
+            UClass* cls = obj->GetClassPrivate();
+            if (!cls) return LoopAction::Continue;
+            if (cls->GetName() != StringType(STR("AnimBP_player_bh_C"))) return LoopAction::Continue;
+            StringType full = obj->GetFullName();
+            if (full.find(pawnPath) == StringType::npos) return LoopAction::Continue;
+            found = obj;
+            return LoopAction::Continue;
+        });
+        if (!found) {
+            Output::send<LogLevel::Verbose>(STR("[ImmDlg] BH probe: AnimBP_player_bh_C NOT FOUND for pawn\n"));
+            return;
+        }
+        m_bhAnimInstance = found;
+        // Same struct names as main AnimInstance.
+        const wchar_t* sdNames[] = { STR("state_data"), STR("StateData") };
+        for (auto* n : sdNames) { m_bhStateProp = m_bhAnimInstance->GetPropertyByNameInChain(n); if (m_bhStateProp) break; }
+        const wchar_t* ldNames[] = { STR("locomotion_data"), STR("LocomotionData") };
+        for (auto* n : ldNames) { m_bhLocoProp = m_bhAnimInstance->GetPropertyByNameInChain(n); if (m_bhLocoProp) break; }
+        if (m_bhStateProp) {
+            FStructProperty* sfp = static_cast<FStructProperty*>(m_bhStateProp);
+            UScriptStruct* stru = sfp->GetStruct();
+            for (UStruct* w = stru; w; w = w->GetSuperStruct()) {
+                for (FProperty* p : TFieldRange<FProperty>(w, EFieldIterationFlags::None)) {
+                    if (p) m_bhStateOffs[p->GetName()] = p->GetOffset_ForInternal();
+                }
+            }
+        }
+        if (m_bhLocoProp) {
+            FStructProperty* sfp = static_cast<FStructProperty*>(m_bhLocoProp);
+            UScriptStruct* stru = sfp->GetStruct();
+            for (UStruct* w = stru; w; w = w->GetSuperStruct()) {
+                for (FProperty* p : TFieldRange<FProperty>(w, EFieldIterationFlags::None)) {
+                    if (p) m_bhLocoOffs[p->GetName()] = p->GetOffset_ForInternal();
+                }
+            }
+        }
+        Output::send<LogLevel::Verbose>(
+            STR("[ImmDlg] BH chain resolved: instance={} state_data={} locomotion_data={} stateOffs={} locoOffs={}\n"),
+            m_bhAnimInstance->GetFullName(),
+            m_bhStateProp ? STR("ok") : STR("null"),
+            m_bhLocoProp ? STR("ok") : STR("null"),
+            (int)m_bhStateOffs.size(), (int)m_bhLocoOffs.size());
+        // Dump the top-level class properties too — Blueprint may add fields specific to
+        // AnimBP_player_bh_C that we don't know about yet.
+        UClass* bhCls = m_bhAnimInstance->GetClassPrivate();
+        if (bhCls) {
+            int n = 0;
+            for (UStruct* w = bhCls; w && n < 60; w = w->GetSuperStruct()) {
+                for (FProperty* p : TFieldRange<FProperty>(w, EFieldIterationFlags::None)) {
+                    if (!p || n >= 60) break;
+                    Output::send<LogLevel::Verbose>(STR("[ImmDlg]   BH class prop: {}\n"), p->GetName());
+                    n++;
+                }
+            }
+        }
+    }
+
+    // Mirror the write pattern from ForceLocomotionData onto the BH AnimInstance.
+    void ForceBhLocomotion(bool moving, double inputFwd, double inputStrafe) {
+        if (!m_bhAnimInstance) return;
+        // state_data first: DynamicGaitValue / CurveGaitValue + b* flags.
+        if (m_bhStateProp) {
+            uint8_t* base = m_bhStateProp->ContainerPtrToValuePtr<uint8_t>(m_bhAnimInstance);
+            if (base) {
+                auto wB = [&](const wchar_t* name, bool val) {
+                    auto it = m_bhStateOffs.find(name);
+                    if (it == m_bhStateOffs.end()) return;
+                    *reinterpret_cast<bool*>(base + it->second) = val;
+                };
+                auto wF = [&](const wchar_t* name, float val) {
+                    auto it = m_bhStateOffs.find(name);
+                    if (it == m_bhStateOffs.end()) return;
+                    *reinterpret_cast<float*>(base + it->second) = val;
+                };
+                wB(STR("bAlive"),     true);
+                wB(STR("bMoving"),    moving);
+                wB(STR("bWalking"),   moving);
+                wB(STR("bRunning"),   false);
+                wB(STR("bSprinting"), false);
+                wB(STR("bJogging"),   false);
+                wB(STR("bInAir"),     false);
+                wB(STR("bCutscene"),  false);
+                wB(STR("bInCombat"),  false);
+                wF(STR("DynamicGaitValue"), moving ? 2.0f : 1.0f);
+                wF(STR("CurveGaitValue"),   0.0f);
+            }
+        }
+        // locomotion_data: Velocity / Direction / BPDirection / AngleDirection / PlayRate.
+        if (m_bhLocoProp) {
+            uint8_t* base = m_bhLocoProp->ContainerPtrToValuePtr<uint8_t>(m_bhAnimInstance);
+            if (base) {
+                auto wF = [&](const wchar_t* name, float val) {
+                    auto it = m_bhLocoOffs.find(name);
+                    if (it == m_bhLocoOffs.end()) return;
+                    *reinterpret_cast<float*>(base + it->second) = val;
+                };
+                auto wByte = [&](const wchar_t* name, uint8_t val) {
+                    auto it = m_bhLocoOffs.find(name);
+                    if (it == m_bhLocoOffs.end()) return;
+                    *reinterpret_cast<uint8_t*>(base + it->second) = val;
+                };
+                auto wB = [&](const wchar_t* name, bool val) {
+                    auto it = m_bhLocoOffs.find(name);
+                    if (it == m_bhLocoOffs.end()) return;
+                    *reinterpret_cast<bool*>(base + it->second) = val;
+                };
+                float playRate = 0.0f;
+                if (moving && inputFwd < 0.0) playRate = -1.0f;
+                wF(STR("MovementPlayRate"), playRate);
+                wF(STR("LegIKAlpha"),       1.0f);
+                wB(STR("bLegIKEnabled"),    true);
+                wB(STR("bEnablePlayRateCurves"), true);
+                if (!moving) {
+                    wF(STR("Velocity"), 0.0f);
+                    return;
+                }
+                double angRad = std::atan2(inputStrafe, inputFwd);
+                float  angDeg = (float)(angRad * 180.0 / 3.14159265358979323846);
+                wF(STR("AngleDirection"),   angDeg);
+                wF(STR("ClampedDirection"), angDeg);
+                float velCms = 150.0f;
+                if (inputFwd < 0.0) {
+                    float backT = (float)(-inputFwd);
+                    if (backT > 1.0f) backT = 1.0f;
+                    velCms = 150.0f * (1.0f - backT) + 85.0f * backT;
+                }
+                wF(STR("Velocity"), velCms);
+                uint8_t dirBitmask, bpDir;
+                double a = angDeg;
+                if      (a > -22.5   && a <=  22.5)  { dirBitmask = 1;    bpDir = 1; }
+                else if (a >  22.5   && a <=  67.5)  { dirBitmask = 1|8;  bpDir = 6; }
+                else if (a >  67.5   && a <= 112.5)  { dirBitmask = 8;    bpDir = 4; }
+                else if (a > 112.5   && a <= 157.5)  { dirBitmask = 2|8;  bpDir = 8; }
+                else if (a >  157.5  || a <= -157.5) { dirBitmask = 2;    bpDir = 2; }
+                else if (a > -157.5  && a <= -112.5) { dirBitmask = 2|4;  bpDir = 7; }
+                else if (a > -112.5  && a <=  -67.5) { dirBitmask = 4;    bpDir = 3; }
+                else                                  { dirBitmask = 1|4; bpDir = 5; }
+                wByte(STR("Direction"),   dirBitmask);
+                wByte(STR("BPDirection"), bpDir);
+            }
+        }
+    }
+
+    // Mesh-rotation bypass: since STALKER 2 gates dialogue anim behind a native check we
+    // can't intercept (proved by dynGait writes landing without effect), we can't get the
+    // strafe animation to play. Instead, physically rotate the visible mesh component's
+    // local yaw so the body faces the movement direction — from the mesh's frame, the
+    // forward-walk animation (which the dialog anim state plays) now looks correct.
+    //
+    // Cache each mesh's baseline RelativeRotation on first entry, then set to
+    // (base.Pitch, base.Yaw + movementDirYaw, base.Roll) while moving. Reset to baseline
+    // when idle or leaving dialogue.
+    double m_meshBaseYaw = 0.0;
+    double m_shadowBaseYaw = 0.0;
+    double m_meshBasePitch = 0.0;
+    double m_meshBaseRoll = 0.0;
+    double m_shadowBasePitch = 0.0;
+    double m_shadowBaseRoll = 0.0;
+    bool   m_meshBaseCached = false;
+    bool   m_shadowBaseCached = false;
+
+    FRotatorD ReadRelativeRotation(UObject* comp) {
+        FRotatorD out{0,0,0};
+        if (!comp) return out;
+        FProperty* p = comp->GetPropertyByNameInChain(STR("RelativeRotation"));
+        if (!p) return out;
+        FRotatorD* slot = p->ContainerPtrToValuePtr<FRotatorD>(comp);
+        if (slot) out = *slot;
+        return out;
+    }
+
+    void CacheMeshBaseRotations() {
+        if (!m_meshBaseCached && m_pawnMesh) {
+            FRotatorD r = ReadRelativeRotation(m_pawnMesh);
+            m_meshBasePitch = r.Pitch; m_meshBaseYaw = r.Yaw; m_meshBaseRoll = r.Roll;
+            m_meshBaseCached = true;
+            Output::send<LogLevel::Verbose>(
+                STR("[ImmDlg] main mesh baseline rot: P={} Y={} R={}\n"),
+                (float)r.Pitch, (float)r.Yaw, (float)r.Roll);
+        }
+        if (!m_shadowBaseCached && m_shadowMeshComp) {
+            FRotatorD r = ReadRelativeRotation(m_shadowMeshComp);
+            m_shadowBasePitch = r.Pitch; m_shadowBaseYaw = r.Yaw; m_shadowBaseRoll = r.Roll;
+            m_shadowBaseCached = true;
+            Output::send<LogLevel::Verbose>(
+                STR("[ImmDlg] shadow mesh baseline rot: P={} Y={} R={}\n"),
+                (float)r.Pitch, (float)r.Yaw, (float)r.Roll);
+        }
+    }
+
+    // Apply mesh rotation offset for movement direction. Called each frame in dialogue.
+    // yawOffsetDeg = atan2(strafe, fwd) — 0 for pure fwd, +90 for pure right, -90 for pure left.
+    // When moving==false, reset both meshes to baseline.
+    void ApplyMeshMovementRotation(bool moving, double yawOffsetDeg) {
+        CacheMeshBaseRotations();
+        if (moving) {
+            if (m_pawnMesh && m_meshBaseCached) {
+                SetMeshRelativeYaw(m_pawnMesh, m_meshBaseYaw + yawOffsetDeg);
+            }
+            if (m_shadowMeshComp && m_shadowBaseCached) {
+                SetMeshRelativeYaw(m_shadowMeshComp, m_shadowBaseYaw + yawOffsetDeg);
+            }
+        } else {
+            if (m_pawnMesh && m_meshBaseCached) {
+                SetMeshRelativeYaw(m_pawnMesh, m_meshBaseYaw);
+            }
+            if (m_shadowMeshComp && m_shadowBaseCached) {
+                SetMeshRelativeYaw(m_shadowMeshComp, m_shadowBaseYaw);
+            }
+        }
+    }
+
+    void ForceShadowAnimState(bool moving) {
+        if (!m_shadowStateProp || !m_shadowAnimInstance) return;
+        uint8_t* base = m_shadowStateProp->ContainerPtrToValuePtr<uint8_t>(m_shadowAnimInstance);
+        if (!base) return;
+        auto wB = [&](const wchar_t* name, bool val) {
+            auto it = m_shadowStateOffs.find(name);
+            if (it == m_shadowStateOffs.end()) return;
+            *reinterpret_cast<bool*>(base + it->second) = val;
+        };
+        auto wF = [&](const wchar_t* name, float val) {
+            auto it = m_shadowStateOffs.find(name);
+            if (it == m_shadowStateOffs.end()) return;
+            *reinterpret_cast<float*>(base + it->second) = val;
+        };
+        wB(STR("bAlive"),     true);
+        wB(STR("bMoving"),    moving);
+        wB(STR("bWalking"),   moving);
+        wB(STR("bRunning"),   false);
+        wB(STR("bSprinting"), false);
+        wB(STR("bJogging"),   false);
+        wB(STR("bInAir"),     false);
+        wB(STR("bCutscene"),  false);
+        wB(STR("bInCombat"),  false);
+        // Mirror the same gait writes we do on the main AnimInstance's state_data. The
+        // shadow AnimInstance has no locomotion_data (only state_data + shadow_data), so
+        // its state machine likely reads DynamicGaitValue for gait selection. Match the
+        // outside-dialogue ground truth: dynGait=2, curveGait=0 when moving; 1/0 when idle.
+        wF(STR("DynamicGaitValue"), moving ? 2.0f : 1.0f);
+        wF(STR("CurveGaitValue"),   0.0f);
     }
 
     // Every frame in dialogue: write our set of anim-state bool overrides. "moving" gates
@@ -851,7 +1441,12 @@ public:
             if (it == m_locomotionOffsets.end()) return;
             *reinterpret_cast<bool*>(base + it->second) = val;
         };
-        writeF(STR("MovementPlayRate"), moving ? 1.0f : 0.0f);
+        // Ground-truth PlayRate outside dialogue: 0 for fwd/strafe (game reads velocity
+        // directly), -1 for backward (game plays fwd-walk anim in reverse). Our previous
+        // constant 1 was wrong for both directions.
+        float playRate = 0.0f;
+        if (moving && inputFwd < 0.0) playRate = -1.0f;
+        writeF(STR("MovementPlayRate"), playRate);
         writeF(STR("LegIKAlpha"),       1.0f);
         writeB(STR("bLegIKEnabled"),    true);
         writeB(STR("bEnablePlayRateCurves"), true);
@@ -859,20 +1454,21 @@ public:
             writeF(STR("Velocity"), 0.0f);
             return;
         }
-        // Direction/velocity values below come from the outside-dialogue ground-truth dump:
-        //   - Velocity is cm/s (~150 forward walk; backward walk is much slower ~85)
-        //   - Direction is a BITMASK enum: 1=Fwd, 2=Back, 4=Left, 8=Right
-        //   - BPDirection is 4-way: 1=Fwd, 2=Back, 3=Left, 4=Right
+        // Ground-truth dump revealed:
+        //   - Velocity is cm/s (~150 fwd walk, ~85 back walk)
+        //   - Direction is BITMASK (Fwd=1 Back=2 Left=4 Right=8, OR'd for diagonals)
+        //   - BPDirection is 8-way (1=Fwd 2=Back 3=Left 4=Right 5=FwdLeft 6=FwdRight 7=BackLeft 8=BackRight)
         //   - AngleDirection is atan2(strafe, fwd) in degrees
+        // NOTE: We ALSO call PC::SetMoveVector in on_update, which is what the game's own
+        // input pipeline uses. If that succeeds, the game overwrites these values with
+        // correct ones (harmless — our writes get replaced by the game's). If not (or if
+        // the func doesn't exist), these serve as the fallback.
         double angRad = std::atan2(inputStrafe, inputFwd);
         float  angDeg = (float)(angRad * 180.0 / 3.14159265358979323846);
         writeF(STR("AngleDirection"),   angDeg);
         writeF(STR("ClampedDirection"), angDeg);
-        // Match game's natural backward-walk being slower than forward. Use magnitude of the
-        // forward component to interpolate: fully forward = 150, fully back = 85, strafe = 150.
         float velCms = 150.0f;
         if (inputFwd < 0.0) {
-            // 0..1 how "backward" we are (1 = straight back, 0 = pure strafe)
             float backT = (float)(-inputFwd);
             if (backT > 1.0f) backT = 1.0f;
             velCms = 150.0f * (1.0f - backT) + 85.0f * backT;
@@ -880,11 +1476,15 @@ public:
         writeF(STR("Velocity"), velCms);
 
         uint8_t dirBitmask, bpDir;
-        const double pi = 3.14159265358979323846;
-        if      (angRad > -pi/4 && angRad <  pi/4)     { dirBitmask = 1; bpDir = 1; } // Fwd
-        else if (angRad >=  pi/4 && angRad < 3*pi/4)   { dirBitmask = 8; bpDir = 4; } // Right
-        else if (angRad >= 3*pi/4 || angRad < -3*pi/4) { dirBitmask = 2; bpDir = 2; } // Back
-        else                                            { dirBitmask = 4; bpDir = 3; } // Left
+        double a = angDeg;
+        if      (a > -22.5   && a <=  22.5)  { dirBitmask = 1;    bpDir = 1; }
+        else if (a >  22.5   && a <=  67.5)  { dirBitmask = 1|8;  bpDir = 6; }
+        else if (a >  67.5   && a <= 112.5)  { dirBitmask = 8;    bpDir = 4; }
+        else if (a > 112.5   && a <= 157.5)  { dirBitmask = 2|8;  bpDir = 8; }
+        else if (a >  157.5  || a <= -157.5) { dirBitmask = 2;    bpDir = 2; }
+        else if (a > -157.5  && a <= -112.5) { dirBitmask = 2|4;  bpDir = 7; }
+        else if (a > -112.5  && a <=  -67.5) { dirBitmask = 4;    bpDir = 3; }
+        else                                  { dirBitmask = 1|4; bpDir = 5; }
         auto writeByte = [&](const wchar_t* name, uint8_t val) {
             auto it = m_locomotionOffsets.find(name);
             if (it == m_locomotionOffsets.end()) return;
@@ -893,6 +1493,7 @@ public:
         writeByte(STR("Direction"),   dirBitmask);
         writeByte(STR("BPDirection"), bpDir);
     }
+
 
     // Drive shadow_data. bShouldUseBHLocomotion is the key — off = shadow uses static pose,
     // on = shadow follows the body's locomotion animation.
@@ -979,6 +1580,89 @@ public:
             readFloat(m_shadowDataProp,     m_shadowOffsets,     STR("MovementPlayRate")),
             readFloat(m_shadowDataProp,     m_shadowOffsets,     STR("AngleDirection"))
         );
+
+        // Extended dump: the state_data properties we haven't been reading yet. These are
+        // the most likely gates for the "dialog locomotion state" that plays forward-walk
+        // regardless of Direction. Compare in/out of dialogue to find the differing lever.
+        auto readStateByteByName = [&](const wchar_t* name) -> int {
+            if (!m_stateDataProp) return -1;
+            uint8_t* base = m_stateDataProp->ContainerPtrToValuePtr<uint8_t>(m_animInstance);
+            if (!base) return -1;
+            FProperty* p = nullptr;
+            {
+                FStructProperty* sfp = static_cast<FStructProperty*>(m_stateDataProp);
+                UScriptStruct* stru = sfp->GetStruct();
+                UStruct* w = stru;
+                while (w && !p) {
+                    for (FProperty* pp : TFieldRange<FProperty>(w, EFieldIterationFlags::None)) {
+                        if (pp && pp->GetName() == name) { p = pp; break; }
+                    }
+                    w = w->GetSuperStruct();
+                }
+            }
+            if (!p) return -1;
+            return (int)*(uint8_t*)(base + p->GetOffset_ForInternal());
+        };
+        auto readStateFloatByName = [&](const wchar_t* name) -> float {
+            if (!m_stateDataProp) return 0.0f;
+            uint8_t* base = m_stateDataProp->ContainerPtrToValuePtr<uint8_t>(m_animInstance);
+            if (!base) return 0.0f;
+            FProperty* p = nullptr;
+            {
+                FStructProperty* sfp = static_cast<FStructProperty*>(m_stateDataProp);
+                UScriptStruct* stru = sfp->GetStruct();
+                UStruct* w = stru;
+                while (w && !p) {
+                    for (FProperty* pp : TFieldRange<FProperty>(w, EFieldIterationFlags::None)) {
+                        if (pp && pp->GetName() == name) { p = pp; break; }
+                    }
+                    w = w->GetSuperStruct();
+                }
+            }
+            if (!p) return 0.0f;
+            return *(float*)(base + p->GetOffset_ForInternal());
+        };
+        auto readStateBoolByName = [&](const wchar_t* name) -> int {
+            if (!m_stateDataProp) return -1;
+            uint8_t* base = m_stateDataProp->ContainerPtrToValuePtr<uint8_t>(m_animInstance);
+            if (!base) return -1;
+            FProperty* p = nullptr;
+            {
+                FStructProperty* sfp = static_cast<FStructProperty*>(m_stateDataProp);
+                UScriptStruct* stru = sfp->GetStruct();
+                UStruct* w = stru;
+                while (w && !p) {
+                    for (FProperty* pp : TFieldRange<FProperty>(w, EFieldIterationFlags::None)) {
+                        if (pp && pp->GetName() == name) { p = pp; break; }
+                    }
+                    w = w->GetSuperStruct();
+                }
+            }
+            if (!p) return -1;
+            return *(bool*)(base + p->GetOffset_ForInternal()) ? 1 : 0;
+        };
+        // dialog_data.dialog is a single bool at offset 0 of the struct (we know from prior probe).
+        int dialogBit = -1;
+        if (m_dialogDataProp) {
+            uint8_t* dm = m_dialogDataProp->ContainerPtrToValuePtr<uint8_t>(m_animInstance);
+            if (dm) dialogBit = *dm ? 1 : 0;
+        }
+        Output::send<LogLevel::Verbose>(
+            STR("[ImmDlg] STATE-EXT inDlg={} mov={} | gait={} curveGait={} dynGait={} actionSlot={} fullBodySlot={} combatAct={} climbing={} crouching={} dragBody={} inspItem={} leftHandBusy={} dialog_data.dialog={}\n"),
+            inDlg ? 1 : 0, moving ? 1 : 0,
+            readStateByteByName(STR("EnumGaitState")),
+            readStateFloatByName(STR("CurveGaitValue")),
+            readStateFloatByName(STR("DynamicGaitValue")),
+            readStateBoolByName(STR("bActionSlotActive")),
+            readStateBoolByName(STR("bFullBodySlotActive")),
+            readStateBoolByName(STR("bCombatActionActive")),
+            readStateBoolByName(STR("bClimbing")),
+            readStateBoolByName(STR("bCrouching")),
+            readStateBoolByName(STR("bDragDeadBody")),
+            readStateBoolByName(STR("bIsInspectingItem")),
+            readStateBoolByName(STR("bIsLeftHandBusy")),
+            dialogBit
+        );
     }
 
     // Apply the same set of "walking, alive, not-in-air/combat/cutscene" writes to any
@@ -1022,6 +1706,32 @@ public:
             if (off < 0) return;
             *reinterpret_cast<bool*>(structBase + off) = val;
         };
+        // Ground-truth log comparison (outside vs inside dialogue while walking):
+        //   outside walking: dynGait=2, curveGait=0
+        //   outside idle   : dynGait=1, curveGait=0
+        //   inside  walking: dynGait=1, curveGait=? (our previous force to 3 pushed graph
+        //     into a dialogue-restricted gait branch with no strafe blends)
+        // Match the outside values exactly so the anim graph enters its normal locomotion
+        // state with directional blends available.
+        {
+            FStructProperty* sfp = static_cast<FStructProperty*>(m_stateDataProp);
+            UScriptStruct* stru = sfp->GetStruct();
+            UStruct* w = stru;
+            FProperty* dynProp = nullptr;
+            FProperty* curveProp = nullptr;
+            while (w && !(dynProp && curveProp)) {
+                for (FProperty* p : TFieldRange<FProperty>(w, EFieldIterationFlags::None)) {
+                    if (!p) continue;
+                    if (!dynProp   && p->GetName() == STR("DynamicGaitValue")) dynProp = p;
+                    if (!curveProp && p->GetName() == STR("CurveGaitValue"))   curveProp = p;
+                }
+                w = w->GetSuperStruct();
+            }
+            float dynTarget   = moving ? 2.0f : 1.0f;
+            float curveTarget = 0.0f;
+            if (dynProp)   *reinterpret_cast<float*>(structBase + dynProp->GetOffset_ForInternal())   = dynTarget;
+            if (curveProp) *reinterpret_cast<float*>(structBase + curveProp->GetOffset_ForInternal()) = curveTarget;
+        }
         // Override flags: never jog/sprint/crouch/in-air/combat-idle in dialogue.
         write(m_offJoggingOverride,   false);
         write(m_offSprintingOverride, false);
@@ -1073,6 +1783,25 @@ public:
         if (!m_pawnCamera || !m_fovProp) return;
         float* slot = m_fovProp->ContainerPtrToValuePtr<float>(m_pawnCamera);
         if (slot) *slot = fov;
+    }
+
+    // Camera is attached to a mesh socket (head bone for head-bob) — so when we rotate
+    // the mesh for the strafe bypass, camera rotation follows. Call USceneComponent::
+    // SetAbsolute(bAbsLoc, bAbsRot, bAbsScale) on the camera to make its rotation ignore
+    // the parent bone. Camera location still tracks head bone (fine for yaw rotation
+    // since head is directly above pawn origin — Y/X don't change).
+    bool m_camAbsRotApplied = false;
+    void SetCameraRotationAbsolute(bool absolute) {
+        if (!m_pawnCamera) return;
+        if (absolute == m_camAbsRotApplied) return;
+        UFunction* fn = m_pawnCamera->GetFunctionByNameInChain(FName(STR("SetAbsolute")));
+        if (!fn) return;
+        struct { bool bAbsLoc; bool bAbsRot; bool bAbsScale; } p{false, absolute, false};
+        m_pawnCamera->ProcessEvent(fn, &p);
+        m_camAbsRotApplied = absolute;
+        Output::send<LogLevel::Verbose>(
+            STR("[ImmDlg] camera rotation absolute -> {}\n"),
+            absolute ? STR("true") : STR("false"));
     }
 
     // Apply FOV policy in/out of dialogue.
@@ -1161,7 +1890,11 @@ public:
         // Resolve camera once (runs in AND out of dialogue so we can sample non-dialogue FOV).
         ResolvePawnCamera(pawn);
         ResolvePawnAnimInstance(pawn);
+        ResolveShadowChain(pawn);
+        ResolveBhChain(pawn);
+        ResolveRotationControl(pawn);
         ApplyFovPolicy(inDlg);
+        LogPcState(pawn, inDlg);
 
         // Hotkey polling every frame (works even outside dialogue).
         PollHotkeys();
@@ -1189,6 +1922,8 @@ public:
         if (!m_prevInDialog) {
             LoadStalker2Settings();
             ProbeFootstepAudio(pawn);
+            ProbeAllAnimInstances(pawn);
+            DumpMainAnimInstanceProps();
             m_prevInDialog = true;
         }
 
@@ -1222,11 +1957,17 @@ public:
         // Force anim state overrides (in dialogue). Idle/dialogue flags always false; walking
         // flags true only when actually moving. Locomotion + shadow driven by numeric writes.
         if (inDlg) {
+            // Call the game's own input-feed primitive with the raw WASD/stick vector.
+            // Outside dialogue the game's input pipeline calls this every frame; in dialogue
+            // it's gated, so anim state (Direction/Gait) never gets the correct directional
+            // signal. Feeding it ourselves lets the game's natural locomotion pipeline drive
+            // the anim graph — same class of bypass as the Wwise footstep fix.
+            //   Pawn-relative convention: X=forward, Y=right (strafe), Z=0
+            SetMoveVector(pawn, fwd, strafe, 0.0);
             ForceAnimState(moving);
             ForceLocomotionData(moving, fwd, strafe);
-            // ForceShadowData removed — ground-truth dump shows shadow.bBHLoco=0 and
-            // PlayRate=0 outside dialogue when the shadow animates fine, so writing
-            // those to 1 was breaking the shadow rather than driving it.
+            ForceShadowAnimState(moving);
+            ForceBhLocomotion(moving, fwd, strafe);
         }
         // Comparison logging: dumps current anim-instance values every 500ms in BOTH dialogue
         // and non-dialogue. Walk outside dialogue -> see what "correct walking" looks like;
