@@ -48,6 +48,7 @@ static std::atomic<bool>     g_pauseTapPending{false}; // WndProc -> on_update: 
 static std::atomic<uint64_t> g_lieDialogUntil{0};    // window during which IsInStaticDialog is forced to false
                                                      // (currently unused — tap-pause is parked)
 static std::atomic<UObject*> g_hookPawn{nullptr};    // pawn the animation-state lie hooks fire for
+static std::atomic<int>      g_relaxIdleSetCoerced{0};  // diagnostic: how often our pre-hook mutated a SetStandToRelaxIdle(true) into (false)
 
 // Game settings loaded from AppliedSettingsWin64.cfg (refreshed on each dialogue entry)
 static std::atomic<double>   g_mouseSensCoef{1.0};
@@ -384,7 +385,10 @@ public:
                     && g_inDialogue.load(std::memory_order_relaxed)) {
                     struct P { bool NewValue; };
                     P& p = ctx.GetParams<P>();
-                    p.NewValue = false;
+                    if (p.NewValue) {
+                        p.NewValue = false;
+                        g_relaxIdleSetCoerced.fetch_add(1, std::memory_order_relaxed);
+                    }
                 }
             };
         m_hookSetRelaxIdle = UObjectGlobals::RegisterHook(
@@ -793,7 +797,17 @@ public:
             LogInputActionsOnce();
             LogMenuClassesOnce();
             EnumerateBP_SML_Once();
+            g_relaxIdleSetCoerced.store(0, std::memory_order_relaxed);
             m_prevInDialog = true;
+        }
+        // Periodic diagnostic: how often did our pre-hook coerce SetStandToRelaxIdle(true)?
+        // If this stays 0, the game isn't going through the reflected setter at all.
+        static int diagFrameCounter = 0;
+        if (++diagFrameCounter >= 180) {
+            diagFrameCounter = 0;
+            Output::send<LogLevel::Verbose>(
+                STR("[ImmDlg] diag: SetStandToRelaxIdle(true) calls coerced in last ~3s window: {}\n"),
+                g_relaxIdleSetCoerced.exchange(0, std::memory_order_relaxed));
         }
 
         // Tap-Escape: one more real attempt at the actual pause menu. Instead of spawning
@@ -808,25 +822,44 @@ public:
         if (g_pauseTapPending.exchange(false, std::memory_order_relaxed)) {
             m_worldPaused = !m_worldPaused;
             if (m_worldPaused) {
-                UObject* existingWidget = UObjectGlobals::FindFirstOf(STR("W_PauseMenuMainView_C"));
+                // FindAllOf every W_PauseMenuMainView_C instance; the first hit is BP_SML's
+                // mod-loader template copy (empty), the game's real one lives elsewhere.
+                std::vector<UObject*> instances;
+                UObjectGlobals::FindAllOf(STR("W_PauseMenuMainView_C"), instances);
+                UObject* target = nullptr;
+                int idx = -1;
+                for (size_t i = 0; i < instances.size(); ++i) {
+                    UObject* inst = instances[i];
+                    if (!inst) continue;
+                    StringType full = inst->GetFullName();
+                    Output::send<LogLevel::Verbose>(STR("[ImmDlg]   PMMV instance [{}]: {}\n"), (int)i, full);
+                    // Prefer instance NOT owned by BP_SML (that's the mod loader template)
+                    if (!target && full.find(STR("BP_SML")) == StringType::npos) {
+                        target = inst;
+                        idx = (int)i;
+                    }
+                }
+                // If none found outside BP_SML, fall back to the first one anyway
+                if (!target && !instances.empty()) { target = instances[0]; idx = 0; }
+
                 bool addedToView = false;
-                if (existingWidget) {
-                    if (UFunction* addFn = existingWidget->GetFunctionByNameInChain(FName(STR("AddToViewport")))) {
+                if (target) {
+                    if (UFunction* addFn = target->GetFunctionByNameInChain(FName(STR("AddToViewport")))) {
                         alignas(8) char addP[16] = {}; *reinterpret_cast<int32_t*>(addP) = 1000;
-                        existingWidget->ProcessEvent(addFn, addP);
+                        target->ProcessEvent(addFn, addP);
                         addedToView = true;
                     }
-                    if (UFunction* visFn = existingWidget->GetFunctionByNameInChain(FName(STR("SetVisibility")))) {
+                    if (UFunction* visFn = target->GetFunctionByNameInChain(FName(STR("SetVisibility")))) {
                         alignas(8) char visP[16] = {}; visP[0] = 0; // Visible
-                        existingWidget->ProcessEvent(visFn, visP);
+                        target->ProcessEvent(visFn, visP);
                     }
-                    m_spawnedPauseWidget = existingWidget;
+                    m_spawnedPauseWidget = target;
                 }
                 bool frozen = DirectWorldPause(pawn, true);
                 Output::send<LogLevel::Verbose>(
-                    STR("[ImmDlg] pause ON: freeze={}, existingWidget={}, addedToView={}\n"),
+                    STR("[ImmDlg] pause ON: freeze={}, instances={}, using idx={}, added={}\n"),
                     frozen ? STR("ok") : STR("fail"),
-                    existingWidget ? STR("FOUND") : STR("MISSING - open pause menu once outside dialogue first"),
+                    (int)instances.size(), idx,
                     addedToView ? STR("ok") : STR("skipped"));
             } else {
                 DirectWorldPause(pawn, false);
