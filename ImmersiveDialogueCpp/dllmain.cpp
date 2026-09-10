@@ -42,10 +42,10 @@ static std::atomic<bool>     g_inDialogue{false};
 // Escape hold/tap state
 static std::atomic<uint64_t> g_escDownTime{0};       // GetTickCount64() at press; 0 = not pressed
 static std::atomic<bool>     g_escSwallowed{false};  // we're currently swallowing the user's Esc
-static std::atomic<uint64_t> g_synthEscUntil{0};     // pass Esc events through while now < this
+static std::atomic<int>      g_synthEscConsume{0};   // number of Esc key events to treat as ours (pass through)
 static std::atomic<bool>     g_pauseTapPending{false}; // WndProc -> on_update: user tapped Esc
 static std::atomic<uint64_t> g_lieDialogUntil{0};    // window during which IsInStaticDialog is forced to false
-                                                     // (so game's pause action doesn't refuse to open)
+                                                     // (currently unused — tap-pause is parked)
 
 // Game settings loaded from AppliedSettingsWin64.cfg (refreshed on each dialogue entry)
 static std::atomic<double>   g_mouseSensCoef{1.0};
@@ -61,7 +61,7 @@ static bool    g_rawReady    = false;
 // Escape timing constants
 static constexpr uint64_t ESC_TAP_MAX_MS   = 300;  // release before this -> tap
 static constexpr uint64_t ESC_HOLD_MIN_MS  = 500;  // held past this -> hold
-static constexpr uint64_t SYNTH_GUARD_MS   = 500;  // synthesized Esc passes through for this long
+// (SYNTH_GUARD_MS removed — replaced with per-event consumption counter g_synthEscConsume)
 
 // ================= Controller (XInput) with IAT-patched hook =================
 // We patch the GAME's Import Address Table for XInputGetState so its polling sees zeroed
@@ -191,7 +191,9 @@ static void LoadStalker2Settings() {
 
 // ================= Raw mouse + keyboard WndProc =================
 static void SendSyntheticEscape(int presses) {
-    g_synthEscUntil.store(GetTickCount64() + SYNTH_GUARD_MS, std::memory_order_relaxed);
+    // Reserve exactly 2 pass-through slots per press (KEYDOWN + KEYUP). WndProc consumes
+    // one per Esc event, so user's real held-Esc repeats after us are correctly swallowed.
+    g_synthEscConsume.fetch_add(presses * 2, std::memory_order_relaxed);
     INPUT ins[4] = {};
     int n = 0;
     for (int i = 0; i < presses; ++i) {
@@ -232,8 +234,14 @@ static LRESULT CALLBACK HookedWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         // Escape: hold/tap arbitration, but let our own synthetic Escapes through.
         if (w == VK_ESCAPE) {
             uint64_t now = GetTickCount64();
-            if (now < g_synthEscUntil.load(std::memory_order_relaxed)) {
-                return CallWindowProc(g_origWndProc, h, msg, w, l); // synthesized: pass through
+            // If this event was queued by our SendSyntheticEscape, consume one slot and pass
+            // through to the game. Real user repeats never get miscounted as synth.
+            int expected = g_synthEscConsume.load(std::memory_order_relaxed);
+            while (expected > 0) {
+                if (g_synthEscConsume.compare_exchange_weak(expected, expected - 1,
+                                                             std::memory_order_relaxed)) {
+                    return CallWindowProc(g_origWndProc, h, msg, w, l);
+                }
             }
             if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) {
                 bool isRepeat = (l & 0x40000000) != 0;
@@ -629,22 +637,11 @@ public:
             m_prevInDialog = true;
         }
 
-        // Tap-Escape latch: open the game's REAL pause menu (with Settings/Save/Load/Quit).
-        // Two strategies in one shot:
-        //   A) Directly spawn PauseMenuMainView via WidgetBlueprintLibrary::Create -> AddToViewport
-        //      (bypasses the input-action gate entirely).
-        //   B) Also fire the lie-hook + synthetic Esc as backup, in case A didn't render.
-        if (g_pauseTapPending.exchange(false, std::memory_order_relaxed)) {
-            uint64_t now = GetTickCount64();
-            UObject* w = TrySpawnPauseMenuWidget(pawn);
-            if (w) m_spawnedPauseWidget = w;
-            g_lieDialogUntil.store(now + 300, std::memory_order_relaxed);
-            g_synthEscUntil.store (now + 500, std::memory_order_relaxed);
-            SendSyntheticEscape(1);
-            Output::send<LogLevel::Verbose>(
-                STR("[ImmDlg] pause tap -> widget spawn={}, lie+synthEsc fired\n"),
-                w ? STR("ok") : STR("null"));
-        }
+        // Tap-Escape: PARKED. Attempts to spawn PauseMenuMainView + lie about IsInStaticDialog
+        // to open the game's pause menu didn't work and appeared to interfere with dialogue
+        // exit. For now, tap-Esc is a no-op (swallowed at the WndProc layer). Hold-Esc still
+        // works to exit dialogue. Consuming the flag so it doesn't stack up.
+        (void)g_pauseTapPending.exchange(false, std::memory_order_relaxed);
 
         // Hold-Escape latch: once we cross the hold threshold, fire close-dialogue and mark.
         if (g_escSwallowed.load(std::memory_order_relaxed) && !m_escHoldFired) {
@@ -652,6 +649,7 @@ public:
             if (down != 0 && (GetTickCount64() - down) >= ESC_HOLD_MIN_MS) {
                 m_escHoldFired = true;
                 SendSyntheticEscape(1); // one Esc -> close dialogue; do NOT open pause
+                Output::send<LogLevel::Verbose>(STR("[ImmDlg] hold-Esc fired -> synthetic Esc -> game\n"));
             }
         }
         if (!g_escSwallowed.load(std::memory_order_relaxed)) {
