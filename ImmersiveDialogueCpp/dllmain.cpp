@@ -248,9 +248,10 @@ public:
     // We enumerate at first dialogue entry — game's anim graph doesn't play walk cycles during
     // dialogue (native C++ path we can't hook via reflection), so foot notifies never fire, so
     // no footstep audio ever plays. We manually trigger Wwise events instead.
-    UObject*  m_ftFootstepEvent = nullptr; // UAkAudioEvent* for footstep (grass/dirt/whatever the game has)
+    UObject*  m_ftFootstepEvent = nullptr; // UAkAudioEvent* for footstep (all surface + gait variants)
     UObject*  m_ftAkComponent   = nullptr; // UAkComponent* on the pawn
-    UFunction* m_ftPostEventFn  = nullptr; // Function to call PostEvent on the component
+    UFunction* m_ftPostEventFn  = nullptr; // PostAkEvent-family function on the component
+    UFunction* m_ftSetSwitchFn  = nullptr; // UAkComponent::SetSwitch(FName group, FName state)
     bool      m_ftProbed = false;
     uint64_t  m_ftNextStepAtMs = 0;
     static constexpr uint64_t FT_STEP_INTERVAL_MS = 450; // ~2.2 steps/sec at walk
@@ -260,7 +261,10 @@ public:
     // pull the camera back to the NPC and clamp view angles in dialogue. If we call the
     // base class's DisableModifier(true) on every instance each frame, the modifier stops
     // applying its yaw/pitch bias and clamp — freeing the camera.
-    bool       m_camCenteringDisabled = false;      // toggled by F5
+    // Default: camera-centering OFF (free camera) — the natural fit for immersive dialogue.
+    // Config file overrides this on load; if user sets DisableCameraCentering=false in the
+    // ini or via MCM, the game default (centering ON) is restored.
+    bool       m_camCenteringDisabled = true;       // toggled by F6
     bool       m_configLoaded         = false;
     bool       m_f5Prev               = false;
     std::vector<UObject*> m_lookAtModifiers;
@@ -426,6 +430,10 @@ public:
                     break;
                 }
             }
+            // SetSwitch UFUNCTION for setting Wwise switches (MovementType, SurfaceMaterial).
+            m_ftSetSwitchFn = m_ftAkComponent->GetFunctionByNameInChain(FName(STR("SetSwitch")));
+            Output::send<LogLevel::Verbose>(STR("[ImmDlg] footstep set-switch fn: {}\n"),
+                                             m_ftSetSwitchFn ? STR("found") : STR("MISSING"));
         }
 
         Output::send<LogLevel::Verbose>(
@@ -436,7 +444,14 @@ public:
             m_ftPostEventFn   ? STR("FOUND") : STR("MISSING"));
     }
 
+    // SetSwitch is DISABLED — the FName/FName param layout guess crashed the game.
+    // Real signature is likely UAkComponent::SetSwitch(UAkSwitchValue*) taking a UObject
+    // pointer to the switch value, not name strings. Need to enumerate AkSwitchValue
+    // instances first and cache pointers per (group,state) — separate iteration.
+    void SetAkSwitch(const wchar_t*, const wchar_t*) { /* no-op — see comment */ }
+
     // Fire a synthetic footstep sound via the pawn's AkComponent, at walk cadence.
+    // Without SetSwitch, Wwise plays a default variant (works, but material-agnostic).
     void MaybeFireFootstep(bool moving) {
         if (!m_ftFootstepEvent || !m_ftAkComponent || !m_ftPostEventFn) return;
         if (!moving) { m_ftNextStepAtMs = 0; return; }
@@ -445,8 +460,6 @@ public:
         if (now < m_ftNextStepAtMs) return;
         m_ftNextStepAtMs = now + FT_STEP_INTERVAL_MS;
 
-        // Best-effort ProcessEvent — parameter layouts vary by Wwise plugin version. We
-        // pass the event pointer as the first field with a generous zero-padded frame.
         alignas(8) char buf[128] = {};
         *reinterpret_cast<UObject**>(buf) = m_ftFootstepEvent;
         m_ftAkComponent->ProcessEvent(m_ftPostEventFn, buf);
