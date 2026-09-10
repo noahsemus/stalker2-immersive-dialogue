@@ -24,6 +24,7 @@
 #include <Unreal/UClass.hpp>
 #include <Unreal/UFunction.hpp>
 #include <Unreal/NameTypes.hpp>
+#include <Unreal/CoreUObject/UObject/UnrealType.hpp>
 #include <Constructs/Loop.hpp>
 
 #include <vector>
@@ -279,6 +280,16 @@ public:
     // Config file overrides this on load; if user sets DisableCameraCentering=false in the
     // ini or via MCM, the game default (centering ON) is restored.
     bool       m_camCenteringDisabled = true;       // toggled by F6
+
+    // FOV control (config-only, no hotkey):
+    //   DisableDialogueFovChange=true  -> force FOV back to non-dialogue value in dialogue
+    //   DialogueFov=<float>            -> if > 0, force FOV to this exact value in dialogue
+    //                                     (takes precedence over DisableDialogueFovChange)
+    bool       m_disableDialogueFov = false;
+    float      m_dialogueFovOverride = 0.0f;
+    float      m_cachedNonDialogueFov = 0.0f;       // last FOV we saw outside dialogue
+    UObject*   m_pawnCamera = nullptr;              // UCameraComponent on the pawn
+    FProperty* m_fovProp = nullptr;                 // FloatProperty "FieldOfView"
     bool       m_configLoaded         = false;
     bool       m_f5Prev               = false;
     std::vector<UObject*> m_lookAtModifiers;
@@ -307,15 +318,20 @@ public:
             if (eq == std::string::npos) continue;
             std::string k = trim(line.substr(0, eq));
             std::string v = trim(line.substr(eq + 1));
-            if (k == "DisableCameraCentering") m_camCenteringDisabled = (v == "true" || v == "1");
+            if      (k == "DisableCameraCentering")     m_camCenteringDisabled = (v == "true" || v == "1");
+            else if (k == "DisableDialogueFovChange")   m_disableDialogueFov   = (v == "true" || v == "1");
+            else if (k == "DialogueFov")                { try { m_dialogueFovOverride = std::stof(v); } catch(...) {} }
         }
     }
     void SaveConfig() {
         std::wstring path = ConfigPath();
         std::ofstream f(path.c_str(), std::ios::trunc);
         if (!f) return;
-        f << "; ImmersiveDialogue config — MCM-compatible key/value ini format\n";
+        f << "; ImmersiveDialogue config — key/value ini format\n";
         f << "DisableCameraCentering=" << (m_camCenteringDisabled ? "true" : "false") << "\n";
+        f << "DisableDialogueFovChange=" << (m_disableDialogueFov ? "true" : "false") << "\n";
+        f << "; DialogueFov: 0 = no override, non-zero = force this FOV (deg) in dialogue\n";
+        f << "DialogueFov=" << m_dialogueFovOverride << "\n";
     }
 
     ImmersiveDialogue() {
@@ -532,26 +548,60 @@ public:
         m_ftAkComponent->ProcessEvent(m_ftPostEventFn, buf);
     }
 
-    // Force-play the walk montage on the pawn while moving in dialogue. If the montage
-    // exists and the PlayAnimMontage UFUNCTION resolves, the anim graph's dialogue-idle
-    // state gets overridden and the character shows a real walking pose with foot IK.
-    bool m_montagePlaying = false;
-    void MaybePlayWalkMontage(UObject* pawn, bool moving) {
-        if (!m_walkMontage || !m_playMontageFn) return;
-        if (moving && !m_montagePlaying) {
-            // ACharacter::PlayAnimMontage(UAnimMontage* AnimMontage, float PlayRate=1.0, FName StartSection=None)
-            alignas(8) char buf[64] = {};
-            *reinterpret_cast<UObject**>(buf + 0) = m_walkMontage;
-            *reinterpret_cast<float*>  (buf + 8) = 1.0f;
-            // Return value (float) at offset ~24 — leave zero.
-            pawn->ProcessEvent(m_playMontageFn, buf);
-            m_montagePlaying = true;
-        } else if (!moving && m_montagePlaying) {
-            // Stop by playing an empty montage — safer than StopAnimMontage which needs the same pointer.
-            // For simplicity we just flag; game will loop the walk montage until we move again.
-            // (Proper stop requires StopAnimMontage UFUNCTION — future polish.)
-            m_montagePlaying = false;
+    // Force-play walk montage — REMOVED. STALKER 2's walking isn't an AnimMontage asset
+    // (walk is a state in the anim graph state machine, not a one-shot montage). The
+    // dialogue-idle lock is enforced in native C++ we can't hook. Body/foot IK during
+    // dialogue movement isn't reachable without RE work on the anim graph.
+
+    // Resolve pawn camera + FOV property (once, on first dialogue entry).
+    void ResolvePawnCamera(UObject* pawn) {
+        if (m_pawnCamera) return;
+        UFunction* getCam = pawn->GetFunctionByNameInChain(FName(STR("GetCameraComponent")));
+        if (!getCam) getCam = pawn->GetFunctionByNameInChain(FName(STR("K2_GetCameraComponent")));
+        if (!getCam) return;
+        struct { UObject* Ret; } p{nullptr};
+        pawn->ProcessEvent(getCam, &p);
+        m_pawnCamera = p.Ret;
+        if (m_pawnCamera) {
+            m_fovProp = m_pawnCamera->GetPropertyByNameInChain(STR("FieldOfView"));
+            Output::send<LogLevel::Verbose>(STR("[ImmDlg] camera+fov resolved: cam={}, fovProp={}\n"),
+                                             m_pawnCamera ? STR("ok") : STR("null"),
+                                             m_fovProp    ? STR("ok") : STR("null"));
         }
+    }
+
+    // Read current camera FOV via property. Returns 0 if not available.
+    float ReadCameraFov() {
+        if (!m_pawnCamera || !m_fovProp) return 0.0f;
+        float* slot = m_fovProp->ContainerPtrToValuePtr<float>(m_pawnCamera);
+        return slot ? *slot : 0.0f;
+    }
+    void WriteCameraFov(float fov) {
+        if (!m_pawnCamera || !m_fovProp) return;
+        float* slot = m_fovProp->ContainerPtrToValuePtr<float>(m_pawnCamera);
+        if (slot) *slot = fov;
+    }
+
+    // Apply FOV policy in/out of dialogue.
+    // Outside dialogue: cache the current FOV as the "normal" value (updated every ~1s
+    // in case game changes it based on aiming/scope state — we grab the last stable one).
+    // In dialogue: if DialogueFov > 0, force it; else if DisableDialogueFovChange, force the cached non-dialogue FOV.
+    uint64_t m_lastFovSampleMs = 0;
+    void ApplyFovPolicy(bool inDlg) {
+        if (!m_pawnCamera || !m_fovProp) return;
+        uint64_t now = GetTickCount64();
+        if (!inDlg) {
+            if (now - m_lastFovSampleMs > 1000) {
+                float cur = ReadCameraFov();
+                if (cur > 30.0f && cur < 170.0f) m_cachedNonDialogueFov = cur;
+                m_lastFovSampleMs = now;
+            }
+            return;
+        }
+        float target = 0.0f;
+        if (m_dialogueFovOverride > 0.0f)     target = m_dialogueFovOverride;
+        else if (m_disableDialogueFov)        target = m_cachedNonDialogueFov;
+        if (target > 30.0f && target < 170.0f) WriteCameraFov(target);
     }
 
     void PollCameraCenteringHotkey() {
@@ -601,6 +651,10 @@ public:
         bool inDlg = CallBool(pawn, STR("IsInStaticDialog"));
         g_inDialogue.store(inDlg, std::memory_order_relaxed);
 
+        // Resolve camera once (runs in AND out of dialogue so we can sample non-dialogue FOV).
+        ResolvePawnCamera(pawn);
+        ApplyFovPolicy(inDlg);
+
         // Hotkey polling every frame (works even outside dialogue).
         PollCameraCenteringHotkey();
         // Apply camera-centering-disable in dialogue if user has toggled it on.
@@ -645,7 +699,6 @@ public:
             if (strafe != 0.0) AddMovement(pawn, rX, rY, (float)(strafe * WALK_SCALE));
         }
         MaybeFireFootstep(moving);
-        MaybePlayWalkMontage(pawn, moving);
 
         // ---- Look: mouse (smoothed) + right stick ----
         m_pending_dx += (double)g_dx.exchange(0);
