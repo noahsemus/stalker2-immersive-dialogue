@@ -743,14 +743,6 @@ public:
             // Auto-unpause if we paused earlier and dialogue has since ended
             if (m_worldPaused) {
                 DirectWorldPause(pawn, false);
-                if (m_spawnedPauseWidget) {
-                    // Prefer SetVisibility(Collapsed) — RemoveFromParent crashed reliably.
-                    if (UFunction* visFn = m_spawnedPauseWidget->GetFunctionByNameInChain(FName(STR("SetVisibility")))) {
-                        struct { uint8_t InVisibility; } visP{1}; // 1 = ESlateVisibility::Collapsed
-                        m_spawnedPauseWidget->ProcessEvent(visFn, &visP);
-                    }
-                    // Don't null it — re-use the same widget instance on next pause. Faster + no re-spawn crash risk.
-                }
                 m_worldPaused = false;
             }
             return;
@@ -764,44 +756,13 @@ public:
             m_prevInDialog = true;
         }
 
-        // Tap-Escape: toggle pause menu overlay. First tap: freeze world via WorldSettings.Pauser
-        // direct write (bypasses CanPause), spawn Blueprint-generated pause widget on top, lie
-        // about IsInStaticDialog. Second tap: unfreeze, remove widget.
-        if (g_pauseTapPending.exchange(false, std::memory_order_relaxed)) {
-            m_worldPaused = !m_worldPaused;
-            if (m_worldPaused) {
-                uint64_t now = GetTickCount64();
-                g_lieDialogUntil.store(now + 60000, std::memory_order_relaxed); // long lie while menu is up
-                bool frozen = DirectWorldPause(pawn, true);
-                // Re-show existing widget if we already have one, else spawn.
-                if (m_spawnedPauseWidget) {
-                    if (UFunction* visFn = m_spawnedPauseWidget->GetFunctionByNameInChain(FName(STR("SetVisibility")))) {
-                        struct { uint8_t InVisibility; } visP{0}; // Visible
-                        m_spawnedPauseWidget->ProcessEvent(visFn, &visP);
-                    }
-                } else {
-                    UObject* w = TrySpawnPauseMenuWidget(pawn);
-                    if (w) m_spawnedPauseWidget = w;
-                }
-                Output::send<LogLevel::Verbose>(
-                    STR("[ImmDlg] pause ON: DirectPause={}, widget={}\n"),
-                    frozen ? STR("ok") : STR("fail"),
-                    m_spawnedPauseWidget ? STR("ok") : STR("null"));
-            } else {
-                DirectWorldPause(pawn, false);
-                g_lieDialogUntil.store(0, std::memory_order_relaxed);
-                // Remove widget if we spawned one
-                if (m_spawnedPauseWidget) {
-                    // Prefer SetVisibility(Collapsed) — RemoveFromParent crashed reliably.
-                    if (UFunction* visFn = m_spawnedPauseWidget->GetFunctionByNameInChain(FName(STR("SetVisibility")))) {
-                        struct { uint8_t InVisibility; } visP{1}; // 1 = ESlateVisibility::Collapsed
-                        m_spawnedPauseWidget->ProcessEvent(visFn, &visP);
-                    }
-                    // Don't null it — re-use the same widget instance on next pause. Faster + no re-spawn crash risk.
-                }
-                Output::send<LogLevel::Verbose>(STR("[ImmDlg] pause OFF: DirectPause=off, widget removed\n"));
-            }
-        }
+        // Tap-Escape: NO-OP. Feature dropped per user decision — spawning the real STALKER 2
+        // pause menu (WBP_PauseMenuMainView) during dialogue proved intractable: the WBP
+        // isn't reliably pre-loaded, spawning from the empty C++ parent renders nothing, and
+        // the game's own pause pipeline refuses during dialogue at a level below the UFunction
+        // reflection layer. Freezing world time alone is useless without menu buttons. Just
+        // consume the flag so pad-Start / tap-Esc don't stack pending events.
+        (void)g_pauseTapPending.exchange(false, std::memory_order_relaxed);
 
         // Hold-Escape latch: once we cross the hold threshold, fire close-dialogue and mark.
         if (g_escSwallowed.load(std::memory_order_relaxed) && !m_escHoldFired) {
