@@ -255,6 +255,51 @@ public:
     uint64_t  m_ftNextStepAtMs = 0;
     static constexpr uint64_t FT_STEP_INTERVAL_MS = 450; // ~2.2 steps/sec at walk
 
+    // Camera-centering toggle (F5 flips; persisted to <mod>/config.ini).
+    // STALKER 2 uses /Script/Stalker2.CameraModifier_LookAt (a UCameraModifier subclass) to
+    // pull the camera back to the NPC and clamp view angles in dialogue. If we call the
+    // base class's DisableModifier(true) on every instance each frame, the modifier stops
+    // applying its yaw/pitch bias and clamp — freeing the camera.
+    bool       m_camCenteringDisabled = false;      // toggled by F5
+    bool       m_configLoaded         = false;
+    bool       m_f5Prev               = false;
+    std::vector<UObject*> m_lookAtModifiers;
+    UFunction* m_disableModifierFn = nullptr;
+    UFunction* m_enableModifierFn  = nullptr;
+    uint64_t   m_lastLookAtRescanMs = 0;
+
+    std::wstring ConfigPath() {
+        // Config lives next to the mod DLL for MCM-mod parity with other UE4SS mods.
+        wchar_t buf[MAX_PATH]; GetModuleFileNameW((HMODULE)GetModuleHandleW(L"main.dll"), buf, MAX_PATH);
+        std::wstring p(buf);
+        size_t slash = p.find_last_of(L'\\');
+        if (slash != std::wstring::npos) p.resize(slash + 1);
+        p += L"config.ini";
+        return p;
+    }
+    void LoadConfig() {
+        if (m_configLoaded) return;
+        m_configLoaded = true;
+        std::wstring path = ConfigPath();
+        std::ifstream f(path.c_str());
+        if (!f) return;
+        std::string line;
+        while (std::getline(f, line)) {
+            auto eq = line.find('=');
+            if (eq == std::string::npos) continue;
+            std::string k = trim(line.substr(0, eq));
+            std::string v = trim(line.substr(eq + 1));
+            if (k == "DisableCameraCentering") m_camCenteringDisabled = (v == "true" || v == "1");
+        }
+    }
+    void SaveConfig() {
+        std::wstring path = ConfigPath();
+        std::ofstream f(path.c_str(), std::ios::trunc);
+        if (!f) return;
+        f << "; ImmersiveDialogue config — MCM-compatible key/value ini format\n";
+        f << "DisableCameraCentering=" << (m_camCenteringDisabled ? "true" : "false") << "\n";
+    }
+
     ImmersiveDialogue() {
         ModName        = STR("ImmersiveDialogue");
         ModVersion     = STR("1.0");
@@ -266,6 +311,7 @@ public:
         SetupInputHook();
         InstallXInputHook();
         LoadStalker2Settings();
+        LoadConfig();
         Output::send<LogLevel::Verbose>(
             STR("[ImmDlg] unreal init v{} (mouse={}, xinput={}, mouseSens={}, padSens={}, invertY={})\n"),
             ModVersion,
@@ -406,11 +452,57 @@ public:
         m_ftAkComponent->ProcessEvent(m_ftPostEventFn, buf);
     }
 
+    void PollCameraCenteringHotkey() {
+        // F6 toggles (F5 is quicksave in STALKER 2 — don't stomp it).
+        bool f6 = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
+        if (f6 && !m_f5Prev) {
+            m_camCenteringDisabled = !m_camCenteringDisabled;
+            SaveConfig();
+            Output::send<LogLevel::Verbose>(
+                STR("[ImmDlg] camera centering (F6) -> {}\n"),
+                m_camCenteringDisabled ? STR("DISABLED (camera free)") : STR("enabled (game default)"));
+        }
+        m_f5Prev = f6;
+    }
+
+    void ApplyCameraCenteringToggle(bool inDlg) {
+        if (!m_camCenteringDisabled || !inDlg) return;
+        // Rescan every ~2s for CameraModifier_LookAt instances (game may add/remove them on
+        // dialogue enter/exit or per-NPC).
+        uint64_t now = GetTickCount64();
+        if (m_lookAtModifiers.empty() || (now - m_lastLookAtRescanMs) > 2000) {
+            m_lastLookAtRescanMs = now;
+            m_lookAtModifiers.clear();
+            UObjectGlobals::FindAllOf(STR("CameraModifier_LookAt"), m_lookAtModifiers);
+            if (!m_disableModifierFn && !m_lookAtModifiers.empty()) {
+                // UCameraModifier::DisableModifier(bool bImmediate) — UFUNCTION on base class.
+                m_disableModifierFn = m_lookAtModifiers[0]->GetFunctionByNameInChain(FName(STR("DisableModifier")));
+                if (m_disableModifierFn) {
+                    Output::send<LogLevel::Verbose>(
+                        STR("[ImmDlg] look-at modifiers found: {}, disable fn resolved\n"),
+                        (int)m_lookAtModifiers.size());
+                }
+            }
+        }
+        if (!m_disableModifierFn) return;
+        // Call DisableModifier(true) on every instance every frame — game may re-enable.
+        for (UObject* mod : m_lookAtModifiers) {
+            if (!mod) continue;
+            struct { bool bImmediate; } p{true};
+            mod->ProcessEvent(m_disableModifierFn, &p);
+        }
+    }
+
     auto on_update() -> void override {
         UObject* pawn = GetPawn();
         if (!pawn) return;
         bool inDlg = CallBool(pawn, STR("IsInStaticDialog"));
         g_inDialogue.store(inDlg, std::memory_order_relaxed);
+
+        // Hotkey polling every frame (works even outside dialogue).
+        PollCameraCenteringHotkey();
+        // Apply camera-centering-disable in dialogue if user has toggled it on.
+        ApplyCameraCenteringToggle(inDlg);
 
         if (!inDlg) {
             g_dx.exchange(0); g_dy.exchange(0);
