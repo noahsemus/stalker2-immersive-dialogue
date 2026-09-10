@@ -23,6 +23,7 @@
 #include <Unreal/UObject.hpp>
 #include <Unreal/UClass.hpp>
 #include <Unreal/UFunction.hpp>
+#include <Unreal/UFunctionStructs.hpp>
 #include <Unreal/NameTypes.hpp>
 #include <Unreal/CoreUObject/UObject/UnrealType.hpp>
 #include <Constructs/Loop.hpp>
@@ -59,6 +60,10 @@ static std::atomic<bool>   g_invertPadY   {false};
 
 static WNDPROC g_origWndProc = nullptr;
 static bool    g_rawReady    = false;
+
+// Thread-local: set true right before OUR own IsInStaticDialog polls; the post-hook uses
+// this to distinguish our polling (return truth) from every other caller (return lie).
+static thread_local bool tl_selfDialogueQuery = false;
 
 // ================= Controller (XInput) with IAT-patched hook =================
 // Patch the game's IAT for XInputGetState so its polls see zeroed left stick during
@@ -342,9 +347,28 @@ public:
         ModDescription = STR("Free movement + mouse/pad look during NPC dialogue.");
     }
 
+    std::pair<int,int> m_hookIsInDialog{-1,-1};
+    void InstallIsInDialogLieHook() {
+        // Post-hook on PC::IsInStaticDialog. Any caller that goes through the reflection
+        // system (anim graph, camera modifier, dialogue widget checks) sees FALSE while
+        // g_inDialogue is true — so those systems stop applying their in-dialogue behavior.
+        // Our own polling (marked via thread_local tl_selfDialogueQuery) gets the truth.
+        UnrealScriptFunctionCallable postLie =
+            [](UnrealScriptFunctionCallableContext& ctx, void*) {
+                if (tl_selfDialogueQuery) return; // our own probe: pass through real return
+                if (g_inDialogue.load(std::memory_order_relaxed)) {
+                    ctx.SetReturnValue<bool>(false);
+                }
+            };
+        m_hookIsInDialog = UObjectGlobals::RegisterHook(
+            StringType(STR("/Script/Stalker2.PC:IsInStaticDialog")),
+            UnrealScriptFunctionCallable{}, postLie, nullptr);
+    }
+
     auto on_unreal_init() -> void override {
         SetupInputHook();
         InstallXInputHook();
+        InstallIsInDialogLieHook();
         LoadStalker2Settings();
         LoadConfig();
         Output::send<LogLevel::Verbose>(
@@ -790,7 +814,10 @@ public:
     auto on_update() -> void override {
         UObject* pawn = GetPawn();
         if (!pawn) return;
+        // Our own poll must bypass the lie hook — set thread-local guard around the call.
+        tl_selfDialogueQuery = true;
         bool inDlg = CallBool(pawn, STR("IsInStaticDialog"));
+        tl_selfDialogueQuery = false;
         g_inDialogue.store(inDlg, std::memory_order_relaxed);
 
         // Resolve camera once (runs in AND out of dialogue so we can sample non-dialogue FOV).
