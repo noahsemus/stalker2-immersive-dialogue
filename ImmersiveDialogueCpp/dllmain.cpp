@@ -568,27 +568,51 @@ public:
         if (m_animProbed) return;
         m_animProbed = true;
 
-        UFunction* getMeshFn = pawn->GetFunctionByNameInChain(FName(STR("GetMesh")));
-        if (!getMeshFn) getMeshFn = pawn->GetFunctionByNameInChain(FName(STR("K2_GetMesh")));
-        if (getMeshFn) {
-            struct { UObject* Ret; } p{nullptr};
-            pawn->ProcessEvent(getMeshFn, &p);
-            m_pawnMesh = p.Ret;
+        // Prefer direct UPROPERTY read (ACharacter::Mesh) — GetMesh UFUNCTION isn't always
+        // exposed. Fall back to a couple UFUNCTION name variants.
+        {
+            const wchar_t* meshPropNames[] = { STR("Mesh"), STR("SkeletalMesh"), STR("BodyMesh") };
+            for (auto* n : meshPropNames) {
+                if (FProperty* p = pawn->GetPropertyByNameInChain(n)) {
+                    UObject** slot = p->ContainerPtrToValuePtr<UObject*>(pawn);
+                    if (slot && *slot) { m_pawnMesh = *slot; break; }
+                }
+            }
         }
         if (!m_pawnMesh) {
-            Output::send<LogLevel::Verbose>(STR("[ImmDlg] anim probe: pawn mesh not found\n"));
+            const wchar_t* meshFnNames[] = { STR("GetMesh"), STR("K2_GetMesh"), STR("GetSkeletalMeshComponent") };
+            for (auto* n : meshFnNames) {
+                if (UFunction* fn = pawn->GetFunctionByNameInChain(FName(n))) {
+                    struct { UObject* Ret; } p{nullptr};
+                    pawn->ProcessEvent(fn, &p);
+                    if (p.Ret) { m_pawnMesh = p.Ret; break; }
+                }
+            }
+        }
+        if (!m_pawnMesh) {
+            Output::send<LogLevel::Verbose>(STR("[ImmDlg] anim probe: pawn mesh not found (tried Mesh/SkeletalMesh/BodyMesh props + GetMesh/K2_GetMesh/GetSkeletalMeshComponent fns)\n"));
             return;
         }
+        Output::send<LogLevel::Verbose>(STR("[ImmDlg] anim probe: mesh found -> {}\n"), m_pawnMesh->GetFullName());
         UFunction* getAnimFn = m_pawnMesh->GetFunctionByNameInChain(FName(STR("GetAnimInstance")));
+        if (!getAnimFn) getAnimFn = m_pawnMesh->GetFunctionByNameInChain(FName(STR("K2_GetAnimInstance")));
         if (getAnimFn) {
             struct { UObject* Ret; } p{nullptr};
             m_pawnMesh->ProcessEvent(getAnimFn, &p);
             m_animInstance = p.Ret;
         }
         if (!m_animInstance) {
+            // Fall back to AnimScriptInstance property on the mesh component.
+            if (FProperty* p = m_pawnMesh->GetPropertyByNameInChain(STR("AnimScriptInstance"))) {
+                UObject** slot = p->ContainerPtrToValuePtr<UObject*>(m_pawnMesh);
+                if (slot) m_animInstance = *slot;
+            }
+        }
+        if (!m_animInstance) {
             Output::send<LogLevel::Verbose>(STR("[ImmDlg] anim probe: AnimInstance not found\n"));
             return;
         }
+        Output::send<LogLevel::Verbose>(STR("[ImmDlg] anim probe: AnimInstance found -> {}\n"), m_animInstance->GetFullName());
 
         // Candidate names + intended force value:
         //   force FALSE for anything that says "in dialogue" / "relax idle"
