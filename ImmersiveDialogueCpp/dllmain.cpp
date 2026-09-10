@@ -906,6 +906,68 @@ public:
         }
     }
 
+    // Periodic diagnostic: log current state/locomotion/shadow values (~every 500ms) so we
+    // can compare what the anim graph looks like outside dialogue vs. what our writes produce
+    // inside dialogue. Runs both in AND out of dialogue.
+    uint64_t m_lastStateLogMs = 0;
+    void LogAnimStateOnce(bool inDlg, bool moving) {
+        if (!m_animInstance) return;
+        uint64_t now = GetTickCount64();
+        if (now - m_lastStateLogMs < 500) return;
+        m_lastStateLogMs = now;
+
+        auto readBool = [&](FProperty* structProp, const std::map<StringType, int32_t>& map, const wchar_t* name) -> int {
+            if (!structProp) return -1;
+            auto it = map.find(name);
+            if (it == map.end()) return -1;
+            uint8_t* base = structProp->ContainerPtrToValuePtr<uint8_t>(m_animInstance);
+            if (!base) return -1;
+            return *(bool*)(base + it->second) ? 1 : 0;
+        };
+        auto readFloat = [&](FProperty* structProp, const std::map<StringType, int32_t>& map, const wchar_t* name) -> float {
+            if (!structProp) return 0.0f;
+            auto it = map.find(name);
+            if (it == map.end()) return 0.0f;
+            uint8_t* base = structProp->ContainerPtrToValuePtr<uint8_t>(m_animInstance);
+            if (!base) return 0.0f;
+            return *(float*)(base + it->second);
+        };
+        auto readByte = [&](FProperty* structProp, const std::map<StringType, int32_t>& map, const wchar_t* name) -> int {
+            if (!structProp) return -1;
+            auto it = map.find(name);
+            if (it == map.end()) return -1;
+            uint8_t* base = structProp->ContainerPtrToValuePtr<uint8_t>(m_animInstance);
+            if (!base) return -1;
+            return (int)*(uint8_t*)(base + it->second);
+        };
+        // Build state_data offset map to reuse (already have some as m_off* but not a map).
+        // Simpler: hardcode via the members we resolved.
+        auto readStateBool = [&](int32_t off) -> int {
+            if (off < 0 || !m_stateDataProp) return -1;
+            uint8_t* base = m_stateDataProp->ContainerPtrToValuePtr<uint8_t>(m_animInstance);
+            if (!base) return -1;
+            return *(bool*)(base + off) ? 1 : 0;
+        };
+
+        Output::send<LogLevel::Verbose>(
+            STR("[ImmDlg] STATE inDlg={} mov={} | state: bMoving={} bWalking={} bWalkOvr={} bRunning={} bJogging={} bSprinting={} bCutscene={} bInCombat={} bInAir={} | loco: V={} AngDir={} Dir={} BPDir={} PlayRate={} LegIKAlpha={} bLegIK={} | shadow: bBHLoco={} PlayRate={} AngDir={}\n"),
+            inDlg ? 1 : 0, moving ? 1 : 0,
+            readStateBool(m_offMoving), readStateBool(m_offWalking), readStateBool(m_offWalkingOverride),
+            readStateBool(m_offRunning), readStateBool(m_offJogging), readStateBool(m_offSprinting),
+            readStateBool(m_offCutscene), readStateBool(m_offInCombat), readStateBool(m_offInAir),
+            readFloat(m_locomotionDataProp, m_locomotionOffsets, STR("Velocity")),
+            readFloat(m_locomotionDataProp, m_locomotionOffsets, STR("AngleDirection")),
+            readByte (m_locomotionDataProp, m_locomotionOffsets, STR("Direction")),
+            readByte (m_locomotionDataProp, m_locomotionOffsets, STR("BPDirection")),
+            readFloat(m_locomotionDataProp, m_locomotionOffsets, STR("MovementPlayRate")),
+            readFloat(m_locomotionDataProp, m_locomotionOffsets, STR("LegIKAlpha")),
+            readBool (m_locomotionDataProp, m_locomotionOffsets, STR("bLegIKEnabled")),
+            readBool (m_shadowDataProp,     m_shadowOffsets,     STR("bShouldUseBHLocomotion")),
+            readFloat(m_shadowDataProp,     m_shadowOffsets,     STR("MovementPlayRate")),
+            readFloat(m_shadowDataProp,     m_shadowOffsets,     STR("AngleDirection"))
+        );
+    }
+
     // Apply the same set of "walking, alive, not-in-air/combat/cutscene" writes to any
     // struct whose name→offset map we resolved. Locomotion + shadow both benefit from
     // knowing "walking + moving, everything else off" so their anim states follow.
@@ -1138,6 +1200,10 @@ public:
             ForceLocomotionData(moving, fwd, strafe);
             ForceShadowData(moving, fwd, strafe);
         }
+        // Comparison logging: dumps current anim-instance values every 500ms in BOTH dialogue
+        // and non-dialogue. Walk outside dialogue -> see what "correct walking" looks like;
+        // walk inside dialogue -> compare our writes vs ground truth.
+        LogAnimStateOnce(inDlg, moving);
 
         // ---- Look: mouse (smoothed) + right stick ----
         m_pending_dx += (double)g_dx.exchange(0);
