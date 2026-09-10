@@ -47,6 +47,7 @@ static std::atomic<int>      g_synthEscConsume{0};   // number of Esc key events
 static std::atomic<bool>     g_pauseTapPending{false}; // WndProc -> on_update: user tapped Esc
 static std::atomic<uint64_t> g_lieDialogUntil{0};    // window during which IsInStaticDialog is forced to false
                                                      // (currently unused — tap-pause is parked)
+static std::atomic<UObject*> g_hookPawn{nullptr};    // pawn the animation-state lie hooks fire for
 
 // Game settings loaded from AppliedSettingsWin64.cfg (refreshed on each dialogue entry)
 static std::atomic<double>   g_mouseSensCoef{1.0};
@@ -348,8 +349,9 @@ public:
     // paths likely aren't resolvable on the PC class and RegisterHook doesn't fail
     // gracefully on missing functions. Sticking to the one hook that's proven to register.
     std::pair<int,int> m_hookIsInDialog{-1,-1};
+    std::pair<int,int> m_hookIsRelaxIdle{-1,-1};
     void InstallStateLieHooks() {
-        UnrealScriptFunctionCallable postFalse =
+        UnrealScriptFunctionCallable postFalseWhilePauseLie =
             [](UnrealScriptFunctionCallableContext& ctx, void*) {
                 if (GetTickCount64() < g_lieDialogUntil.load(std::memory_order_relaxed)) {
                     ctx.SetReturnValue<bool>(false);
@@ -357,7 +359,22 @@ public:
             };
         m_hookIsInDialog = UObjectGlobals::RegisterHook(
             StringType(STR("/Script/Stalker2.PC:IsInStaticDialog")),
-            UnrealScriptFunctionCallable{}, postFalse, nullptr);
+            UnrealScriptFunctionCallable{}, postFalseWhilePauseLie, nullptr);
+
+        // Footsteps: dialogue system re-asserts IsStandToRelaxIdle=true each frame after our
+        // setter. Hook the getter itself to always return false for our pawn while we're in
+        // dialogue — anim graph then sees "not in relax-idle" and plays normal locomotion,
+        // which fires the walk-cycle foot-IK notify that plays footstep audio.
+        UnrealScriptFunctionCallable postRelaxIdleFalseForOurPawn =
+            [](UnrealScriptFunctionCallableContext& ctx, void*) {
+                if (ctx.Context == g_hookPawn.load(std::memory_order_relaxed)
+                    && g_inDialogue.load(std::memory_order_relaxed)) {
+                    ctx.SetReturnValue<bool>(false);
+                }
+            };
+        m_hookIsRelaxIdle = UObjectGlobals::RegisterHook(
+            StringType(STR("/Script/Stalker2.Obj:IsStandToRelaxIdle")),
+            UnrealScriptFunctionCallable{}, postRelaxIdleFalseForOurPawn, nullptr);
     }
 
     auto on_unreal_init() -> void override {
@@ -366,18 +383,20 @@ public:
         LoadStalker2Settings();
         InstallStateLieHooks();
         Output::send<LogLevel::Verbose>(
-            STR("[ImmDlg] unreal init (mouse hook={}, xinput hook={}, mouseSens={}, padSens={}, invertY={}, dlgHook={},{})\n"),
+            STR("[ImmDlg] unreal init (mouse hook={}, xinput hook={}, mouseSens={}, padSens={}, invertY={}, dlgHook={},{} relaxIdleHook={},{})\n"),
             g_rawReady      ? STR("ok") : STR("FAILED"),
             g_xinputHooked  ? STR("ok") : STR("SKIPPED"),
             g_mouseSensCoef.load(),
             g_padSensCoef.load(),
             g_invertMouseY.load() ? STR("true") : STR("false"),
-            m_hookIsInDialog.first, m_hookIsInDialog.second);
+            m_hookIsInDialog.first, m_hookIsInDialog.second,
+            m_hookIsRelaxIdle.first, m_hookIsRelaxIdle.second);
     }
 
     UObject* GetPawn() {
         if (m_pawn && m_pawn->IsUnreachable() == false) return m_pawn;
         m_pawn = UObjectGlobals::FindFirstOf(STR("PC"));
+        g_hookPawn.store(m_pawn, std::memory_order_relaxed); // let hooks filter by receiver
         return m_pawn;
     }
 
@@ -451,10 +470,14 @@ public:
             if (!interesting) return LoopAction::Continue;
             StringType full = obj->GetFullName();
             Output::send<LogLevel::Verbose>(STR("[ImmDlg]   candidate: {}\n"), full);
-            // If it's a UClass (full name starts with "Class ") and contains "Pause",
-            // remember the first _C (Blueprint-generated) hit as our preferred widget class.
+            // The pause menu widget's UClass shows up as "WidgetBlueprintGeneratedClass /...".
+            // Pick the first _C-suffixed one containing PauseMenu.
+            bool isClassObj =
+                full.find(STR("Class ")) == 0 ||
+                full.find(STR("WidgetBlueprintGeneratedClass ")) == 0 ||
+                full.find(STR("BlueprintGeneratedClass ")) == 0;
             if (!m_discoveredPauseWidgetClass
-                && full.find(STR("Class ")) == 0
+                && isClassObj
                 && (n.find(STR("PauseMenu")) != StringType::npos || n.find(STR("PauseGame")) != StringType::npos)
                 && n.find(STR("_C")) != StringType::npos) {
                 m_discoveredPauseWidgetClass = obj;
@@ -481,12 +504,9 @@ public:
         const wchar_t* usedName = widClass ? STR("(from scan)") : nullptr;
         if (!widClass) {
             const wchar_t* candidates[] = {
-                STR("WBP_PauseMenu_C"),
-                STR("WBP_PauseMainMenu_C"),
-                STR("WBP_PauseMenuMainView_C"),
-                STR("BP_PauseMenu_C"),
-                STR("PauseMenu_C"),
-                STR("PauseMenuMainView_C"),
+                STR("/Game/GameLite/FPS_Game/UIRemaster/View/MenuMainView/W_PauseMenuMainView.W_PauseMenuMainView_C"),
+                STR("W_PauseMenuMainView_C"),
+                STR("W_PauseMenuSubViewRoot_C"),
                 STR("/Script/Stalker2.PauseMenuMainView"),
                 STR("/Script/Stalker2.PauseGameView"),
             };
@@ -724,11 +744,12 @@ public:
             if (m_worldPaused) {
                 DirectWorldPause(pawn, false);
                 if (m_spawnedPauseWidget) {
-                    if (UFunction* rmFn = m_spawnedPauseWidget->GetFunctionByNameInChain(FName(STR("RemoveFromParent")))) {
-                        char empty[16] = {};
-                        m_spawnedPauseWidget->ProcessEvent(rmFn, empty);
+                    // Prefer SetVisibility(Collapsed) — RemoveFromParent crashed reliably.
+                    if (UFunction* visFn = m_spawnedPauseWidget->GetFunctionByNameInChain(FName(STR("SetVisibility")))) {
+                        struct { uint8_t InVisibility; } visP{1}; // 1 = ESlateVisibility::Collapsed
+                        m_spawnedPauseWidget->ProcessEvent(visFn, &visP);
                     }
-                    m_spawnedPauseWidget = nullptr;
+                    // Don't null it — re-use the same widget instance on next pause. Faster + no re-spawn crash risk.
                 }
                 m_worldPaused = false;
             }
@@ -752,22 +773,31 @@ public:
                 uint64_t now = GetTickCount64();
                 g_lieDialogUntil.store(now + 60000, std::memory_order_relaxed); // long lie while menu is up
                 bool frozen = DirectWorldPause(pawn, true);
-                UObject* w  = TrySpawnPauseMenuWidget(pawn);
-                if (w) m_spawnedPauseWidget = w;
+                // Re-show existing widget if we already have one, else spawn.
+                if (m_spawnedPauseWidget) {
+                    if (UFunction* visFn = m_spawnedPauseWidget->GetFunctionByNameInChain(FName(STR("SetVisibility")))) {
+                        struct { uint8_t InVisibility; } visP{0}; // Visible
+                        m_spawnedPauseWidget->ProcessEvent(visFn, &visP);
+                    }
+                } else {
+                    UObject* w = TrySpawnPauseMenuWidget(pawn);
+                    if (w) m_spawnedPauseWidget = w;
+                }
                 Output::send<LogLevel::Verbose>(
                     STR("[ImmDlg] pause ON: DirectPause={}, widget={}\n"),
                     frozen ? STR("ok") : STR("fail"),
-                    w      ? STR("spawned") : STR("null"));
+                    m_spawnedPauseWidget ? STR("ok") : STR("null"));
             } else {
                 DirectWorldPause(pawn, false);
                 g_lieDialogUntil.store(0, std::memory_order_relaxed);
                 // Remove widget if we spawned one
                 if (m_spawnedPauseWidget) {
-                    if (UFunction* rmFn = m_spawnedPauseWidget->GetFunctionByNameInChain(FName(STR("RemoveFromParent")))) {
-                        char empty[16] = {};
-                        m_spawnedPauseWidget->ProcessEvent(rmFn, empty);
+                    // Prefer SetVisibility(Collapsed) — RemoveFromParent crashed reliably.
+                    if (UFunction* visFn = m_spawnedPauseWidget->GetFunctionByNameInChain(FName(STR("SetVisibility")))) {
+                        struct { uint8_t InVisibility; } visP{1}; // 1 = ESlateVisibility::Collapsed
+                        m_spawnedPauseWidget->ProcessEvent(visFn, &visP);
                     }
-                    m_spawnedPauseWidget = nullptr;
+                    // Don't null it — re-use the same widget instance on next pause. Faster + no re-spawn crash risk.
                 }
                 Output::send<LogLevel::Verbose>(STR("[ImmDlg] pause OFF: DirectPause=off, widget removed\n"));
             }
