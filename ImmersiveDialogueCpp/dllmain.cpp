@@ -700,10 +700,6 @@ public:
         }
         // Write state_data override bools.
         ForceStateDataOverrides(moving);
-        // Also drive locomotion_data and shadow_data with the same walking-state pattern —
-        // upper-body twist + shadow motion come from those data structs.
-        ForceStructWalkState(m_locomotionDataProp, m_locomotionOffsets, moving);
-        ForceStructWalkState(m_shadowDataProp,     m_shadowOffsets,     moving);
     }
     FProperty* m_dialogDataProp = nullptr;
 
@@ -819,6 +815,64 @@ public:
                        m_locomotionDataProp, m_locomotionOffsets);
         resolveAndDump(STR("shadow_data"),     STR("ShadowData"),     STR("shadow_data"),
                        m_shadowDataProp, m_shadowOffsets);
+    }
+
+    // Drive locomotion_data (numeric — Velocity, AngleDirection, MovementPlayRate, LegIK).
+    // The anim graph's walk blend is driven by these; without them the body doesn't twist
+    // even if state_data.bWalking is set. inputFwd/inputStrafe are the normalized WASD
+    // vector — we convert to a direction angle in degrees.
+    void ForceLocomotionData(bool moving, double inputFwd, double inputStrafe) {
+        if (!m_locomotionDataProp || !m_animInstance) return;
+        uint8_t* base = m_locomotionDataProp->ContainerPtrToValuePtr<uint8_t>(m_animInstance);
+        if (!base) return;
+        auto writeF = [&](const wchar_t* name, float val) {
+            auto it = m_locomotionOffsets.find(name);
+            if (it == m_locomotionOffsets.end()) return;
+            *reinterpret_cast<float*>(base + it->second) = val;
+        };
+        auto writeB = [&](const wchar_t* name, bool val) {
+            auto it = m_locomotionOffsets.find(name);
+            if (it == m_locomotionOffsets.end()) return;
+            *reinterpret_cast<bool*>(base + it->second) = val;
+        };
+        float speed = moving ? 1.5f : 0.0f; // "walking" speed magnitude
+        writeF(STR("Velocity"),         speed);
+        writeF(STR("MovementPlayRate"), moving ? 1.0f : 0.0f);
+        writeF(STR("LegIKAlpha"),       1.0f);
+        writeB(STR("bLegIKEnabled"),    true);
+        writeB(STR("bEnablePlayRateCurves"), true);
+        if (moving) {
+            // Direction angle in degrees. atan2(strafe, fwd) — forward=0, right=+90, back=180, left=-90.
+            double angRad = std::atan2(inputStrafe, inputFwd);
+            float  angDeg = (float)(angRad * 180.0 / 3.14159265358979323846);
+            writeF(STR("AngleDirection"),   angDeg);
+            writeF(STR("ClampedDirection"), angDeg);
+        }
+    }
+
+    // Drive shadow_data. bShouldUseBHLocomotion is the key — off = shadow uses static pose,
+    // on = shadow follows the body's locomotion animation.
+    void ForceShadowData(bool moving, double inputFwd, double inputStrafe) {
+        if (!m_shadowDataProp || !m_animInstance) return;
+        uint8_t* base = m_shadowDataProp->ContainerPtrToValuePtr<uint8_t>(m_animInstance);
+        if (!base) return;
+        auto writeF = [&](const wchar_t* name, float val) {
+            auto it = m_shadowOffsets.find(name);
+            if (it == m_shadowOffsets.end()) return;
+            *reinterpret_cast<float*>(base + it->second) = val;
+        };
+        auto writeB = [&](const wchar_t* name, bool val) {
+            auto it = m_shadowOffsets.find(name);
+            if (it == m_shadowOffsets.end()) return;
+            *reinterpret_cast<bool*>(base + it->second) = val;
+        };
+        writeB(STR("bShouldUseBHLocomotion"), moving);
+        writeF(STR("MovementPlayRate"),      moving ? 1.0f : 0.0f);
+        if (moving) {
+            double angRad = std::atan2(inputStrafe, inputFwd);
+            float  angDeg = (float)(angRad * 180.0 / 3.14159265358979323846);
+            writeF(STR("AngleDirection"), angDeg);
+        }
     }
 
     // Apply the same set of "walking, alive, not-in-air/combat/cutscene" writes to any
@@ -1047,8 +1101,12 @@ public:
         }
         MaybeFireFootstep(moving);
         // Force anim state overrides (in dialogue). Idle/dialogue flags always false; walking
-        // flags true only when actually moving.
-        if (inDlg) ForceAnimState(moving);
+        // flags true only when actually moving. Locomotion + shadow driven by numeric writes.
+        if (inDlg) {
+            ForceAnimState(moving);
+            ForceLocomotionData(moving, fwd, strafe);
+            ForceShadowData(moving, fwd, strafe);
+        }
 
         // ---- Look: mouse (smoothed) + right stick ----
         m_pending_dx += (double)g_dx.exchange(0);
