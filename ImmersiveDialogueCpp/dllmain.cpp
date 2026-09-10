@@ -679,12 +679,16 @@ public:
         Output::send<LogLevel::Verbose>(STR("[ImmDlg]   dialog_data struct prop: {}\n"),
                                          m_dialogDataProp ? STR("found") : STR("MISSING"));
 
+        // Walk state_data struct for override bool offsets.
+        ResolveStateDataOffsets();
+
         Output::send<LogLevel::Verbose>(
-            STR("[ImmDlg] anim probe: mesh={}, animInst={}, boolProps={}, dialogStruct={}\n"),
+            STR("[ImmDlg] anim probe: mesh={}, animInst={}, boolProps={}, dialogStruct={}, stateStruct={}\n"),
             m_pawnMesh ? STR("ok") : STR("null"),
             m_animInstance ? STR("ok") : STR("null"),
             (int)m_animBoolProps.size(),
-            m_dialogDataProp ? STR("ok") : STR("null"));
+            m_dialogDataProp ? STR("ok") : STR("null"),
+            m_stateDataProp ? STR("ok") : STR("null"));
     }
 
     // Every frame in dialogue: write our set of anim-state bool overrides. "moving" gates
@@ -705,8 +709,63 @@ public:
             uint8_t* structMem = m_dialogDataProp->ContainerPtrToValuePtr<uint8_t>(m_animInstance);
             if (structMem) *structMem = 0; // dialog = false
         }
+        // Write state_data override bools.
+        ForceStateDataOverrides(moving);
     }
     FProperty* m_dialogDataProp = nullptr;
+
+    // AnimPlayerStateData nested-struct writes. state_data is a StructProperty on the
+    // AnimInstance; walking_override / jogging_override / sprinting_override / etc. are
+    // bool members INSIDE it. We resolve their inner offsets once via UScriptStruct's
+    // CustomFindProperty and then write per-frame.
+    FProperty* m_stateDataProp = nullptr;
+    int32_t m_offWalkingOverride = -1;
+    int32_t m_offJoggingOverride = -1;
+    int32_t m_offSprintingOverride = -1;
+    int32_t m_offCrouchingOverride = -1;
+    int32_t m_offCombatMoveIdle = -1;
+    int32_t m_offCombatCrouchIdle = -1;
+
+    void ResolveStateDataOffsets() {
+        if (m_stateDataProp) return;
+        if (!m_animInstance) return;
+        FProperty* sp = m_animInstance->GetPropertyByNameInChain(STR("state_data"));
+        if (!sp) return;
+        m_stateDataProp = sp;
+        FStructProperty* sfp = static_cast<FStructProperty*>(sp);
+        UScriptStruct* stru = sfp->GetStruct();
+        if (!stru) return;
+        auto lookup = [&](const wchar_t* nm) -> int32_t {
+            FProperty* p = stru->CustomFindProperty(FName(nm));
+            return p ? p->GetOffset_ForInternal() : -1;
+        };
+        m_offWalkingOverride   = lookup(STR("walking_override"));
+        m_offJoggingOverride   = lookup(STR("jogging_override"));
+        m_offSprintingOverride = lookup(STR("sprinting_override"));
+        m_offCrouchingOverride = lookup(STR("crouching_override"));
+        m_offCombatMoveIdle    = lookup(STR("combat_move_idle"));
+        m_offCombatCrouchIdle  = lookup(STR("combat_crouch_idle"));
+        Output::send<LogLevel::Verbose>(
+            STR("[ImmDlg]   state_data offsets: walk={}, jog={}, sprint={}, crouch={}, combatMoveIdle={}, combatCrouchIdle={}\n"),
+            m_offWalkingOverride, m_offJoggingOverride, m_offSprintingOverride,
+            m_offCrouchingOverride, m_offCombatMoveIdle, m_offCombatCrouchIdle);
+    }
+
+    void ForceStateDataOverrides(bool moving) {
+        if (!m_stateDataProp || !m_animInstance) return;
+        uint8_t* structBase = m_stateDataProp->ContainerPtrToValuePtr<uint8_t>(m_animInstance);
+        if (!structBase) return;
+        auto write = [&](int32_t off, bool val) {
+            if (off < 0) return;
+            *reinterpret_cast<bool*>(structBase + off) = val;
+        };
+        write(m_offJoggingOverride,   false); // never jogging in dialogue
+        write(m_offSprintingOverride, false); // never sprinting
+        write(m_offCrouchingOverride, false); // no crouch state changes
+        write(m_offCombatMoveIdle,    false);
+        write(m_offCombatCrouchIdle,  false);
+        write(m_offWalkingOverride,   moving); // walking only when actually moving
+    }
 
     // Resolve pawn camera + FOV property (once, on first dialogue entry).
     void ResolvePawnCamera(UObject* pawn) {
