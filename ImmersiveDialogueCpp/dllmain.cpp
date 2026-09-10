@@ -18,6 +18,7 @@
 #include <Unreal/UFunctionStructs.hpp>
 #include <Unreal/NameTypes.hpp>
 #include <Unreal/CoreUObject/UObject/UnrealType.hpp>
+#include <Constructs/Loop.hpp>
 
 #include <Windows.h>
 #include <Xinput.h>
@@ -426,28 +427,43 @@ public:
         return true;
     }
 
-    // Diagnostic: dump every loaded UClass whose name contains PauseMenu or MainMenu.
-    // The C++ class /Script/Stalker2.PauseMenuMainView is empty (members=0); the actual
-    // renderable pause menu is a Blueprint (WBP_...) that inherits from it. We need
-    // that WBP class object to spawn a widget with visual content.
+    // Diagnostic: walk EVERY loaded UObject once and log those whose name or full path
+    // suggests they're pause-menu related — WBP class objects, view widgets, IPUs, etc.
+    // FindAllOf("Class") returns 0 in this UE4SS version so we go through ForEachUObject.
     bool m_menuClassesLogged = false;
+    UObject* m_discoveredPauseWidgetClass = nullptr;
     void LogMenuClassesOnce() {
         if (m_menuClassesLogged) return;
         m_menuClassesLogged = true;
-        std::vector<UObject*> classes;
-        UObjectGlobals::FindAllOf(STR("Class"), classes);
+        int scanned = 0;
         int found = 0;
-        Output::send<LogLevel::Verbose>(STR("[ImmDlg] scanning {} UClass objects for pause/menu\n"), (int)classes.size());
-        for (UObject* cls : classes) {
-            if (!cls) continue;
-            StringType n = cls->GetName();
-            if (n.find(STR("PauseMenu")) != StringType::npos
-                || n.find(STR("MainMenu")) != StringType::npos
-                || n.find(STR("PauseGame")) != StringType::npos) {
-                Output::send<LogLevel::Verbose>(STR("[ImmDlg]   menu class: {}\n"), n);
-                if (++found >= 40) { Output::send<LogLevel::Verbose>(STR("[ImmDlg]   (truncated)\n")); break; }
+        UObjectGlobals::ForEachUObject([&](UObject* obj, int32_t, int32_t) -> LoopAction {
+            scanned++;
+            if (!obj) return LoopAction::Continue;
+            StringType n = obj->GetName();
+            bool interesting =
+                n.find(STR("PauseMenu"))   != StringType::npos ||
+                n.find(STR("PauseGame"))   != StringType::npos ||
+                n.find(STR("MainMenu"))    != StringType::npos ||
+                (n.find(STR("WBP_")) != StringType::npos &&
+                    (n.find(STR("Menu")) != StringType::npos ||
+                     n.find(STR("Pause")) != StringType::npos));
+            if (!interesting) return LoopAction::Continue;
+            StringType full = obj->GetFullName();
+            Output::send<LogLevel::Verbose>(STR("[ImmDlg]   candidate: {}\n"), full);
+            // If it's a UClass (full name starts with "Class ") and contains "Pause",
+            // remember the first _C (Blueprint-generated) hit as our preferred widget class.
+            if (!m_discoveredPauseWidgetClass
+                && full.find(STR("Class ")) == 0
+                && (n.find(STR("PauseMenu")) != StringType::npos || n.find(STR("PauseGame")) != StringType::npos)
+                && n.find(STR("_C")) != StringType::npos) {
+                m_discoveredPauseWidgetClass = obj;
+                Output::send<LogLevel::Verbose>(STR("[ImmDlg]   -> using this as pause widget class\n"));
             }
-        }
+            if (++found >= 80) { Output::send<LogLevel::Verbose>(STR("[ImmDlg]   (truncated at 80)\n")); return LoopAction::Break; }
+            return LoopAction::Continue;
+        });
+        Output::send<LogLevel::Verbose>(STR("[ImmDlg] scanned {} UObjects, {} menu-like\n"), scanned, found);
     }
 
     bool m_pauseWidgetLogged = false;
@@ -459,22 +475,25 @@ public:
         UFunction* createFn = widLib->GetFunctionByNameInChain(FName(STR("Create")));
         if (!createFn) return nullptr;
 
-        // Try Blueprint-generated classes first (they have visual content), then C++ parents.
-        const wchar_t* candidates[] = {
-            STR("WBP_PauseMenu_C"),
-            STR("WBP_PauseMainMenu_C"),
-            STR("WBP_PauseMenuMainView_C"),
-            STR("BP_PauseMenu_C"),
-            STR("PauseMenu_C"),
-            STR("PauseMenuMainView_C"),
-            STR("/Script/Stalker2.PauseMenuMainView"),
-            STR("/Script/Stalker2.PauseGameView"),
-        };
-        UObject* widClass = nullptr;
-        const wchar_t* usedName = nullptr;
-        for (auto* n : candidates) {
-            UObject* c = UObjectGlobals::FindObject(nullptr, nullptr, n, false);
-            if (c) { widClass = c; usedName = n; break; }
+        // Prefer whatever LogMenuClassesOnce discovered via the full-UObject scan; only if
+        // that's null do we try the hand-written candidate names.
+        UObject* widClass = m_discoveredPauseWidgetClass;
+        const wchar_t* usedName = widClass ? STR("(from scan)") : nullptr;
+        if (!widClass) {
+            const wchar_t* candidates[] = {
+                STR("WBP_PauseMenu_C"),
+                STR("WBP_PauseMainMenu_C"),
+                STR("WBP_PauseMenuMainView_C"),
+                STR("BP_PauseMenu_C"),
+                STR("PauseMenu_C"),
+                STR("PauseMenuMainView_C"),
+                STR("/Script/Stalker2.PauseMenuMainView"),
+                STR("/Script/Stalker2.PauseGameView"),
+            };
+            for (auto* n : candidates) {
+                UObject* c = UObjectGlobals::FindObject(nullptr, nullptr, n, false);
+                if (c) { widClass = c; usedName = n; break; }
+            }
         }
         if (!m_pauseWidgetLogged) {
             m_pauseWidgetLogged = true;
@@ -706,7 +725,8 @@ public:
                 DirectWorldPause(pawn, false);
                 if (m_spawnedPauseWidget) {
                     if (UFunction* rmFn = m_spawnedPauseWidget->GetFunctionByNameInChain(FName(STR("RemoveFromParent")))) {
-                        m_spawnedPauseWidget->ProcessEvent(rmFn, nullptr);
+                        char empty[16] = {};
+                        m_spawnedPauseWidget->ProcessEvent(rmFn, empty);
                     }
                     m_spawnedPauseWidget = nullptr;
                 }
@@ -744,7 +764,8 @@ public:
                 // Remove widget if we spawned one
                 if (m_spawnedPauseWidget) {
                     if (UFunction* rmFn = m_spawnedPauseWidget->GetFunctionByNameInChain(FName(STR("RemoveFromParent")))) {
-                        m_spawnedPauseWidget->ProcessEvent(rmFn, nullptr);
+                        char empty[16] = {};
+                        m_spawnedPauseWidget->ProcessEvent(rmFn, empty);
                     }
                     m_spawnedPauseWidget = nullptr;
                 }
