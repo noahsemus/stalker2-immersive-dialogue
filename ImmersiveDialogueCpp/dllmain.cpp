@@ -291,7 +291,8 @@ public:
     UObject*   m_pawnCamera = nullptr;              // UCameraComponent on the pawn
     FProperty* m_fovProp = nullptr;                 // FloatProperty "FieldOfView"
     bool       m_configLoaded         = false;
-    bool       m_f5Prev               = false;
+    bool       m_f5Prev               = false; // (name lingering; actually tracks F6)
+    bool       m_f7Prev               = false;
     std::vector<UObject*> m_lookAtModifiers;
     UFunction* m_disableModifierFn = nullptr;
     UFunction* m_enableModifierFn  = nullptr;
@@ -548,10 +549,98 @@ public:
         m_ftAkComponent->ProcessEvent(m_ftPostEventFn, buf);
     }
 
-    // Force-play walk montage — REMOVED. STALKER 2's walking isn't an AnimMontage asset
-    // (walk is a state in the anim graph state machine, not a one-shot montage). The
-    // dialogue-idle lock is enforced in native C++ we can't hook. Body/foot IK during
-    // dialogue movement isn't reachable without RE work on the anim graph.
+    // Walking anim in dialogue: attack via direct AnimInstance UPROPERTY writes.
+    // Path: pawn -> GetMesh (USkeletalMeshComponent) -> GetAnimInstance (UAnimInstance).
+    // We probe for bool UPROPERTYs whose name hints at dialogue-idle state and either
+    // force them false (idle-lock) or true (walking) each frame in dialogue.
+    UObject* m_pawnMesh         = nullptr;
+    UObject* m_animInstance     = nullptr;
+    bool     m_animProbed       = false;
+    // Candidate UPROPERTYs found — we write in bulk each tick while moving in dialogue.
+    struct AnimBoolProp {
+        FProperty* prop = nullptr;
+        bool valueToForce = false; // false to override "in dialogue" flags, true to override "walking" flags
+        const wchar_t* name = nullptr; // for logging
+    };
+    std::vector<AnimBoolProp> m_animBoolProps;
+
+    void ResolvePawnAnimInstance(UObject* pawn) {
+        if (m_animProbed) return;
+        m_animProbed = true;
+
+        UFunction* getMeshFn = pawn->GetFunctionByNameInChain(FName(STR("GetMesh")));
+        if (!getMeshFn) getMeshFn = pawn->GetFunctionByNameInChain(FName(STR("K2_GetMesh")));
+        if (getMeshFn) {
+            struct { UObject* Ret; } p{nullptr};
+            pawn->ProcessEvent(getMeshFn, &p);
+            m_pawnMesh = p.Ret;
+        }
+        if (!m_pawnMesh) {
+            Output::send<LogLevel::Verbose>(STR("[ImmDlg] anim probe: pawn mesh not found\n"));
+            return;
+        }
+        UFunction* getAnimFn = m_pawnMesh->GetFunctionByNameInChain(FName(STR("GetAnimInstance")));
+        if (getAnimFn) {
+            struct { UObject* Ret; } p{nullptr};
+            m_pawnMesh->ProcessEvent(getAnimFn, &p);
+            m_animInstance = p.Ret;
+        }
+        if (!m_animInstance) {
+            Output::send<LogLevel::Verbose>(STR("[ImmDlg] anim probe: AnimInstance not found\n"));
+            return;
+        }
+
+        // Candidate names + intended force value:
+        //   force FALSE for anything that says "in dialogue" / "relax idle"
+        //   force TRUE  for anything that says "walking" / "moving"
+        struct Cand { const wchar_t* name; bool val; };
+        Cand candidates[] = {
+            // Dialogue / relax-idle overrides (force false)
+            { STR("bInDialogue"),          false },
+            { STR("bIsInDialogue"),        false },
+            { STR("bIsInStaticDialog"),    false },
+            { STR("bIsInStaticDialogue"),  false },
+            { STR("bDialogueMode"),        false },
+            { STR("bStandToRelaxIdle"),    false },
+            { STR("bIsStandToRelaxIdle"),  false },
+            { STR("bIsRelaxIdle"),         false },
+            { STR("bInRelaxIdle"),         false },
+            { STR("bRelaxIdle"),           false },
+            { STR("StandToRelaxIdle"),     false },
+            { STR("IsInStaticDialog"),     false },
+            // Walking flags (force true when moving)
+            { STR("bIsWalking"),           true  },
+            { STR("bIsMoving"),            true  },
+            { STR("bHasMovementInput"),    true  },
+            { STR("bWalking"),             true  },
+            { STR("bMoving"),              true  },
+        };
+        for (auto& c : candidates) {
+            if (FProperty* p = m_animInstance->GetPropertyByNameInChain(c.name)) {
+                m_animBoolProps.push_back({p, c.val, c.name});
+                Output::send<LogLevel::Verbose>(STR("[ImmDlg]   anim prop: {} -> force {}\n"),
+                                                 c.name, c.val ? STR("true") : STR("false"));
+            }
+        }
+        Output::send<LogLevel::Verbose>(
+            STR("[ImmDlg] anim probe: mesh={}, animInst={}, props={}\n"),
+            m_pawnMesh ? STR("ok") : STR("null"),
+            m_animInstance ? STR("ok") : STR("null"),
+            (int)m_animBoolProps.size());
+    }
+
+    // Every frame in dialogue: write our set of anim-state bool overrides. "moving" gates
+    // the walking-related ones; dialogue-related ones are always forced false while in dlg.
+    void ForceAnimState(bool moving) {
+        if (!m_animInstance) return;
+        for (auto& b : m_animBoolProps) {
+            if (!b.prop) continue;
+            // Skip walking-true when not moving so we don't lie that we're always walking.
+            if (b.valueToForce == true && !moving) continue;
+            bool* slot = b.prop->ContainerPtrToValuePtr<bool>(m_animInstance);
+            if (slot) *slot = b.valueToForce;
+        }
+    }
 
     // Resolve pawn camera + FOV property (once, on first dialogue entry).
     void ResolvePawnCamera(UObject* pawn) {
@@ -604,8 +693,8 @@ public:
         if (target > 30.0f && target < 170.0f) WriteCameraFov(target);
     }
 
-    void PollCameraCenteringHotkey() {
-        // F6 toggles (F5 is quicksave in STALKER 2 — don't stomp it).
+    void PollHotkeys() {
+        // F6 — camera centering (F5 is quicksave in STALKER 2, don't stomp it).
         bool f6 = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
         if (f6 && !m_f5Prev) {
             m_camCenteringDisabled = !m_camCenteringDisabled;
@@ -615,6 +704,17 @@ public:
                 m_camCenteringDisabled ? STR("DISABLED (camera free)") : STR("enabled (game default)"));
         }
         m_f5Prev = f6;
+
+        // F7 — disable dialogue FOV change.
+        bool f7 = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
+        if (f7 && !m_f7Prev) {
+            m_disableDialogueFov = !m_disableDialogueFov;
+            SaveConfig();
+            Output::send<LogLevel::Verbose>(
+                STR("[ImmDlg] disable dialogue FOV change (F7) -> {}\n"),
+                m_disableDialogueFov ? STR("YES (keep non-dialogue FOV)") : STR("no (game's dialogue FOV shift applies)"));
+        }
+        m_f7Prev = f7;
     }
 
     void ApplyCameraCenteringToggle(bool inDlg) {
@@ -653,10 +753,11 @@ public:
 
         // Resolve camera once (runs in AND out of dialogue so we can sample non-dialogue FOV).
         ResolvePawnCamera(pawn);
+        ResolvePawnAnimInstance(pawn);
         ApplyFovPolicy(inDlg);
 
         // Hotkey polling every frame (works even outside dialogue).
-        PollCameraCenteringHotkey();
+        PollHotkeys();
         // Apply camera-centering-disable in dialogue if user has toggled it on.
         ApplyCameraCenteringToggle(inDlg);
 
@@ -699,6 +800,9 @@ public:
             if (strafe != 0.0) AddMovement(pawn, rX, rY, (float)(strafe * WALK_SCALE));
         }
         MaybeFireFootstep(moving);
+        // Force anim state overrides (in dialogue). Idle/dialogue flags always false; walking
+        // flags true only when actually moving.
+        if (inDlg) ForceAnimState(moving);
 
         // ---- Look: mouse (smoothed) + right stick ----
         m_pending_dx += (double)g_dx.exchange(0);
