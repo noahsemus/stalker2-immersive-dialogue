@@ -756,13 +756,49 @@ public:
             m_prevInDialog = true;
         }
 
-        // Tap-Escape: NO-OP. Feature dropped per user decision — spawning the real STALKER 2
-        // pause menu (WBP_PauseMenuMainView) during dialogue proved intractable: the WBP
-        // isn't reliably pre-loaded, spawning from the empty C++ parent renders nothing, and
-        // the game's own pause pipeline refuses during dialogue at a level below the UFunction
-        // reflection layer. Freezing world time alone is useless without menu buttons. Just
-        // consume the flag so pad-Start / tap-Esc don't stack pending events.
-        (void)g_pauseTapPending.exchange(false, std::memory_order_relaxed);
+        // Tap-Escape: one more real attempt at the actual pause menu. Instead of spawning
+        // a fresh widget from a class (empty C++ parent renders nothing; WBP not always
+        // pre-loaded), we look for an EXISTING W_PauseMenuMainView_C instance in memory —
+        // one is created by the game the first time you open pause menu, and it usually
+        // stays alive after being hidden. If found we AddToViewport + SetVisibility on
+        // that fully-constructed instance, then freeze the world via WorldSettings.Pauser.
+        //
+        // For this to work you need to open pause menu once in gameplay (outside dialogue)
+        // before entering a dialogue — that instantiates the WBP.
+        if (g_pauseTapPending.exchange(false, std::memory_order_relaxed)) {
+            m_worldPaused = !m_worldPaused;
+            if (m_worldPaused) {
+                UObject* existingWidget = UObjectGlobals::FindFirstOf(STR("W_PauseMenuMainView_C"));
+                bool addedToView = false;
+                if (existingWidget) {
+                    if (UFunction* addFn = existingWidget->GetFunctionByNameInChain(FName(STR("AddToViewport")))) {
+                        alignas(8) char addP[16] = {}; *reinterpret_cast<int32_t*>(addP) = 1000;
+                        existingWidget->ProcessEvent(addFn, addP);
+                        addedToView = true;
+                    }
+                    if (UFunction* visFn = existingWidget->GetFunctionByNameInChain(FName(STR("SetVisibility")))) {
+                        alignas(8) char visP[16] = {}; visP[0] = 0; // Visible
+                        existingWidget->ProcessEvent(visFn, visP);
+                    }
+                    m_spawnedPauseWidget = existingWidget;
+                }
+                bool frozen = DirectWorldPause(pawn, true);
+                Output::send<LogLevel::Verbose>(
+                    STR("[ImmDlg] pause ON: freeze={}, existingWidget={}, addedToView={}\n"),
+                    frozen ? STR("ok") : STR("fail"),
+                    existingWidget ? STR("FOUND") : STR("MISSING - open pause menu once outside dialogue first"),
+                    addedToView ? STR("ok") : STR("skipped"));
+            } else {
+                DirectWorldPause(pawn, false);
+                if (m_spawnedPauseWidget) {
+                    if (UFunction* visFn = m_spawnedPauseWidget->GetFunctionByNameInChain(FName(STR("SetVisibility")))) {
+                        alignas(8) char visP[16] = {}; visP[0] = 1; // Collapsed
+                        m_spawnedPauseWidget->ProcessEvent(visFn, visP);
+                    }
+                }
+                Output::send<LogLevel::Verbose>(STR("[ImmDlg] pause OFF: world resumed, widget hidden\n"));
+            }
+        }
 
         // Hold-Escape latch: once we cross the hold threshold, fire close-dialogue and mark.
         if (g_escSwallowed.load(std::memory_order_relaxed) && !m_escHoldFired) {
