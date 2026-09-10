@@ -394,52 +394,112 @@ public:
         return UObjectGlobals::FindObject(nullptr, nullptr, fullPath, false);
     }
 
-    // Try to open the game's real PauseMenuMainView as a viewport overlay. If the widget
-    // spawns successfully it renders on top of the dialogue view with full Settings / Save
-    // / Load / Quit functionality — the dialogue widget stays underneath in its own view.
-    // This bypasses the game's pause gate entirely because we're not going through the
-    // input-action -> IPU pipeline; we're calling UWidgetBlueprintLibrary::Create directly.
+    // Get PlayerState — required to write into AWorldSettings.Pauser to freeze the world.
+    UObject* GetPlayerStateViaProperty(UObject* pawn) {
+        if (UObject* c = GetControllerViaProperty(pawn)) {
+            if (FProperty* p = c->GetPropertyByNameInChain(STR("PlayerState"))) {
+                if (UObject** s = p->ContainerPtrToValuePtr<UObject*>(c)) if (*s) return *s;
+            }
+        }
+        if (FProperty* p = pawn->GetPropertyByNameInChain(STR("PlayerState"))) {
+            if (UObject** s = p->ContainerPtrToValuePtr<UObject*>(pawn)) return *s;
+        }
+        return nullptr;
+    }
+
+    // Freeze / unfreeze the world by writing AWorldSettings.Pauser directly. This bypasses
+    // APlayerController::SetPause's CanPause() virtual entirely — CanPause is what STALKER 2
+    // clamps down on during dialogue. Setting Pauser to a non-null player state makes the
+    // world's tick see itself as paused; setting to null unpauses.
+    bool DirectWorldPause(UObject* pawn, bool paused) {
+        UObject* ws = UObjectGlobals::FindFirstOf(STR("WorldSettings"));
+        if (!ws) { Output::send<LogLevel::Verbose>(STR("[ImmDlg] DirectWorldPause: WorldSettings not found\n")); return false; }
+        FProperty* prop = ws->GetPropertyByNameInChain(STR("Pauser"));
+        if (!prop) prop = ws->GetPropertyByNameInChain(STR("PauserPlayerState"));
+        if (!prop) { Output::send<LogLevel::Verbose>(STR("[ImmDlg] DirectWorldPause: Pauser property not found\n")); return false; }
+        UObject** slot = prop->ContainerPtrToValuePtr<UObject*>(ws);
+        if (!slot) return false;
+        UObject* ps = paused ? GetPlayerStateViaProperty(pawn) : nullptr;
+        *slot = ps;
+        Output::send<LogLevel::Verbose>(STR("[ImmDlg] DirectWorldPause: set Pauser={}\n"),
+                                         ps ? STR("PlayerState") : STR("null"));
+        return true;
+    }
+
+    // Diagnostic: dump every loaded UClass whose name contains PauseMenu or MainMenu.
+    // The C++ class /Script/Stalker2.PauseMenuMainView is empty (members=0); the actual
+    // renderable pause menu is a Blueprint (WBP_...) that inherits from it. We need
+    // that WBP class object to spawn a widget with visual content.
+    bool m_menuClassesLogged = false;
+    void LogMenuClassesOnce() {
+        if (m_menuClassesLogged) return;
+        m_menuClassesLogged = true;
+        std::vector<UObject*> classes;
+        UObjectGlobals::FindAllOf(STR("Class"), classes);
+        int found = 0;
+        Output::send<LogLevel::Verbose>(STR("[ImmDlg] scanning {} UClass objects for pause/menu\n"), (int)classes.size());
+        for (UObject* cls : classes) {
+            if (!cls) continue;
+            StringType n = cls->GetName();
+            if (n.find(STR("PauseMenu")) != StringType::npos
+                || n.find(STR("MainMenu")) != StringType::npos
+                || n.find(STR("PauseGame")) != StringType::npos) {
+                Output::send<LogLevel::Verbose>(STR("[ImmDlg]   menu class: {}\n"), n);
+                if (++found >= 40) { Output::send<LogLevel::Verbose>(STR("[ImmDlg]   (truncated)\n")); break; }
+            }
+        }
+    }
+
     bool m_pauseWidgetLogged = false;
     UObject* TrySpawnPauseMenuWidget(UObject* pawn) {
-        UObject* widLib   = FindDefaultObject(STR("/Script/UMG.Default__WidgetBlueprintLibrary"));
-        UObject* widClass = FindDefaultObject(STR("/Script/Stalker2.PauseMenuMainView"));
-        if (!widClass) widClass = FindDefaultObject(STR("/Script/Stalker2.PauseGameView"));
-        UObject* pc = GetControllerViaProperty(pawn);
-        if (!m_pauseWidgetLogged) {
-            m_pauseWidgetLogged = true;
-            Output::send<LogLevel::Verbose>(
-                STR("[ImmDlg] pause menu spawn probe: widLib={}, widClass={}, pc={}\n"),
-                widLib   ? STR("found") : STR("MISSING"),
-                widClass ? STR("found") : STR("MISSING"),
-                pc       ? STR("found") : STR("MISSING"));
-        }
-        if (!widLib || !widClass || !pc) return nullptr;
+        UObject* widLib = FindDefaultObject(STR("/Script/UMG.Default__WidgetBlueprintLibrary"));
+        UObject* pc     = GetControllerViaProperty(pawn);
+        if (!widLib || !pc) return nullptr;
 
         UFunction* createFn = widLib->GetFunctionByNameInChain(FName(STR("Create")));
         if (!createFn) return nullptr;
-        // UWidgetBlueprintLibrary::Create(OwningObject, WidgetType, WidgetName) -> UserWidget*
+
+        // Try Blueprint-generated classes first (they have visual content), then C++ parents.
+        const wchar_t* candidates[] = {
+            STR("WBP_PauseMenu_C"),
+            STR("WBP_PauseMainMenu_C"),
+            STR("WBP_PauseMenuMainView_C"),
+            STR("BP_PauseMenu_C"),
+            STR("PauseMenu_C"),
+            STR("PauseMenuMainView_C"),
+            STR("/Script/Stalker2.PauseMenuMainView"),
+            STR("/Script/Stalker2.PauseGameView"),
+        };
+        UObject* widClass = nullptr;
+        const wchar_t* usedName = nullptr;
+        for (auto* n : candidates) {
+            UObject* c = UObjectGlobals::FindObject(nullptr, nullptr, n, false);
+            if (c) { widClass = c; usedName = n; break; }
+        }
+        if (!m_pauseWidgetLogged) {
+            m_pauseWidgetLogged = true;
+            Output::send<LogLevel::Verbose>(
+                STR("[ImmDlg] pause widget: using class '{}'\n"),
+                usedName ? usedName : STR("NONE"));
+        }
+        if (!widClass) return nullptr;
+
         alignas(8) char buf[64] = {};
-        *reinterpret_cast<UObject**>(buf + 0)  = pc;
-        *reinterpret_cast<UObject**>(buf + 8)  = widClass;
-        // WidgetName FName is 8 bytes; leave zero => empty name (auto)
+        *reinterpret_cast<UObject**>(buf + 0) = pc;
+        *reinterpret_cast<UObject**>(buf + 8) = widClass;
         widLib->ProcessEvent(createFn, buf);
-        UObject* widget = *reinterpret_cast<UObject**>(buf + 24); // returned UserWidget*
+        UObject* widget = *reinterpret_cast<UObject**>(buf + 24);
         if (!widget) return nullptr;
 
-        UFunction* addFn = widget->GetFunctionByNameInChain(FName(STR("AddToViewport")));
-        if (!addFn) return nullptr;
-        struct { int32_t ZOrder; } addP{1000};
-        widget->ProcessEvent(addFn, &addP);
-
+        if (UFunction* addFn = widget->GetFunctionByNameInChain(FName(STR("AddToViewport")))) {
+            struct { int32_t ZOrder; } addP{1000};
+            widget->ProcessEvent(addFn, &addP);
+        }
         if (UFunction* visFn = widget->GetFunctionByNameInChain(FName(STR("SetVisibility")))) {
-            struct { uint8_t InVisibility; } visP{0}; // 0 = ESlateVisibility::Visible
+            struct { uint8_t InVisibility; } visP{0};
             widget->ProcessEvent(visFn, &visP);
         }
-
-        // NOT calling SetInputMode_UIOnlyEx here — it releases OS cursor from the game and
-        // leaves it un-recapturable when the widget doesn't take proper focus. Widget stays
-        // on the viewport z=1000; if it renders visibly great, if not we haven't broken
-        // cursor lock.
+        // Deliberately NOT SetInputMode_UIOnlyEx — that broke cursor lock last time.
         return widget;
     }
     UObject* m_spawnedPauseWidget = nullptr;
@@ -640,9 +700,16 @@ public:
             m_prevInDialog = false;
             m_escHoldFired = false;
             g_pauseTapPending.store(false, std::memory_order_relaxed);
+            g_lieDialogUntil.store(0, std::memory_order_relaxed);
             // Auto-unpause if we paused earlier and dialogue has since ended
             if (m_worldPaused) {
-                TryPauseGame(pawn, false);
+                DirectWorldPause(pawn, false);
+                if (m_spawnedPauseWidget) {
+                    if (UFunction* rmFn = m_spawnedPauseWidget->GetFunctionByNameInChain(FName(STR("RemoveFromParent")))) {
+                        m_spawnedPauseWidget->ProcessEvent(rmFn, nullptr);
+                    }
+                    m_spawnedPauseWidget = nullptr;
+                }
                 m_worldPaused = false;
             }
             return;
@@ -652,24 +719,37 @@ public:
         if (!m_prevInDialog) {
             LoadStalker2Settings();
             LogInputActionsOnce();
+            LogMenuClassesOnce();
             m_prevInDialog = true;
         }
 
-        // Tap-Escape: open pause menu without closing dialogue. Multi-pronged this iteration:
-        //   1. Set 2-second lie window on IsInStaticDialog + IsInteractionInProgress + IsInCinematic
-        //      (three gates the game might use to refuse pause).
-        //   2. Try direct widget spawn of PauseMenuMainView + SetVisibility + SetInputMode UI.
-        //   3. Send synthetic Escape into the game so its normal pause action fires while
-        //      all three state-check hooks are lying.
+        // Tap-Escape: toggle pause menu overlay. First tap: freeze world via WorldSettings.Pauser
+        // direct write (bypasses CanPause), spawn Blueprint-generated pause widget on top, lie
+        // about IsInStaticDialog. Second tap: unfreeze, remove widget.
         if (g_pauseTapPending.exchange(false, std::memory_order_relaxed)) {
-            uint64_t now = GetTickCount64();
-            g_lieDialogUntil.store(now + 2000, std::memory_order_relaxed);
-            UObject* w = TrySpawnPauseMenuWidget(pawn);
-            SendSyntheticEscape(1);
-            Output::send<LogLevel::Verbose>(
-                STR("[ImmDlg] pause tap -> lie 2s + widget={} + synthEsc\n"),
-                w ? STR("spawned") : STR("null"));
-            if (w) m_spawnedPauseWidget = w;
+            m_worldPaused = !m_worldPaused;
+            if (m_worldPaused) {
+                uint64_t now = GetTickCount64();
+                g_lieDialogUntil.store(now + 60000, std::memory_order_relaxed); // long lie while menu is up
+                bool frozen = DirectWorldPause(pawn, true);
+                UObject* w  = TrySpawnPauseMenuWidget(pawn);
+                if (w) m_spawnedPauseWidget = w;
+                Output::send<LogLevel::Verbose>(
+                    STR("[ImmDlg] pause ON: DirectPause={}, widget={}\n"),
+                    frozen ? STR("ok") : STR("fail"),
+                    w      ? STR("spawned") : STR("null"));
+            } else {
+                DirectWorldPause(pawn, false);
+                g_lieDialogUntil.store(0, std::memory_order_relaxed);
+                // Remove widget if we spawned one
+                if (m_spawnedPauseWidget) {
+                    if (UFunction* rmFn = m_spawnedPauseWidget->GetFunctionByNameInChain(FName(STR("RemoveFromParent")))) {
+                        m_spawnedPauseWidget->ProcessEvent(rmFn, nullptr);
+                    }
+                    m_spawnedPauseWidget = nullptr;
+                }
+                Output::send<LogLevel::Verbose>(STR("[ImmDlg] pause OFF: DirectPause=off, widget removed\n"));
+            }
         }
 
         // Hold-Escape latch: once we cross the hold threshold, fire close-dialogue and mark.
