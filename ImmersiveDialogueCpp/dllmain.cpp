@@ -342,39 +342,45 @@ public:
         ModDescription = STR("Free movement + mouse look during NPC dialogue.");
     }
 
-    // We install a post-hook on PC::IsInStaticDialog so that during a brief window right
-    // after the user requests pause, the game's pause-menu-open flow sees "not in dialogue"
-    // and lets the pause menu open. The dialogue widget stays on the view stack (we don't
-    // send Escape to close it) and pause menu appears over the top, complete with Settings,
-    // Save, Load, Quit — the whole thing.
-    std::pair<int,int> m_isInDialogHookIds{-1,-1};
-    void InstallIsInDialogLieHook() {
-        UnrealScriptFunctionCallable postCb =
+    // We install post-hooks on every state-check that STALKER 2 might use to gate the pause
+    // menu during dialogue. During a lie window, they all return false, so whatever branch
+    // the game takes when it processes the pause action, it doesn't refuse.
+    std::pair<int,int> m_hookIsInDialog{-1,-1};
+    std::pair<int,int> m_hookInteractionInProgress{-1,-1};
+    std::pair<int,int> m_hookInCinematic{-1,-1};
+    void InstallStateLieHooks() {
+        UnrealScriptFunctionCallable postFalse =
             [](UnrealScriptFunctionCallableContext& ctx, void*) {
                 if (GetTickCount64() < g_lieDialogUntil.load(std::memory_order_relaxed)) {
                     ctx.SetReturnValue<bool>(false);
                 }
             };
-        m_isInDialogHookIds = UObjectGlobals::RegisterHook(
+        m_hookIsInDialog = UObjectGlobals::RegisterHook(
             StringType(STR("/Script/Stalker2.PC:IsInStaticDialog")),
-            UnrealScriptFunctionCallable{},  // no pre-hook
-            postCb,
-            nullptr);
+            UnrealScriptFunctionCallable{}, postFalse, nullptr);
+        m_hookInteractionInProgress = UObjectGlobals::RegisterHook(
+            StringType(STR("/Script/Stalker2.PC:IsInteractionInProgress")),
+            UnrealScriptFunctionCallable{}, postFalse, nullptr);
+        m_hookInCinematic = UObjectGlobals::RegisterHook(
+            StringType(STR("/Script/Stalker2.PC:IsInCinematic")),
+            UnrealScriptFunctionCallable{}, postFalse, nullptr);
     }
 
     auto on_unreal_init() -> void override {
         SetupInputHook();
         InstallXInputHook();
         LoadStalker2Settings();
-        InstallIsInDialogLieHook();
+        InstallStateLieHooks();
         Output::send<LogLevel::Verbose>(
-            STR("[ImmDlg] unreal init (mouse hook={}, xinput hook={}, mouseSens={}, padSens={}, invertY={}, dlgHook={},{})\n"),
+            STR("[ImmDlg] unreal init (mouse hook={}, xinput hook={}, mouseSens={}, padSens={}, invertY={}, dlgHook={},{} interactHook={},{} cineHook={},{})\n"),
             g_rawReady      ? STR("ok") : STR("FAILED"),
             g_xinputHooked  ? STR("ok") : STR("SKIPPED"),
             g_mouseSensCoef.load(),
             g_padSensCoef.load(),
             g_invertMouseY.load() ? STR("true") : STR("false"),
-            m_isInDialogHookIds.first, m_isInDialogHookIds.second);
+            m_hookIsInDialog.first, m_hookIsInDialog.second,
+            m_hookInteractionInProgress.first, m_hookInteractionInProgress.second,
+            m_hookInCinematic.first, m_hookInCinematic.second);
     }
 
     UObject* GetPawn() {
@@ -431,8 +437,31 @@ public:
 
         UFunction* addFn = widget->GetFunctionByNameInChain(FName(STR("AddToViewport")));
         if (!addFn) return nullptr;
-        struct { int32_t ZOrder; } addP{100};
+        struct { int32_t ZOrder; } addP{1000};
         widget->ProcessEvent(addFn, &addP);
+
+        // Force visibility (some widgets default to Collapsed).
+        if (UFunction* visFn = widget->GetFunctionByNameInChain(FName(STR("SetVisibility")))) {
+            struct { uint8_t InVisibility; } visP{0}; // 0 = ESlateVisibility::Visible
+            widget->ProcessEvent(visFn, &visP);
+        }
+
+        // Route input to the pause menu UI so its buttons receive clicks/gamepad.
+        UObject* widLibForInput = FindDefaultObject(STR("/Script/UMG.Default__WidgetBlueprintLibrary"));
+        if (widLibForInput) {
+            if (UFunction* imFn = widLibForInput->GetFunctionByNameInChain(FName(STR("SetInputMode_UIOnlyEx")))) {
+                alignas(8) char imBuf[64] = {};
+                *reinterpret_cast<UObject**>(imBuf + 0) = pc;       // PlayerController
+                *reinterpret_cast<UObject**>(imBuf + 8) = widget;   // WidgetToFocus
+                // MouseLockMode enum + FlushInput bool have default zeros
+                widLibForInput->ProcessEvent(imFn, imBuf);
+            } else if (UFunction* imFn2 = widLibForInput->GetFunctionByNameInChain(FName(STR("SetInputMode_GameAndUIEx")))) {
+                alignas(8) char imBuf[64] = {};
+                *reinterpret_cast<UObject**>(imBuf + 0) = pc;
+                *reinterpret_cast<UObject**>(imBuf + 8) = widget;
+                widLibForInput->ProcessEvent(imFn2, imBuf);
+            }
+        }
         return widget;
     }
     UObject* m_spawnedPauseWidget = nullptr;
@@ -531,31 +560,31 @@ public:
         return nullptr;
     }
 
-    // Force footsteps back on during dialogue (game normally mutes character SFX in static dialog).
-    // The setter is on the Obj base class (parent of PC), reachable via GetFunctionByNameInChain.
-    UFunction*  m_fnFootsteps = nullptr;
-    bool        m_footstepsFnResolved = false;
-    void ForceFootstepsEnabled(UObject* pawn) {
-        if (!m_footstepsFnResolved) {
-            m_footstepsFnResolved = true;
-            const wchar_t* candidates[] = {
-                STR("SetFootstepsEnabled"),
-                STR("set_footsteps_enabled"),
-                STR("EnableFootsteps"),
-                STR("BP_SetFootstepsEnabled"),
-                STR("K2_SetFootstepsEnabled"),
-            };
-            const wchar_t* used = nullptr;
-            for (auto* c : candidates) {
-                if (UFunction* fn = Fn(pawn, c)) { m_fnFootsteps = fn; used = c; break; }
-            }
+    // Break the character out of the "dialogue relaxed idle" animation state AND flip footsteps on
+    // every frame. Without exiting the relax-idle pose, the anim graph doesn't play walk cycles,
+    // so no foot-IK notify fires, so no footstep sound. Setting SetStandToRelaxIdle(false) each
+    // tick keeps overriding whatever dialogue system pushes.
+    UFunction* m_fnFootsteps      = nullptr;
+    UFunction* m_fnSetRelaxIdle   = nullptr;
+    bool       m_animGatesResolved = false;
+    void ForceWalkAnimatable(UObject* pawn) {
+        if (!m_animGatesResolved) {
+            m_animGatesResolved = true;
+            m_fnFootsteps    = Fn(pawn, STR("SetFootstepsEnabled"));
+            m_fnSetRelaxIdle = Fn(pawn, STR("SetStandToRelaxIdle"));
             Output::send<LogLevel::Verbose>(
-                STR("[ImmDlg] footsteps fn: {}\n"),
-                used ? used : STR("NOT-FOUND"));
+                STR("[ImmDlg] anim gates: SetFootstepsEnabled={}, SetStandToRelaxIdle={}\n"),
+                m_fnFootsteps    ? STR("found") : STR("MISSING"),
+                m_fnSetRelaxIdle ? STR("found") : STR("MISSING"));
         }
-        if (!m_fnFootsteps) return;
-        struct { bool NewEnabled; } p{true};
-        pawn->ProcessEvent(m_fnFootsteps, &p);
+        if (m_fnFootsteps) {
+            struct { bool NewEnabled; } p{true};
+            pawn->ProcessEvent(m_fnFootsteps, &p);
+        }
+        if (m_fnSetRelaxIdle) {
+            struct { bool StandToRelaxIdle; } p{false};
+            pawn->ProcessEvent(m_fnSetRelaxIdle, &p);
+        }
     }
 
     static UFunction* Fn(UObject* o, const wchar_t* name) {
@@ -637,11 +666,22 @@ public:
             m_prevInDialog = true;
         }
 
-        // Tap-Escape: PARKED. Attempts to spawn PauseMenuMainView + lie about IsInStaticDialog
-        // to open the game's pause menu didn't work and appeared to interfere with dialogue
-        // exit. For now, tap-Esc is a no-op (swallowed at the WndProc layer). Hold-Esc still
-        // works to exit dialogue. Consuming the flag so it doesn't stack up.
-        (void)g_pauseTapPending.exchange(false, std::memory_order_relaxed);
+        // Tap-Escape: open pause menu without closing dialogue. Multi-pronged this iteration:
+        //   1. Set 2-second lie window on IsInStaticDialog + IsInteractionInProgress + IsInCinematic
+        //      (three gates the game might use to refuse pause).
+        //   2. Try direct widget spawn of PauseMenuMainView + SetVisibility + SetInputMode UI.
+        //   3. Send synthetic Escape into the game so its normal pause action fires while
+        //      all three state-check hooks are lying.
+        if (g_pauseTapPending.exchange(false, std::memory_order_relaxed)) {
+            uint64_t now = GetTickCount64();
+            g_lieDialogUntil.store(now + 2000, std::memory_order_relaxed);
+            UObject* w = TrySpawnPauseMenuWidget(pawn);
+            SendSyntheticEscape(1);
+            Output::send<LogLevel::Verbose>(
+                STR("[ImmDlg] pause tap -> lie 2s + widget={} + synthEsc\n"),
+                w ? STR("spawned") : STR("null"));
+            if (w) m_spawnedPauseWidget = w;
+        }
 
         // Hold-Escape latch: once we cross the hold threshold, fire close-dialogue and mark.
         if (g_escSwallowed.load(std::memory_order_relaxed) && !m_escHoldFired) {
@@ -657,7 +697,7 @@ public:
         }
 
         ResetIgnore(pawn);
-        ForceFootstepsEnabled(pawn); // game mutes footsteps during static dialog — flip back on each frame
+        ForceWalkAnimatable(pawn); // flip footsteps flag AND break out of dialogue relax-idle so anim graph plays walk cycle
 
         // ---- read controller ONCE per frame (also used for movement/look below) ----
         double padMoveX = 0.0, padMoveY = 0.0, padLookX = 0.0, padLookY = 0.0;
