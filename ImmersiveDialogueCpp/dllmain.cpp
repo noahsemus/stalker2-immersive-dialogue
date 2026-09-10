@@ -756,6 +756,22 @@ public:
             STR("[ImmDlg]   state_data offsets: walk={}, jog={}, sprint={}, crouch={}, combatMoveIdle={}, combatCrouchIdle={}\n"),
             m_offWalkingOverride, m_offJoggingOverride, m_offSprintingOverride,
             m_offCrouchingOverride, m_offCombatMoveIdle, m_offCombatCrouchIdle);
+
+        // Diagnostic: dump EVERY property on the state_data struct (name + offset). Walk
+        // parent structs too so inherited members show up. This tells us exactly what
+        // the names are so future lookups match.
+        int printed = 0;
+        UStruct* s = stru;
+        while (s) {
+            for (FProperty* p : TFieldRange<FProperty>(s, EFieldIterationFlags::None)) {
+                if (!p) continue;
+                Output::send<LogLevel::Verbose>(STR("[ImmDlg]     state_data.{} off={}\n"),
+                                                 p->GetName(), p->GetOffset_ForInternal());
+                if (++printed >= 40) break;
+            }
+            if (printed >= 40) break;
+            s = s->GetSuperStruct();
+        }
     }
 
     void ForceStateDataOverrides(bool moving) {
