@@ -431,28 +431,15 @@ public:
         struct { int32_t ZOrder; } addP{1000};
         widget->ProcessEvent(addFn, &addP);
 
-        // Force visibility (some widgets default to Collapsed).
         if (UFunction* visFn = widget->GetFunctionByNameInChain(FName(STR("SetVisibility")))) {
             struct { uint8_t InVisibility; } visP{0}; // 0 = ESlateVisibility::Visible
             widget->ProcessEvent(visFn, &visP);
         }
 
-        // Route input to the pause menu UI so its buttons receive clicks/gamepad.
-        UObject* widLibForInput = FindDefaultObject(STR("/Script/UMG.Default__WidgetBlueprintLibrary"));
-        if (widLibForInput) {
-            if (UFunction* imFn = widLibForInput->GetFunctionByNameInChain(FName(STR("SetInputMode_UIOnlyEx")))) {
-                alignas(8) char imBuf[64] = {};
-                *reinterpret_cast<UObject**>(imBuf + 0) = pc;       // PlayerController
-                *reinterpret_cast<UObject**>(imBuf + 8) = widget;   // WidgetToFocus
-                // MouseLockMode enum + FlushInput bool have default zeros
-                widLibForInput->ProcessEvent(imFn, imBuf);
-            } else if (UFunction* imFn2 = widLibForInput->GetFunctionByNameInChain(FName(STR("SetInputMode_GameAndUIEx")))) {
-                alignas(8) char imBuf[64] = {};
-                *reinterpret_cast<UObject**>(imBuf + 0) = pc;
-                *reinterpret_cast<UObject**>(imBuf + 8) = widget;
-                widLibForInput->ProcessEvent(imFn2, imBuf);
-            }
-        }
+        // NOT calling SetInputMode_UIOnlyEx here — it releases OS cursor from the game and
+        // leaves it un-recapturable when the widget doesn't take proper focus. Widget stays
+        // on the viewport z=1000; if it renders visibly great, if not we haven't broken
+        // cursor lock.
         return widget;
     }
     UObject* m_spawnedPauseWidget = nullptr;
@@ -555,26 +542,37 @@ public:
     // every frame. Without exiting the relax-idle pose, the anim graph doesn't play walk cycles,
     // so no foot-IK notify fires, so no footstep sound. Setting SetStandToRelaxIdle(false) each
     // tick keeps overriding whatever dialogue system pushes.
-    UFunction* m_fnFootsteps      = nullptr;
-    UFunction* m_fnSetRelaxIdle   = nullptr;
+    UFunction* m_fnFootsteps       = nullptr;
+    UFunction* m_fnSetRelaxIdle    = nullptr;
+    UFunction* m_fnRelaxToStandDone = nullptr;
+    UFunction* m_fnUpdateAnimInst   = nullptr;
     bool       m_animGatesResolved = false;
     void ForceWalkAnimatable(UObject* pawn) {
         if (!m_animGatesResolved) {
             m_animGatesResolved = true;
-            m_fnFootsteps    = Fn(pawn, STR("SetFootstepsEnabled"));
-            m_fnSetRelaxIdle = Fn(pawn, STR("SetStandToRelaxIdle"));
+            m_fnFootsteps        = Fn(pawn, STR("SetFootstepsEnabled"));
+            m_fnSetRelaxIdle     = Fn(pawn, STR("SetStandToRelaxIdle"));
+            m_fnRelaxToStandDone = Fn(pawn, STR("SetRelaxToStandFinished"));
+            m_fnUpdateAnimInst   = Fn(pawn, STR("UpdateObjAnimInstancesByReason"));
             Output::send<LogLevel::Verbose>(
-                STR("[ImmDlg] anim gates: SetFootstepsEnabled={}, SetStandToRelaxIdle={}\n"),
-                m_fnFootsteps    ? STR("found") : STR("MISSING"),
-                m_fnSetRelaxIdle ? STR("found") : STR("MISSING"));
+                STR("[ImmDlg] anim gates: SetFootstepsEnabled={}, SetStandToRelaxIdle={}, SetRelaxToStandFinished={}, UpdateObjAnimInstancesByReason={}\n"),
+                m_fnFootsteps         ? STR("found") : STR("MISSING"),
+                m_fnSetRelaxIdle      ? STR("found") : STR("MISSING"),
+                m_fnRelaxToStandDone  ? STR("found") : STR("MISSING"),
+                m_fnUpdateAnimInst    ? STR("found") : STR("MISSING"));
         }
         if (m_fnFootsteps) {
             struct { bool NewEnabled; } p{true};
             pawn->ProcessEvent(m_fnFootsteps, &p);
         }
+        // Force anim state machine: NOT in dialogue-idle AND transition-to-stand is finished.
         if (m_fnSetRelaxIdle) {
             struct { bool StandToRelaxIdle; } p{false};
             pawn->ProcessEvent(m_fnSetRelaxIdle, &p);
+        }
+        if (m_fnRelaxToStandDone) {
+            struct { bool RelaxToStandFinished; } p{true};
+            pawn->ProcessEvent(m_fnRelaxToStandDone, &p);
         }
     }
 
