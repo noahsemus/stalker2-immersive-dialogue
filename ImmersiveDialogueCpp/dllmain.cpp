@@ -646,11 +646,21 @@ public:
                                                  c.name, c.val ? STR("true") : STR("false"));
             }
         }
+        // Look up the STRUCT properties directly — these are named `dialog_data`,
+        // `state_data`, `locomotion_data` on AnimInstancePlayer. Inside dialog_data is a
+        // single `dialog` bool (offset 0). If we set that to false in dialogue, the anim
+        // graph sees "not in dialogue" and walks normal locomotion.
+        m_dialogDataProp = m_animInstance->GetPropertyByNameInChain(STR("dialog_data"));
+        if (!m_dialogDataProp) m_dialogDataProp = m_animInstance->GetPropertyByNameInChain(STR("DialogData"));
+        Output::send<LogLevel::Verbose>(STR("[ImmDlg]   dialog_data struct prop: {}\n"),
+                                         m_dialogDataProp ? STR("found") : STR("MISSING"));
+
         Output::send<LogLevel::Verbose>(
-            STR("[ImmDlg] anim probe: mesh={}, animInst={}, props={}\n"),
+            STR("[ImmDlg] anim probe: mesh={}, animInst={}, boolProps={}, dialogStruct={}\n"),
             m_pawnMesh ? STR("ok") : STR("null"),
             m_animInstance ? STR("ok") : STR("null"),
-            (int)m_animBoolProps.size());
+            (int)m_animBoolProps.size(),
+            m_dialogDataProp ? STR("ok") : STR("null"));
     }
 
     // Every frame in dialogue: write our set of anim-state bool overrides. "moving" gates
@@ -664,7 +674,15 @@ public:
             bool* slot = b.prop->ContainerPtrToValuePtr<bool>(m_animInstance);
             if (slot) *slot = b.valueToForce;
         }
+        // Direct write to `dialog_data.dialog` (bool) if we located the struct.
+        // AnimPlayerDialogData has exactly ONE member (dialog: bool at offset 0), so writing
+        // the first byte of the struct's memory IS writing the bool.
+        if (m_dialogDataProp) {
+            uint8_t* structMem = m_dialogDataProp->ContainerPtrToValuePtr<uint8_t>(m_animInstance);
+            if (structMem) *structMem = 0; // dialog = false
+        }
     }
+    FProperty* m_dialogDataProp = nullptr;
 
     // Resolve pawn camera + FOV property (once, on first dialogue entry).
     void ResolvePawnCamera(UObject* pawn) {
