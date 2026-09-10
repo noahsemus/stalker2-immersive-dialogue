@@ -1,0 +1,28 @@
+# Build tree
+Output/
+build/
+out/
+
+# Cloned UE4SS source (see BUILD.md — user clones this locally)
+RE-UE4SS/
+
+# Visual Studio caches
+.vs/
+*.suo
+*.user
+*.opendb
+
+# Binaries
+*.dll
+*.lib
+*.pdb
+*.exp
+*.obj
+*.ilk
+
+# OS/editor cruft
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Local claude session state (per-project memory lives elsewhere)
