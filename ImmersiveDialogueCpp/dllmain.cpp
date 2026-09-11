@@ -199,11 +199,15 @@ class ImmersiveDialogue : public CppUserModBase {
 public:
     UObject* m_pawn = nullptr;
 
-    // Tuning constants
-    static constexpr double WALK_SCALE      = 0.15;   // fraction of MaxWalkSpeed
-    static constexpr double BASE_MOUSE_SENS = 0.10;   // multiplied by in-game MouseSensitivityCoef
-    static constexpr double MOUSE_SMOOTH    = 0.5;    // release fraction per frame (1=raw, lower=smoother)
-    static constexpr double PAD_LOOK_SCALE  = 0.4;    // multiplied by in-game GamepadSensitivityCoef
+    // Tuning defaults — user-overridable via config.ini. Loaded in LoadConfig,
+    // written back in SaveConfig. Final applied sensitivity for mouse/pad still
+    // multiplies by the game's own MouseSensitivityCoef / GamepadSensitivityCoef
+    // (read from AppliedSettingsWin64.cfg), so raising the game slider still feels
+    // faster relative to a given mod value.
+    double m_walkScale     = 0.15;   // fraction of MaxWalkSpeed
+    double m_mouseSens     = 0.10;   // multiplied by in-game MouseSensitivityCoef
+    double m_padLookScale  = 0.4;    // multiplied by in-game GamepadSensitivityCoef
+    static constexpr double MOUSE_SMOOTH = 0.5;    // release fraction per frame (1=raw, lower=smoother)
 
     // Mouse smoothing state
     double m_pending_dx = 0.0;
@@ -274,6 +278,9 @@ public:
     // frame-by-frame FOV writes, so we deliberately do NOT touch FOV here.
     bool       m_configLoaded         = false;
     bool       m_f5Prev               = false; // (name lingering; actually tracks F6)
+    // Camera-centering toggle keybind. Default F6 (F5 is quicksave in STALKER 2, don't
+    // stomp it). User-overridable via `CameraCenteringToggleKey=<name>` in config.ini.
+    int        m_camCenteringToggleVk = VK_F6;
     std::vector<UObject*> m_lookAtModifiers;
     UFunction* m_disableModifierFn = nullptr;
     UFunction* m_enableModifierFn  = nullptr;
@@ -288,6 +295,75 @@ public:
         p += L"config.ini";
         return p;
     }
+    // Parse a key name like "F6", "F12", "H", "0", "Home", "0x71" into a Win32 VK_ code.
+    // Returns -1 on unrecognized input (caller keeps the previous default).
+    static int ParseKeyName(std::string s) {
+        // Trim + uppercase for matching.
+        while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r')) s.pop_back();
+        while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.erase(s.begin());
+        std::string u = s;
+        for (auto& c : u) c = (char)toupper((unsigned char)c);
+        // Hex form "0x7B".
+        if (u.size() > 2 && u[0] == '0' && u[1] == 'X') {
+            try { return (int)std::stoul(u.substr(2), nullptr, 16); } catch (...) {}
+        }
+        // Single letter A-Z or digit 0-9 → ASCII == VK_ for those ranges.
+        if (u.size() == 1 && ((u[0] >= 'A' && u[0] <= 'Z') || (u[0] >= '0' && u[0] <= '9'))) {
+            return (int)u[0];
+        }
+        // Function keys F1..F24.
+        if (u.size() >= 2 && u[0] == 'F') {
+            try {
+                int n = std::stoi(u.substr(1));
+                if (n >= 1 && n <= 24) return VK_F1 + (n - 1);
+            } catch (...) {}
+        }
+        // Named non-letter keys.
+        struct { const char* name; int vk; } table[] = {
+            {"HOME",       VK_HOME},     {"END",        VK_END},
+            {"INSERT",     VK_INSERT},   {"DELETE",     VK_DELETE},
+            {"PAGEUP",     VK_PRIOR},    {"PAGEDOWN",   VK_NEXT},
+            {"UP",         VK_UP},       {"DOWN",       VK_DOWN},
+            {"LEFT",       VK_LEFT},     {"RIGHT",      VK_RIGHT},
+            {"SPACE",      VK_SPACE},    {"TAB",        VK_TAB},
+            {"BACKSPACE",  VK_BACK},     {"ENTER",      VK_RETURN},
+            {"ESCAPE",     VK_ESCAPE},   {"ESC",        VK_ESCAPE},
+            {"CAPSLOCK",   VK_CAPITAL},  {"NUMLOCK",    VK_NUMLOCK},
+            {"SCROLLLOCK", VK_SCROLL},   {"PAUSE",      VK_PAUSE},
+        };
+        for (auto& e : table) if (u == e.name) return e.vk;
+        return -1;
+    }
+    // Reverse — best-effort human-readable name for a VK_ code. Falls back to hex.
+    static std::string KeyNameFromVk(int vk) {
+        if (vk >= 'A' && vk <= 'Z') return std::string(1, (char)vk);
+        if (vk >= '0' && vk <= '9') return std::string(1, (char)vk);
+        if (vk >= VK_F1 && vk <= VK_F24) return "F" + std::to_string(vk - VK_F1 + 1);
+        switch (vk) {
+            case VK_HOME:    return "Home";
+            case VK_END:     return "End";
+            case VK_INSERT:  return "Insert";
+            case VK_DELETE:  return "Delete";
+            case VK_PRIOR:   return "PageUp";
+            case VK_NEXT:    return "PageDown";
+            case VK_UP:      return "Up";
+            case VK_DOWN:    return "Down";
+            case VK_LEFT:    return "Left";
+            case VK_RIGHT:   return "Right";
+            case VK_SPACE:   return "Space";
+            case VK_TAB:     return "Tab";
+            case VK_BACK:    return "Backspace";
+            case VK_RETURN:  return "Enter";
+            case VK_ESCAPE:  return "Escape";
+            case VK_CAPITAL: return "CapsLock";
+            case VK_NUMLOCK: return "NumLock";
+            case VK_SCROLL:  return "ScrollLock";
+            case VK_PAUSE:   return "Pause";
+        }
+        char buf[16]; snprintf(buf, sizeof(buf), "0x%02X", vk);
+        return buf;
+    }
+
     void LoadConfig() {
         if (m_configLoaded) return;
         m_configLoaded = true;
@@ -300,7 +376,18 @@ public:
             if (eq == std::string::npos) continue;
             std::string k = trim(line.substr(0, eq));
             std::string v = trim(line.substr(eq + 1));
-            if (k == "DisableCameraCentering") m_camCenteringDisabled = (v == "true" || v == "1");
+            if (k == "DisableCameraCentering") {
+                m_camCenteringDisabled = (v == "true" || v == "1");
+            } else if (k == "CameraCenteringToggleKey") {
+                int vk = ParseKeyName(v);
+                if (vk > 0) m_camCenteringToggleVk = vk;
+            } else if (k == "MouseSensitivity") {
+                try { m_mouseSens = std::stod(v); } catch (...) {}
+            } else if (k == "GamepadLookSensitivity") {
+                try { m_padLookScale = std::stod(v); } catch (...) {}
+            } else if (k == "WalkSpeed") {
+                try { m_walkScale = std::stod(v); } catch (...) {}
+            }
         }
     }
     void SaveConfig() {
@@ -309,11 +396,24 @@ public:
         if (!f) return;
         f << "; ImmersiveDialogue config — key/value ini format\n";
         f << "DisableCameraCentering=" << (m_camCenteringDisabled ? "true" : "false") << "\n";
+        f << "; Hotkey to toggle camera centering while in dialogue. Accepts key names\n";
+        f << "; like F1-F24, A-Z, 0-9, Home/End/PageUp/PageDown/Insert/Delete/Space/etc,\n";
+        f << "; or a raw Win32 virtual-key hex code (e.g. 0x71). Default: F6.\n";
+        f << "CameraCenteringToggleKey=" << KeyNameFromVk(m_camCenteringToggleVk) << "\n";
+        f << "\n";
+        f << "; Sensitivity / speed tuning. These are BASE values — the final applied\n";
+        f << "; mouse/pad sensitivity is (value * your in-game sensitivity coefficient),\n";
+        f << "; so raising the in-game slider still feels faster relative to a given\n";
+        f << "; base. Adjust these to taste; defaults feel natural at typical settings.\n";
+        f << "; Defaults: MouseSensitivity=0.10, GamepadLookSensitivity=0.4, WalkSpeed=0.15\n";
+        f << "MouseSensitivity="        << m_mouseSens    << "\n";
+        f << "GamepadLookSensitivity="  << m_padLookScale << "\n";
+        f << "WalkSpeed="               << m_walkScale    << "\n";
     }
 
     ImmersiveDialogue() {
         ModName        = STR("ImmersiveDialogue");
-        ModVersion     = STR("1.1");
+        ModVersion     = STR("1.1.1");
         ModAuthors     = STR("Noah");
         ModDescription = STR("Free movement + mouse/pad look during NPC dialogue.");
     }
@@ -2536,16 +2636,17 @@ public:
     }
 
     void PollHotkeys() {
-        // F6 — toggle camera centering (F5 is quicksave in STALKER 2, don't stomp it).
-        bool f6 = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
-        if (f6 && !m_f5Prev) {
+        // Toggle camera centering (default F6; user-configurable via config.ini). F5 is
+        // quicksave in STALKER 2 — don't stomp it, and don't default to it.
+        bool pressed = (GetAsyncKeyState(m_camCenteringToggleVk) & 0x8000) != 0;
+        if (pressed && !m_f5Prev) {
             m_camCenteringDisabled = !m_camCenteringDisabled;
             SaveConfig();
             Output::send<LogLevel::Verbose>(
-                STR("[ImmDlg] camera centering (F6) -> {}\n"),
+                STR("[ImmDlg] camera centering -> {}\n"),
                 m_camCenteringDisabled ? STR("DISABLED (camera free)") : STR("enabled (game default)"));
         }
-        m_f5Prev = f6;
+        m_f5Prev = pressed;
     }
 
     bool m_lookAtPropsDumped = false;
@@ -2774,9 +2875,9 @@ public:
             double fX = std::cos(r), fY = std::sin(r);
             double rX = -std::sin(r), rY = std::cos(r);
             // Backward walking is naturally ~55% of forward speed in-game — mirror that.
-            float fwdScale = (fwd < 0.0) ? (WALK_SCALE * 0.55f) : WALK_SCALE;
+            float fwdScale = (fwd < 0.0) ? (float)(m_walkScale * 0.55) : (float)m_walkScale;
             if (fwd    != 0.0) AddMovement(pawn, fX, fY, (float)(fwd    * fwdScale));
-            if (strafe != 0.0) AddMovement(pawn, rX, rY, (float)(strafe * WALK_SCALE));
+            if (strafe != 0.0) AddMovement(pawn, rX, rY, (float)(strafe * m_walkScale));
         }
         MaybeFireFootstep(moving);
         // Force anim state overrides (in dialogue). Idle/dialogue flags always false; walking
@@ -2804,12 +2905,12 @@ public:
         m_pending_dx -= dx;
         m_pending_dy -= dy;
 
-        double mouseScale = BASE_MOUSE_SENS * g_mouseSensCoef.load(std::memory_order_relaxed);
+        double mouseScale = m_mouseSens * g_mouseSensCoef.load(std::memory_order_relaxed);
         double yawVal   = dx * mouseScale * (g_invertMouseX.load() ? -1.0 : 1.0);
         double pitchVal = dy * mouseScale * (g_invertMouseY.load() ? -1.0 : 1.0);
 
         if (padLookX != 0.0 || padLookY != 0.0) {
-            double padScale = PAD_LOOK_SCALE * g_padSensCoef.load(std::memory_order_relaxed);
+            double padScale = m_padLookScale * g_padSensCoef.load(std::memory_order_relaxed);
             yawVal   +=  padLookX * padScale * (g_invertPadX.load() ? -1.0 : 1.0);
             pitchVal += -padLookY * padScale * (g_invertPadY.load() ? -1.0 : 1.0);
         }
