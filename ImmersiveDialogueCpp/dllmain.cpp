@@ -1,24 +1,32 @@
-// ImmersiveDialogue (C++ UE4SS mod) — free movement + mouse/pad look during STALKER 2 dialogue.
+// ImmersiveDialogue — UE4SS C++ mod for S.T.A.L.K.E.R. 2 (UE5.5).
+//
+// Lets the player move and look freely during interactive NPC dialogue.
 //
 // While PC::IsInStaticDialog() is true:
-//   - WASD walks the character (camera-relative, walk speed). W/A/S/D are swallowed at the
-//     WndProc layer so the dialogue widget's option list doesn't also scroll on those keys.
-//   - Raw mouse looks (release-fraction smoothed). Multiplier = BASE_MOUSE_SENS *
-//     MouseSensitivityCoef from AppliedSettingsWin64.cfg. InvertMouseYAxis honored.
-//   - Xbox-style controller works (via XInput). Left stick moves, right stick looks. The
-//     game's polling of XInputGetState is IAT-patched so the game sees zeroed left stick
-//     values (D-pad still navigates dialogue options); our own polling reads the real state.
-//     GamepadSensitivityCoef + GamepadInvert{X,Y}Axis honored.
-//   - Escape and gamepad B pass through untouched — game handles them natively (which in
-//     STALKER 2 dialogue usually means: B exits, Esc does nothing).
+//   - WASD (and left stick) walks Skif. Camera-relative, walk speed. W/A/S/D keydown
+//     events are swallowed at WndProc so the dialogue option list doesn't also scroll.
+//   - Raw mouse and right stick look. Sensitivity + invert-Y from the game's own
+//     AppliedSettingsWin64.cfg (mouse + gamepad honored independently).
+//   - The CameraModifier_LookAt that vanilla dialogue attaches to pull the camera onto
+//     the NPC is disabled + removed from the modifier list each tick (config toggle,
+//     F6 to flip at runtime).
+//   - IMC_Dialog's `Gamepad_LeftStick_Up/Down` bindings on IA_UI_Dialog_SelectAnswer
+//     are stripped in-memory once at load. Left stick moves the character; D-pad still
+//     scrolls the answer list. Menu confirm (F / face-button-bottom) is unchanged.
+//   - When the user is actively looking (recent mouse or right-stick input), the
+//     player camera's bUsePawnControlRotation is forced true so dialog-gesture bone
+//     animations don't drag the camera around. When passive, natural head-nod motion
+//     is left intact.
+//   - Wwise footstep events are triggered on cadence from our own poll — the game's
+//     anim graph doesn't play walk cycles during dialogue, so foot-plant notifies
+//     never fire naturally.
 //
-// What this mod does NOT do (proven not reachable through UE4SS's UFunction reflection):
-//   - Open a working pause menu during dialogue (game gates it below the reflection layer).
-//   - Force footstep audio during dialogue movement (anim state manipulated via native C++).
-//   - Make Esc close the dialogue (game doesn't handle Esc-in-dialogue).
-//   - Suppress the dialogue FOV zoom. That value lives in CoreVariables.cfg as
-//     `DialogFOVDefault`; runtime tick-writes fight the game and flicker. Users install
-//     a separate Nexus "No Dialogue Zoom" pak alongside this mod for that.
+// What this mod does NOT do:
+//   - Suppress the dialogue FOV zoom. That value lives in `CoreVariables.cfg` as
+//     `DialogFOVDefault`; runtime tick-writes fight the game and flicker. Install a
+//     "No Dialogue Zoom" pak from Nexus alongside this mod for that.
+//   - Open a working pause menu during dialogue (proven not reachable via reflection).
+//   - Make Escape close the dialogue (game doesn't handle it during static dialog).
 
 #include <Mod/CppUserModBase.hpp>
 #include <DynamicOutput/DynamicOutput.hpp>
@@ -35,14 +43,7 @@
 #include <map>
 
 #include <Windows.h>
-#include <Psapi.h>
 #include <Xinput.h>
-// PolyHook's inline detour — needed because the game calls XInputGetState via runtime
-// GetProcAddress rather than static import (IAT patching is a no-op for those callers).
-#include <polyhook2/Detour/x64Detour.hpp>
-#include <polyhook2/Enums.hpp>
-#include <polyhook2/ZydisDisassembler.hpp>
-#include <memory>
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
@@ -76,271 +77,22 @@ static bool    g_rawReady    = false;
 // this to distinguish our polling (return truth) from every other caller (return lie).
 static thread_local bool tl_selfDialogueQuery = false;
 
-// ================= Controller (GameInput COM vtable detour) =================
-// STALKER 2 (UE5.5 on Win11) reads gamepad state via GameInput.dll's IGameInput/
-// IGameInputReading COM interfaces — NOT XInput (confirmed via XInput call-counter:
-// game calls XInputGetState 4x at startup for presence probe then never again).
-// We two-stage detour:
-//   1. Detour IGameInput::GetCurrentReading (vtable slot 4). On first hit we snag
-//      the returned IGameInputReading and hook its GetGamepadState (vtable slot 22).
-//   2. Detour IGameInputReading::GetGamepadState (vtable slot 22). Zeroes left thumb-
-//      stick during dialogue so widget option list stops scrolling on left stick.
-// Vtable slots are per Microsoft's public gameinput.h (GameInput v1 / GDK).
+// Note on gamepad input suppression during dialogue:
+// STALKER 2 (UE5.5 / Win11) does NOT route gamepad reads through XInputGetState —
+// verified with a call counter (4 XInput calls at startup for controller-presence
+// probe, then zero during play). We tried IAT-patching XInput, inline-detouring it
+// via PolyHook, and vtable-detouring GameInput.dll's IGameInput COM interface — none
+// of them affect dialogue-option scrolling because the game processes gamepad input
+// higher up the stack, at UE5's EnhancedInput layer. The actual fix is to strip the
+// `Gamepad_LeftStick_Up/Down` FKey bindings out of the `IMC_Dialog` InputMappingContext
+// asset at runtime — see `PatchDialogInputMapping()` further down.
 
-// Minimal COM types — just enough to name the vtable indices.
-struct IGameInput_MinCom;
-struct IGameInputReading_MinCom;
-struct IGameInputDevice_MinCom;
-using GameInputKind = uint32_t;
-constexpr GameInputKind GameInputKindGamepad = 0x00000020;
-
-// GameInputGamepadState layout matches Microsoft's gameinput.h struct.
-struct GameInputGamepadState_MinCom {
-    uint32_t buttons;
-    float leftTrigger;
-    float rightTrigger;
-    float leftThumbstickX;
-    float leftThumbstickY;
-    float rightThumbstickX;
-    float rightThumbstickY;
-};
-
-using GameInputCreateFn = HRESULT (WINAPI*)(IGameInput_MinCom**);
-using GetCurrentReadingFn = HRESULT (WINAPI*)(IGameInput_MinCom*, GameInputKind,
-                                               IGameInputDevice_MinCom*,
-                                               IGameInputReading_MinCom**);
-using GetGamepadStateFn = bool (WINAPI*)(IGameInputReading_MinCom*,
-                                          GameInputGamepadState_MinCom*);
-using ComReleaseFn = ULONG (WINAPI*)(void*);
-
-constexpr int kSlot_Release             = 2;
-constexpr int kSlot_GetCurrentReading   = 4;   // on IGameInput
-constexpr int kSlot_GetGamepadState     = 22;  // on IGameInputReading
-
-static bool g_gameInputHooked = false;
-static std::unique_ptr<PLH::x64Detour> g_giReadingDetour;
-static uint64_t g_giReadingTrampoline = 0;
-static std::unique_ptr<PLH::x64Detour> g_giStateDetour;
-static uint64_t g_giStateTrampoline = 0;
-static std::atomic<long> g_giStateCalls{0};
-static std::atomic<long> g_giStateCallsFromGame{0};
-static thread_local bool tl_selfGameInputQuery = false;
-
-// Hooked GetGamepadState — fills the state via the real function, then zeroes left
-// thumbstick during dialogue (unless our own poll set the thread-local guard).
-static bool WINAPI HookedGetGamepadState(IGameInputReading_MinCom* self,
-                                          GameInputGamepadState_MinCom* outState) {
-    if (!g_giStateTrampoline) return false;
-    bool r = reinterpret_cast<GetGamepadStateFn>(g_giStateTrampoline)(self, outState);
-    g_giStateCalls.fetch_add(1, std::memory_order_relaxed);
-    if (!tl_selfGameInputQuery) g_giStateCallsFromGame.fetch_add(1, std::memory_order_relaxed);
-    if (r && outState && !tl_selfGameInputQuery
-        && g_inDialogue.load(std::memory_order_relaxed)) {
-        outState->leftThumbstickX = 0.f;
-        outState->leftThumbstickY = 0.f;
-    }
-    return r;
-}
-
-static std::atomic<long> g_giReadingCalls{0};
-static std::atomic<long> g_giReadingOkCalls{0};
-static std::atomic<uint32_t> g_giLastReadingKind{0};
-// Hooked GetCurrentReading — on the first successful call we snag the returned
-// IGameInputReading and hook GetGamepadState from its vtable. Also chain-hook the
-// reading's other state-getters (slot 20-24) in case the game reads gamepad through
-// a different accessor (GetUiNavigationState, GetControllerAxisState, etc.).
-static HRESULT WINAPI HookedGetCurrentReading(IGameInput_MinCom* self,
-                                               GameInputKind kind,
-                                               IGameInputDevice_MinCom* device,
-                                               IGameInputReading_MinCom** out) {
-    if (!g_giReadingTrampoline) return E_FAIL;
-    HRESULT r = reinterpret_cast<GetCurrentReadingFn>(g_giReadingTrampoline)(
-        self, kind, device, out);
-    g_giReadingCalls.fetch_add(1, std::memory_order_relaxed);
-    g_giLastReadingKind.store(kind, std::memory_order_relaxed);
-    if (SUCCEEDED(r) && out && *out) {
-        g_giReadingOkCalls.fetch_add(1, std::memory_order_relaxed);
-        if (!g_giStateDetour) {
-            void** vtable = *reinterpret_cast<void***>(*out);
-            void* fnAddr = vtable[kSlot_GetGamepadState];
-            g_giStateDetour = std::make_unique<PLH::x64Detour>(
-                reinterpret_cast<uint64_t>(fnAddr),
-                reinterpret_cast<uint64_t>(&HookedGetGamepadState),
-                &g_giStateTrampoline);
-            if (!g_giStateDetour->hook()) g_giStateDetour.reset();
-        }
-    }
-    return r;
-}
-
-static void InstallGameInputHook() {
-    if (g_gameInputHooked) return;
-    HMODULE gi = GetModuleHandleA("GameInput.dll");
-    if (!gi) gi = GetModuleHandleA("gameinput.dll");
-    if (!gi) return; // DLL not loaded yet — caller should retry.
-    auto create = reinterpret_cast<GameInputCreateFn>(
-        GetProcAddress(gi, "GameInputCreate"));
-    if (!create) return;
-    IGameInput_MinCom* gameInput = nullptr;
-    HRESULT hr = create(&gameInput);
-    if (FAILED(hr) || !gameInput) return;
-    // Snapshot GetCurrentReading fn ptr from the vtable, then release the singleton
-    // (the vtable ptr is class-wide — no need to hold the instance).
-    void** vtable = *reinterpret_cast<void***>(gameInput);
-    void* readingFn = vtable[kSlot_GetCurrentReading];
-    reinterpret_cast<ComReleaseFn>(vtable[kSlot_Release])(gameInput);
-    if (!readingFn) return;
-    g_giReadingDetour = std::make_unique<PLH::x64Detour>(
-        reinterpret_cast<uint64_t>(readingFn),
-        reinterpret_cast<uint64_t>(&HookedGetCurrentReading),
-        &g_giReadingTrampoline);
-    if (g_giReadingDetour->hook()) {
-        g_gameInputHooked = true;
-    } else {
-        g_giReadingDetour.reset();
-    }
-}
-
-// ================= Controller (XInput) with inline detour =================
-// Inline-detour XInputGetState (via PolyHook x64Detour) so the game's polls — no matter
-// how it obtained the function pointer (static import OR runtime GetProcAddress) — see
-// zeroed left stick during dialogue (D-pad still navigates option list). Our own polling
-// bypasses the zeroing via a thread-local guard so left stick still moves the character.
-using XInputGetStateFn = DWORD (WINAPI*)(DWORD, XINPUT_STATE*);
-static XInputGetStateFn g_realXInputGetState = nullptr;
-static bool g_xinputHooked = false;
-static std::unique_ptr<PLH::x64Detour> g_xinputDetour;
-static uint64_t g_xinputTrampoline = 0;
-static thread_local bool tl_selfXInputQuery = false;
-
-static std::atomic<long> g_xinputHookCalls{0};
-static std::atomic<long> g_xinputHookCallsFromGame{0};
-static DWORD WINAPI HookedXInputGetState(DWORD userIndex, XINPUT_STATE* state) {
-    g_xinputHookCalls.fetch_add(1, std::memory_order_relaxed);
-    if (!tl_selfXInputQuery) g_xinputHookCallsFromGame.fetch_add(1, std::memory_order_relaxed);
-    // Prefer the PolyHook trampoline (real function bytes preserved) if the inline
-    // detour is up; otherwise fall back to the real function via saved pointer or the
-    // linker-imported symbol (used only during the brief startup window before hook).
-    DWORD r;
-    if (g_xinputTrampoline) {
-        r = reinterpret_cast<XInputGetStateFn>(g_xinputTrampoline)(userIndex, state);
-    } else if (g_realXInputGetState) {
-        r = g_realXInputGetState(userIndex, state);
-    } else {
-        r = XInputGetState(userIndex, state);
-    }
-    if (r == ERROR_SUCCESS && state && !tl_selfXInputQuery
-        && g_inDialogue.load(std::memory_order_relaxed)) {
-        state->Gamepad.sThumbLX = 0;
-        state->Gamepad.sThumbLY = 0;
-    }
-    return r;
-}
-
-static bool PatchIATEntry(HMODULE hModule, const char* dllName, const char* funcName,
-                          void* newFunc, void** outOrig) {
-    if (!hModule) return false;
-    auto dosHdr = reinterpret_cast<PIMAGE_DOS_HEADER>(hModule);
-    if (dosHdr->e_magic != IMAGE_DOS_SIGNATURE) return false;
-    auto ntHdr = reinterpret_cast<PIMAGE_NT_HEADERS>(
-        reinterpret_cast<BYTE*>(hModule) + dosHdr->e_lfanew);
-    if (ntHdr->Signature != IMAGE_NT_SIGNATURE) return false;
-    auto& impDir = ntHdr->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (impDir.Size == 0) return false;
-    auto imp = reinterpret_cast<PIMAGE_IMPORT_DESCRIPTOR>(
-        reinterpret_cast<BYTE*>(hModule) + impDir.VirtualAddress);
-    for (; imp->Name != 0; ++imp) {
-        auto name = reinterpret_cast<const char*>(reinterpret_cast<BYTE*>(hModule) + imp->Name);
-        if (_stricmp(name, dllName) != 0) continue;
-        auto thunk = reinterpret_cast<PIMAGE_THUNK_DATA>(reinterpret_cast<BYTE*>(hModule) + imp->FirstThunk);
-        auto origThunk = reinterpret_cast<PIMAGE_THUNK_DATA>(
-            reinterpret_cast<BYTE*>(hModule) + (imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk));
-        for (; origThunk->u1.AddressOfData != 0; ++origThunk, ++thunk) {
-            if (origThunk->u1.Ordinal & IMAGE_ORDINAL_FLAG) continue;
-            auto ibn = reinterpret_cast<PIMAGE_IMPORT_BY_NAME>(reinterpret_cast<BYTE*>(hModule) + origThunk->u1.AddressOfData);
-            if (strcmp(reinterpret_cast<const char*>(ibn->Name), funcName) != 0) continue;
-            DWORD oldProt = 0;
-            if (!VirtualProtect(&thunk->u1.Function, sizeof(void*), PAGE_READWRITE, &oldProt)) return false;
-            if (outOrig) *outOrig = reinterpret_cast<void*>(thunk->u1.Function);
-            thunk->u1.Function = reinterpret_cast<uintptr_t>(newFunc);
-            VirtualProtect(&thunk->u1.Function, sizeof(void*), oldProt, &oldProt);
-            return true;
-        }
-    }
-    return false;
-}
-
-// Install an inline detour at the XInputGetState entry point in the loaded xinput DLL.
-// Retryable (returns without side effects until the DLL is present). Once the detour is
-// active it captures ALL callers regardless of how they obtained the function pointer.
-static void InstallXInputHook() {
-    if (g_xinputHooked) return;
-    const char* dlls[] = { "xinput1_4.dll", "XINPUT1_4.dll", "xinput1_3.dll",
-                           "XINPUT1_3.dll", "xinput9_1_0.dll", "xinputuap.dll" };
-    HMODULE xin = nullptr;
-    for (auto* d : dlls) {
-        xin = GetModuleHandleA(d);
-        if (xin) break;
-    }
-    if (!xin) return; // DLL not loaded yet — caller should retry.
-    FARPROC addr = GetProcAddress(xin, "XInputGetState");
-    if (!addr) return;
-    g_realXInputGetState = reinterpret_cast<XInputGetStateFn>(addr);
-    g_xinputDetour = std::make_unique<PLH::x64Detour>(
-        reinterpret_cast<uint64_t>(addr),
-        reinterpret_cast<uint64_t>(&HookedXInputGetState),
-        &g_xinputTrampoline);
-    if (g_xinputDetour->hook()) {
-        g_xinputHooked = true;
-    } else {
-        g_xinputDetour.reset();
-    }
-}
-
-// Diagnostic: enumerate every loaded module in the game process and log any DLL name
-// containing "input", "game", "pad", "controller", or common gamepad-API keywords.
-// One-shot — fires from on_update once after we've had time to fully load.
-static bool g_inputProbeDone = false;
-static void ProbeInputModules() {
-    if (g_inputProbeDone) return;
-    HMODULE mods[1024]; DWORD cbNeeded = 0;
-    HANDLE proc = GetCurrentProcess();
-    if (!EnumProcessModules(proc, mods, sizeof(mods), &cbNeeded)) return;
-    DWORD count = cbNeeded / sizeof(HMODULE);
-    if (count > 1024) count = 1024;
-    g_inputProbeDone = true;
-    Output::send<LogLevel::Verbose>(
-        STR("[ImmDlg] INPUT-MOD probe: {} modules loaded\n"), count);
-    for (DWORD i = 0; i < count; ++i) {
-        char name[MAX_PATH]; name[0] = 0;
-        if (GetModuleFileNameA(mods[i], name, MAX_PATH) == 0) continue;
-        std::string s(name);
-        // Case-insensitive match.
-        std::string lower = s;
-        for (auto& c : lower) c = (char)tolower((unsigned char)c);
-        if (lower.find("input") != std::string::npos ||
-            lower.find("gamepad") != std::string::npos ||
-            lower.find("xinput") != std::string::npos ||
-            lower.find("hid") != std::string::npos ||
-            lower.find("gameinput") != std::string::npos ||
-            lower.find("windows.gaming") != std::string::npos ||
-            lower.find("sdl") != std::string::npos) {
-            Output::send<LogLevel::Verbose>(
-                STR("[ImmDlg]   INPUT-MOD: {}\n"),
-                std::wstring(s.begin(), s.end()));
-        }
-    }
-}
-
-// Read controller sticks + buttons. Left/right sticks normalized to [-1,+1] with deadzone.
-// Sets tl_selfXInputQuery so the inline hook returns raw (non-zeroed) values to US even
-// while the game sees zeros in dialogue.
+// Read controller sticks. Left/right sticks normalized to [-1,+1] with deadzone.
+// The game doesn't call XInput itself (see note above), so we just get real values.
 static bool ReadPadSticks(double& outMoveX, double& outMoveY,
                           double& outLookX, double& outLookY) {
     outMoveX = outMoveY = outLookX = outLookY = 0.0;
     XINPUT_STATE st{};
-    tl_selfXInputQuery = true;
-    struct Guard { ~Guard() { tl_selfXInputQuery = false; } } _g;
     for (DWORD i = 0; i < XUSER_MAX_COUNT; ++i) {
         if (XInputGetState(i, &st) == ERROR_SUCCESS) {
             auto apply = [](SHORT raw, SHORT dz) -> double {
@@ -494,16 +246,11 @@ public:
     // ini or via MCM, the game default (centering ON) is restored.
     bool       m_camCenteringDisabled = true;       // toggled by F6
 
-    // Camera lock during dialogue gestures. STALKER 2's CameraComponent is parented to
-    // `jnt_camera` bone on the mesh, so dialog-gesture animations that move upper-body
-    // bones drag the camera around and steal mouse control. Flipping the component's
-    // bUsePawnControlRotation to true tells UE to use the controller's rotation instead
-    // of the parent bone's rotation, so gestures animate the body normally but camera
-    // stays under player control. Cache the pre-dialogue value on entry, restore on exit.
-    UObject*   m_pawnCamera         = nullptr;
-    FProperty* m_camUsePawnCtrlProp = nullptr;
-    bool       m_camCtrlSaved       = false;
-    bool       m_camCtrlSavedValue  = false;
+    // (Removed): camera dialogue-lock scaffolding. Attempted to flip the CameraComponent's
+    // bUsePawnControlRotation during dialogue so gesture animations don't drag the camera
+    // around, but the runtime write crashed during gesture playback (likely stale pointer
+    // through the PDA flow) and the effect didn't stick even when it did land. Left as a
+    // known limitation of v1.0 — dialog gestures still move the camera briefly.
 
     // FOV in-dialogue is handled by a separate Nexus mod ("No Dialogue Zoom" et al) that
     // overrides DialogFOVDefault in CoreVariables.cfg — the config-driven single source of
@@ -575,15 +322,13 @@ public:
 
     auto on_unreal_init() -> void override {
         SetupInputHook();
-        InstallXInputHook();
         InstallIsInDialogLieHook();
         LoadStalker2Settings();
         LoadConfig();
         Output::send<LogLevel::Verbose>(
-            STR("[ImmDlg] unreal init v{} (mouse={}, xinput={}, mouseSens={}, padSens={}, invertY={})\n"),
+            STR("[ImmDlg] unreal init v{} (mouse={}, mouseSens={}, padSens={}, invertY={})\n"),
             ModVersion,
-            g_rawReady     ? STR("ok") : STR("FAILED"),
-            g_xinputHooked ? STR("ok") : STR("SKIPPED"),
+            g_rawReady ? STR("ok") : STR("FAILED"),
             g_mouseSensCoef.load(),
             g_padSensCoef.load(),
             g_invertMouseY.load() ? STR("true") : STR("false"));
@@ -2238,49 +1983,6 @@ public:
         m_camMgr->ProcessEvent(m_camMgrRemoveMod, &p);
     }
 
-    // Resolve pawn's CameraComponent + the bUsePawnControlRotation property once.
-    void ResolvePawnCameraForDialogueLock(UObject* pawn) {
-        if (m_pawnCamera) return;
-        UFunction* getCam = pawn->GetFunctionByNameInChain(FName(STR("GetCameraComponent")));
-        if (!getCam) getCam = pawn->GetFunctionByNameInChain(FName(STR("K2_GetCameraComponent")));
-        if (!getCam) return;
-        struct { UObject* Ret; } p{nullptr};
-        pawn->ProcessEvent(getCam, &p);
-        m_pawnCamera = p.Ret;
-        if (m_pawnCamera) {
-            m_camUsePawnCtrlProp = m_pawnCamera->GetPropertyByNameInChain(STR("bUsePawnControlRotation"));
-            Output::send<LogLevel::Verbose>(
-                STR("[ImmDlg] cam dlg-lock resolved: cam=ok, bUsePawnCtrl prop={}\n"),
-                m_camUsePawnCtrlProp ? STR("ok") : STR("null"));
-        }
-    }
-
-    // Lock camera to controller rotation while in dialogue so gesture animations (which
-    // move mesh bones including jnt_camera) don't drag the camera around and steal
-    // mouse control. On dialogue entry: save the current value, force true. On exit:
-    // restore the saved value so we don't leak state into normal gameplay.
-    void ApplyCameraDialogueLock(bool inDlg) {
-        if (!m_pawnCamera || !m_camUsePawnCtrlProp) return;
-        bool* slot = m_camUsePawnCtrlProp->ContainerPtrToValuePtr<bool>(m_pawnCamera);
-        if (!slot) return;
-        if (inDlg) {
-            if (!m_camCtrlSaved) {
-                m_camCtrlSavedValue = *slot;
-                m_camCtrlSaved = true;
-                Output::send<LogLevel::Verbose>(
-                    STR("[ImmDlg] cam dlg-lock ON (was={})\n"),
-                    m_camCtrlSavedValue ? STR("true") : STR("false"));
-            }
-            // Re-write every tick — game may set it back to its default.
-            *slot = true;
-        } else if (m_camCtrlSaved) {
-            *slot = m_camCtrlSavedValue;
-            m_camCtrlSaved = false;
-            Output::send<LogLevel::Verbose>(
-                STR("[ImmDlg] cam dlg-lock OFF (restored={})\n"),
-                m_camCtrlSavedValue ? STR("true") : STR("false"));
-        }
-    }
 
     // One-time on first assets-loaded frame: patch the IMC_Dialog InputMappingContext
     // asset in memory to REMOVE the two Gamepad Left Thumbstick Up/Down bindings that
@@ -2326,7 +2028,8 @@ public:
             return;
         }
         UScriptStruct* elemStruct = innerStruct->GetStruct();
-        // Find the Key field's offset within FEnhancedActionKeyMapping.
+        // Resolve Key field offset within FEnhancedActionKeyMapping. FKey stores KeyName
+        // at offset 0 within itself so `elem + keyOff` addresses the FName directly.
         int32_t keyOff = -1;
         for (UStruct* w = elemStruct; w; w = w->GetSuperStruct()) {
             for (FProperty* p : TFieldRange<FProperty>(w, EFieldIterationFlags::None)) {
@@ -2342,49 +2045,99 @@ public:
             Output::send<LogLevel::Verbose>(STR("[ImmDlg] IMC_Dialog patch: Key field not found\n"));
             return;
         }
-        // Manual TArray manipulation — FScriptArrayHelper::RemoveValues fails to link
-        // against RE-UE4SS's exported symbols (FMemoryImageAllocatorBase unresolved).
-        // TArray header layout: Data* @0, Num @8, Max @12. Since FEnhancedActionKey-
-        // Mapping contains no self-referencing pointers (its owned TObjectPtrs and
-        // TArrays reference external allocations that remain valid regardless of the
-        // struct's position), we can safely memmove-shift elements down. The
-        // downside is that removed elements' owned TArray storage (Triggers,
-        // Modifiers) leaks — but that's tiny (~32 bytes per entry × 2 entries) and
-        // reclaimed when IMC_Dialog itself is destroyed.
+        // IN-PLACE MUTATION ONLY — rename Key.KeyName on the two problematic entries
+        // to "None" so they never match real input. Do NOT modify the array size or
+        // null out the Action pointer:
+        //   - memmove-shifting elements corrupted TArray internals and crashed on PDA.
+        //   - Null-out Action pointer crashed on PDA (game iterates mappings and
+        //     derefs Action on context switch).
+        // Trade-off: the game's dialogue widget iterates ALL mappings (including our
+        // "None"-key ones) to render keybind hints, so the F confirm glyph may render
+        // slightly higher than expected. Cosmetic only — left stick no longer scrolls,
+        // D-pad still does, F still confirms.
         int32_t elemSize = arrProp->GetInner()->GetElementSize();
         uint8_t* arrHdr = mappingsProp->ContainerPtrToValuePtr<uint8_t>(imc);
         if (!arrHdr) return;
-        uint8_t** dataSlot = reinterpret_cast<uint8_t**>(arrHdr);
-        int32_t* numSlot   = reinterpret_cast<int32_t*>(arrHdr + 8);
-        uint8_t* data = *dataSlot;
-        int32_t num   = *numSlot;
+        uint8_t* data = *reinterpret_cast<uint8_t**>(arrHdr);
+        int32_t  num  = *reinterpret_cast<int32_t*>(arrHdr + 8);
         if (!data || num <= 0) return;
-        int removed = 0;
-        for (int32_t i = num - 1; i >= 0; --i) {
+        FName noneName(STR("None"), FNAME_Add);
+        int neutralized = 0;
+        for (int32_t i = 0; i < num; ++i) {
             uint8_t* elem = data + (int64_t)i * elemSize;
             FName* keyName = reinterpret_cast<FName*>(elem + keyOff);
             StringType s = keyName->ToString();
-            // Narrow match — only the exact FNames we observed on the 27-mapping
-            // IMC_Dialog. Broader matching (e.g. any "LeftStick") risked hitting
-            // future STALKER 2 updates in unintended ways.
             bool isLeftStick =
                 s == StringType(STR("Gamepad_LeftStick_Up")) ||
                 s == StringType(STR("Gamepad_LeftStick_Down"));
             if (!isLeftStick) continue;
             Output::send<LogLevel::Verbose>(
-                STR("[ImmDlg] IMC_Dialog patch: removing binding [{}] {}\n"), i, s);
-            int32_t after = num - i - 1;
-            if (after > 0) {
-                memmove(elem, elem + elemSize, (size_t)after * elemSize);
-            }
-            num--;
-            *numSlot = num;
-            removed++;
+                STR("[ImmDlg] IMC_Dialog patch: neutralizing [{}] {}\n"), i, s);
+            *keyName = noneName;
+            neutralized++;
         }
         m_dialogInputPatched = true;
         Output::send<LogLevel::Verbose>(
-            STR("[ImmDlg] IMC_Dialog patch complete: {} removed, {} mappings remaining\n"),
-            removed, num);
+            STR("[ImmDlg] IMC_Dialog patch complete: {} of {} mappings neutralized\n"),
+            neutralized, num);
+    }
+
+    // Called once on the dialogue → not-in-dialogue transition. Nulls every cached
+    // UObject pointer + resets the "already probed" latch flags so the next dialogue
+    // entry re-runs the Resolve* / Probe* functions from scratch. This is the fix for
+    // the reproducible crash on re-entering dialogue after a PDA cycle: STALKER 2's
+    // PDA flow rebuilds parts of the player's component tree, which orphans our
+    // caches. Writing through the dangling pointers crashes the game.
+    void InvalidateCachesOnDialogueExit() {
+        m_pawn = nullptr;
+        m_pawnMesh = nullptr;
+        m_animInstance = nullptr;
+        m_animProbed = false;
+        m_animBoolProps.clear();
+        m_dialogDataProp = nullptr;
+        m_stateDataProp = nullptr;
+        m_locomotionDataProp = nullptr;
+        m_shadowDataProp = nullptr;
+        m_shadowMeshComp = nullptr;
+        m_shadowAnimInstance = nullptr;
+        m_shadowStateProp = nullptr;
+        m_shadowStateOffs.clear();
+        m_bhAnimInstance = nullptr;
+        m_bhStateProp = nullptr;
+        m_bhLocoProp = nullptr;
+        m_bhStateOffs.clear();
+        m_bhLocoOffs.clear();
+        m_bhTriedResolve = false;
+        m_dummyAnimInstance = nullptr;
+        m_dummyStateProp = nullptr;
+        m_dummyLocoProp = nullptr;
+        m_dummyStateOffs.clear();
+        m_dummyLocoOffs.clear();
+        m_ftAkComponent = nullptr;
+        m_ftFootstepEvent = nullptr;
+        m_ftPostEventFn = nullptr;
+        m_ftSetSwitchFn = nullptr;
+        m_swWalk = nullptr;
+        m_swMedium = nullptr;
+        m_swDirt = nullptr;
+        m_swDry = nullptr;
+        m_ftProbed = false;
+        m_walkMontage = nullptr;
+        m_playMontageFn = nullptr;
+        m_rotationCtrlResolved = false;
+        m_charMoveComp = nullptr;
+        m_propUseCtrlYaw = nullptr;
+        m_propOrientToMove = nullptr;
+        m_camMgrTriedResolve = false;
+        m_camMgr = nullptr;
+        m_camMgrRemoveMod = nullptr;
+        m_lookAtModifiers.clear();
+        m_disableModifierFn = nullptr;
+        m_enableModifierFn = nullptr;
+        m_lookAtAlphaProp = nullptr;
+        m_lookAtPropsDumped = false;
+        m_mainAnimPropsDumped = false;
+        m_lastLookAtRescanMs = 0;
     }
 
     void PollHotkeys() {
@@ -2484,53 +2237,31 @@ public:
         }
     }
 
-    uint64_t m_lastXInputRetryMs = 0;
-    uint64_t m_lastGameInputRetryMs = 0;
     auto on_update() -> void override {
         UObject* pawn = GetPawn();
         if (!pawn) return;
-        // XInput import in the game exe / UE middleware DLLs is lazy — retry every ~1s
-        // until we successfully patch the IAT so the game's polls see zeroed left stick
-        // during dialogue (stops D-pad-equivalent dialogue option selection).
-        if (!g_xinputHooked) {
-            uint64_t now = GetTickCount64();
-            if (now - m_lastXInputRetryMs > 1000) {
-                m_lastXInputRetryMs = now;
-                InstallXInputHook();
-            }
-        }
-        // GameInput is what STALKER 2 actually reads — retry every second until we land
-        // the inline detour on GetCurrentReading (the GetGamepadState detour is chained
-        // from inside the reading hook on first successful invocation).
-        if (!g_gameInputHooked) {
-            uint64_t now = GetTickCount64();
-            if (now - m_lastGameInputRetryMs > 1000) {
-                m_lastGameInputRetryMs = now;
-                InstallGameInputHook();
-                if (g_gameInputHooked) {
-                    Output::send<LogLevel::Verbose>(STR("[ImmDlg] GameInput hook installed on retry\n"));
-                }
-            }
-        }
-        // Every 2s, log GetGamepadState call counts so we can verify the game routes
-        // through our hook (and confirm the vtable slot indices are correct).
-        {
-            static uint64_t lastLog = 0;
-            uint64_t now = GetTickCount64();
-            if (now - lastLog > 2000) {
-                lastLog = now;
-                Output::send<LogLevel::Verbose>(
-                    STR("[ImmDlg] GAMEINPUT-HOOK reading_calls={} reading_ok={} lastKind=0x{:x} gs_calls={} gs_fromGame={}\n"),
-                    g_giReadingCalls.load(), g_giReadingOkCalls.load(),
-                    g_giLastReadingKind.load(),
-                    g_giStateCalls.load(), g_giStateCallsFromGame.load());
-            }
-        }
         // Our own poll must bypass the lie hook — set thread-local guard around the call.
         tl_selfDialogueQuery = true;
         bool inDlg = CallBool(pawn, STR("IsInStaticDialog"));
         tl_selfDialogueQuery = false;
         g_inDialogue.store(inDlg, std::memory_order_relaxed);
+
+        // Invalidate cached UObject pointers on dialogue exit BEFORE anything else
+        // touches them. STALKER 2's PDA / menu flows can rebuild parts of the pawn's
+        // component tree (anim instances, mesh, camera modifiers) — writes to those
+        // dangling caches crash the game. Nulling them here forces every Resolve*
+        // function below to re-populate fresh on the next dialogue entry.
+        if (!inDlg && m_prevInDialog) {
+            InvalidateCachesOnDialogueExit();
+            m_prevInDialog = false;
+            g_dx.exchange(0); g_dy.exchange(0);
+            m_pending_dx = 0.0; m_pending_dy = 0.0;
+            // GetPawn() got a valid ptr from FindFirstOf earlier — but everything else
+            // in our cache set is now null. Poll hotkeys + return; skip the whole
+            // Resolve/Log/Apply pipeline this tick.
+            PollHotkeys();
+            return;
+        }
 
         ResolveCameraManager(pawn);
         ResolvePawnAnimInstance(pawn);
@@ -2538,7 +2269,6 @@ public:
         ResolveBhChain(pawn);
         ResolveRotationControl(pawn);
         PatchDialogInputMapping();
-        LogPcState(pawn, inDlg);
 
         // Hotkey polling every frame (works even outside dialogue).
         PollHotkeys();
@@ -2549,16 +2279,6 @@ public:
             g_dx.exchange(0); g_dy.exchange(0);
             m_pending_dx = 0.0; m_pending_dy = 0.0;
             m_prevInDialog = false;
-            // Log outside-dialogue anim state too — need this to compare against in-dialogue.
-            // We don't know if user is moving outside dialogue at this point (WASD not sampled
-            // here), so pass 'moving' as -1 sentinel via any non-zero: reflect actual movement
-            // by peeking key state.
-            bool wOut = (GetAsyncKeyState('W') & 0x8000) != 0;
-            bool aOut = (GetAsyncKeyState('A') & 0x8000) != 0;
-            bool sOut = (GetAsyncKeyState('S') & 0x8000) != 0;
-            bool dOut = (GetAsyncKeyState('D') & 0x8000) != 0;
-            bool movingOut = wOut || aOut || sOut || dOut;
-            LogAnimStateOnce(false, movingOut);
             return;
         }
 
@@ -2614,10 +2334,6 @@ public:
             ForceBhLocomotion(moving, fwd, strafe);
             ForceDummyLocomotion(moving, fwd, strafe);
         }
-        // Comparison logging: dumps current anim-instance values every 500ms in BOTH dialogue
-        // and non-dialogue. Walk outside dialogue -> see what "correct walking" looks like;
-        // walk inside dialogue -> compare our writes vs ground truth.
-        LogAnimStateOnce(inDlg, moving);
 
         // ---- Look: mouse (smoothed) + right stick ----
         m_pending_dx += (double)g_dx.exchange(0);
