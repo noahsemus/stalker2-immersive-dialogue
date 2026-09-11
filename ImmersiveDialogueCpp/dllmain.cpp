@@ -246,11 +246,27 @@ public:
     // ini or via MCM, the game default (centering ON) is restored.
     bool       m_camCenteringDisabled = true;       // toggled by F6
 
-    // (Removed): camera dialogue-lock scaffolding. Attempted to flip the CameraComponent's
-    // bUsePawnControlRotation during dialogue so gesture animations don't drag the camera
-    // around, but the runtime write crashed during gesture playback (likely stale pointer
-    // through the PDA flow) and the effect didn't stick even when it did land. Left as a
-    // known limitation of v1.0 — dialog gestures still move the camera briefly.
+    // Camera dialog-lock (v1.1). STALKER 2's CameraComponent is parented to `jnt_camera`
+    // on the mesh, so dialog gestures animate bones that drag the camera around when
+    // combined with movement input. Flipping bUsePawnControlRotation=true tells UE to
+    // use the controller's rotation instead of the parent bone's rotation for the
+    // duration — gestures animate the body but the camera stays under player control.
+    // Only engaged when the player is actively moving (WASD / left stick) since that's
+    // the interaction that visibly hijacks; passive listening still gets natural head-
+    // nod camera motion. The cached CameraComponent + property pointer are nulled by
+    // InvalidateCachesOnDialogueExit so PDA/menu rebuilds can't leave us with dangling
+    // pointers.
+    UObject*   m_pawnCamera         = nullptr;
+    FProperty* m_camUsePawnCtrlProp = nullptr;
+    bool       m_camCtrlSaved       = false;
+    bool       m_camCtrlSavedValue  = false;
+    uint64_t   m_lastMovementInputMs = 0;
+    // Direct-owned controller rotation for dialogue. Initialized to the current
+    // ControlRotation on dialogue entry, then accumulated by our own mouse/right-stick
+    // deltas and written back via SetControlRotation every tick. This makes gesture-
+    // driven or game-driven yaw changes irrelevant — we overwrite them.
+    double     m_myControlYaw   = 0.0;
+    double     m_myControlPitch = 0.0;
 
     // FOV in-dialogue is handled by a separate Nexus mod ("No Dialogue Zoom" et al) that
     // overrides DialogFOVDefault in CoreVariables.cfg — the config-driven single source of
@@ -297,7 +313,7 @@ public:
 
     ImmersiveDialogue() {
         ModName        = STR("ImmersiveDialogue");
-        ModVersion     = STR("1.0");
+        ModVersion     = STR("1.1");
         ModAuthors     = STR("Noah");
         ModDescription = STR("Free movement + mouse/pad look during NPC dialogue.");
     }
@@ -375,6 +391,25 @@ public:
         struct { float Val; } p{v};
         o->ProcessEvent(fn, &p);
     }
+    // Set the pawn's controller rotation directly, bypassing UE's RotationInput queue.
+    // Reads `Controller` UPROPERTY off the pawn and calls SetControlRotation on it.
+    // Used during dialogue to lock the camera against any external yaw sources — gesture
+    // animations propagate to the virtual `jnt_camera` bone via head-bone rotation, and
+    // the game's own dialog systems may also inject yaw. By owning the rotation each
+    // tick we override all of them.
+    UObject* GetPawnController(UObject* pawn) {
+        FProperty* p = pawn->GetPropertyByNameInChain(STR("Controller"));
+        if (!p) return nullptr;
+        UObject** slot = p->ContainerPtrToValuePtr<UObject*>(pawn);
+        return slot ? *slot : nullptr;
+    }
+    void SetControllerRotation(UObject* controller, double pitch, double yaw, double roll) {
+        if (!controller) return;
+        UFunction* fn = controller->GetFunctionByNameInChain(FName(STR("SetControlRotation")));
+        if (!fn) return;
+        struct { FRotatorD Rot; } p{{pitch, yaw, roll}};
+        controller->ProcessEvent(fn, &p);
+    }
     // PC::set_move_vector(FVector) — the UFUNCTION the game's own input pipeline calls
     // to feed WASD/stick into the movement + animation system. In dialogue, this pipeline
     // is gated, so strafe animations receive zero input even though we're calling
@@ -418,6 +453,15 @@ public:
     void StopDialogGesture(UObject* pc) {
         UFunction* fn = Fn(pc, STR("stop_dialog_gesture"));
         if (!fn) fn = Fn(pc, STR("StopDialogGesture"));
+        if (!fn) return;
+        char none[1]; pc->ProcessEvent(fn, none);
+    }
+
+    // PC::cancel_current_dialog_gesture — harder-cut variant (per BP API). Some game
+    // subclasses respect this even when stop_dialog_gesture is a no-op.
+    void CancelCurrentDialogGesture(UObject* pc) {
+        UFunction* fn = Fn(pc, STR("cancel_current_dialog_gesture"));
+        if (!fn) fn = Fn(pc, STR("CancelCurrentDialogGesture"));
         if (!fn) return;
         char none[1]; pc->ProcessEvent(fn, none);
     }
@@ -1384,6 +1428,9 @@ public:
     int32_t m_offInAir = -1;             // bInAir
     int32_t m_offCutscene = -1;          // bCutscene
     int32_t m_offInCombat = -1;          // bInCombat
+    int32_t m_offActionSlot = -1;        // bActionSlotActive — true while a dialog gesture plays
+    int32_t m_offLeftHandBusy = -1;      // bIsLeftHandBusy — true while any hand-anim plays
+    int32_t m_offFullBodySlot = -1;      // bFullBodySlotActive — true for full-body actions
 
     void ResolveStateDataOffsets() {
         if (m_stateDataProp) return;
@@ -1432,6 +1479,9 @@ public:
         m_offInAir             = off(STR("bInAir"));
         m_offCutscene          = off(STR("bCutscene"));
         m_offInCombat          = off(STR("bInCombat"));
+        m_offActionSlot        = off(STR("bActionSlotActive"));
+        m_offLeftHandBusy      = off(STR("bIsLeftHandBusy"));
+        m_offFullBodySlot      = off(STR("bFullBodySlotActive"));
         Output::send<LogLevel::Verbose>(
             STR("[ImmDlg]   state_data offsets: walk={}, jog={}, sprint={}, crouch={}, combatMoveIdle={}, combatCrouchIdle={}\n"),
             m_offWalkingOverride, m_offJoggingOverride, m_offSprintingOverride,
@@ -1983,6 +2033,280 @@ public:
         m_camMgr->ProcessEvent(m_camMgrRemoveMod, &p);
     }
 
+    // Resolve the CameraComponent + its bUsePawnControlRotation property. Nulled on
+    // dialogue exit by InvalidateCachesOnDialogueExit; this call re-populates on the
+    // next dialogue entry.
+    void ResolvePawnCameraForDialogueLock(UObject* pawn) {
+        if (m_pawnCamera && !m_pawnCamera->IsUnreachable()) return;
+        m_pawnCamera = nullptr;
+        m_camUsePawnCtrlProp = nullptr;
+        m_camCtrlSaved = false;
+        UFunction* getCam = pawn->GetFunctionByNameInChain(FName(STR("GetCameraComponent")));
+        if (!getCam) getCam = pawn->GetFunctionByNameInChain(FName(STR("K2_GetCameraComponent")));
+        if (!getCam) return;
+        struct { UObject* Ret; } p{nullptr};
+        pawn->ProcessEvent(getCam, &p);
+        m_pawnCamera = p.Ret;
+        if (m_pawnCamera) {
+            m_camUsePawnCtrlProp = m_pawnCamera->GetPropertyByNameInChain(STR("bUsePawnControlRotation"));
+        }
+    }
+
+    // Force the camera to use controller rotation while the user is actively moving
+    // in dialogue, so gesture bone animations don't drag the camera around. Cache the
+    // pre-lock value on entry, restore on exit — don't leak state into non-dialogue.
+    void ApplyCameraDialogueLock(bool shouldLock) {
+        if (!m_pawnCamera || m_pawnCamera->IsUnreachable() || !m_camUsePawnCtrlProp) return;
+        bool* slot = m_camUsePawnCtrlProp->ContainerPtrToValuePtr<bool>(m_pawnCamera);
+        if (!slot) return;
+        if (shouldLock) {
+            if (!m_camCtrlSaved) {
+                m_camCtrlSavedValue = *slot;
+                m_camCtrlSaved = true;
+            }
+            *slot = true;
+        } else if (m_camCtrlSaved) {
+            *slot = m_camCtrlSavedValue;
+            m_camCtrlSaved = false;
+        }
+    }
+
+    // v1.1: gesture-triggered camera + body lock. Only kicks in while a montage is
+    // playing on the pawn's main AnimInstance — outside of gestures, everything works
+    // exactly like v1.0 (body turns with left stick, strafe animations play normally).
+    // While a gesture IS playing:
+    //   1. Camera rotation is made absolute (ignores parent jnt_camera bone) and
+    //      driven from ControlRotation each tick → no bone-driven camera swing.
+    //   2. Pawn body is FPS-locked (bUseControllerRotationYaw=true, bOrient=false)
+    //      so left-stick movement doesn't rotate the mesh out of view.
+    // On gesture-end tick, both are reverted to vanilla dialogue behavior.
+    bool       m_camAbsoluteApplied     = false;
+    UFunction* m_camSetAbsoluteFn       = nullptr;
+    UFunction* m_camSetRelRotFn         = nullptr;
+    UFunction* m_isAnyMontagePlayingFn  = nullptr;
+    bool       m_bodyLockApplied        = false;
+    bool       m_savedOrientToMove      = true;   // vanilla dialogue: true
+    bool       m_savedUseCtrlYaw        = true;   // vanilla dialogue: true
+
+    // Gesture detection via state_data bools on the main AnimInstance. Montage-based
+    // detection failed — gestures aren't running through UE's Montage system in this
+    // game; they fire as anim graph slot activations. bActionSlotActive / bIsLeftHand-
+    // Busy / bFullBodySlotActive are set on state_data while a gesture plays.
+    bool IsGesturePlayingOnPawn() {
+        if (!m_animInstance || m_animInstance->IsUnreachable() || !m_stateDataProp) return false;
+        uint8_t* base = m_stateDataProp->ContainerPtrToValuePtr<uint8_t>(m_animInstance);
+        if (!base) return false;
+        auto readBool = [&](int32_t off) -> bool {
+            if (off < 0) return false;
+            return *reinterpret_cast<bool*>(base + off);
+        };
+        bool action  = readBool(m_offActionSlot);
+        bool handBz  = readBool(m_offLeftHandBusy);
+        bool fullBod = readBool(m_offFullBodySlot);
+        bool any = action || handBz || fullBod;
+        static uint64_t lastLog = 0;
+        static bool lastAny = false;
+        uint64_t now = GetTickCount64();
+        if (any != lastAny || (now - lastLog > 2000)) {
+            lastLog = now;
+            lastAny = any;
+            Output::send<LogLevel::Verbose>(
+                STR("[ImmDlg] GESTURE action={} handBusy={} fullBody={} any={}\n"),
+                action?1:0, handBz?1:0, fullBod?1:0, any?1:0);
+        }
+        return any;
+    }
+
+    // Faster variant: write RelativeRotation directly via the FProperty offset instead
+    // of going through K2_SetRelativeRotation. The UFunction path does an update
+    // cascade (component transforms, physics sweep check, delegates) that stutters
+    // when called every tick during camera rotation. Direct write is a plain FRotator
+    // memcpy — instant, no cascade. When bAbsRot=true (set once via SetAbsolute), the
+    // component's world rotation equals RelativeRotation, so the direct write
+    // effectively sets the world rotation with no side effects.
+    FProperty* m_camRelativeRotProp = nullptr;
+    void EngageCameraAbsoluteDirect(UObject* pawn) {
+        ResolvePawnCameraForDialogueLock(pawn);
+        if (!m_pawnCamera || m_pawnCamera->IsUnreachable()) return;
+        // One-time: enable absolute rotation on the camera.
+        if (!m_camAbsoluteApplied) {
+            if (!m_camSetAbsoluteFn) {
+                m_camSetAbsoluteFn = m_pawnCamera->GetFunctionByNameInChain(FName(STR("SetAbsolute")));
+            }
+            if (m_camSetAbsoluteFn) {
+                struct { bool bAbsLoc; bool bAbsRot; bool bAbsScale; } p{false, true, false};
+                m_pawnCamera->ProcessEvent(m_camSetAbsoluteFn, &p);
+                m_camAbsoluteApplied = true;
+                Output::send<LogLevel::Verbose>(STR("[ImmDlg] cam SetAbsolute(rot=true) applied\n"));
+            }
+        }
+        // Resolve RelativeRotation property once + write directly each tick.
+        if (!m_camRelativeRotProp) {
+            m_camRelativeRotProp = m_pawnCamera->GetPropertyByNameInChain(STR("RelativeRotation"));
+        }
+        if (m_camRelativeRotProp) {
+            FRotatorD ctrl = ControlRotation(pawn);
+            FRotatorD* slot = m_camRelativeRotProp->ContainerPtrToValuePtr<FRotatorD>(m_pawnCamera);
+            if (slot) *slot = ctrl;
+        }
+    }
+
+    void EngageCameraAbsolute(UObject* pawn) {
+        ResolvePawnCameraForDialogueLock(pawn);
+        if (!m_pawnCamera || m_pawnCamera->IsUnreachable()) return;
+        if (!m_camAbsoluteApplied) {
+            if (!m_camSetAbsoluteFn) {
+                m_camSetAbsoluteFn = m_pawnCamera->GetFunctionByNameInChain(FName(STR("SetAbsolute")));
+            }
+            if (m_camSetAbsoluteFn) {
+                struct { bool bAbsLoc; bool bAbsRot; bool bAbsScale; } p{false, true, false};
+                m_pawnCamera->ProcessEvent(m_camSetAbsoluteFn, &p);
+                m_camAbsoluteApplied = true;
+            }
+        }
+        if (!m_camSetRelRotFn) {
+            m_camSetRelRotFn = m_pawnCamera->GetFunctionByNameInChain(FName(STR("K2_SetRelativeRotation")));
+        }
+        if (m_camSetRelRotFn) {
+            FRotatorD ctrl = ControlRotation(pawn);
+            struct {
+                FRotatorD NewRotation;
+                bool bSweep; uint8_t pad0[7];
+                uint8_t hit[512];
+                uint8_t teleport; uint8_t pad1[7];
+                bool ReturnValue;
+            } p{};
+            p.NewRotation = ctrl;
+            p.bSweep = false;
+            p.teleport = 0;
+            m_pawnCamera->ProcessEvent(m_camSetRelRotFn, &p);
+        }
+    }
+
+    void DisengageCameraAbsolute() {
+        if (!m_camAbsoluteApplied) return;
+        if (!m_pawnCamera || m_pawnCamera->IsUnreachable()) {
+            m_camAbsoluteApplied = false;
+            return;
+        }
+        // FIRST reset RelativeRotation to zero — while bAbsRot was true, RelativeRotation
+        // was being written to controller world rotation. When we flip bAbsRot back to
+        // false, RelativeRotation is interpreted as parent-socket-relative, so leaving
+        // the last written world-rotation value there makes the camera stay tilted
+        // (25° off level, or wherever it was on dialogue exit).
+        if (!m_camRelativeRotProp) {
+            m_camRelativeRotProp = m_pawnCamera->GetPropertyByNameInChain(STR("RelativeRotation"));
+        }
+        if (m_camRelativeRotProp) {
+            FRotatorD* slot = m_camRelativeRotProp->ContainerPtrToValuePtr<FRotatorD>(m_pawnCamera);
+            if (slot) *slot = {0.0, 0.0, 0.0};
+        }
+        // THEN un-set absolute rotation so the camera re-attaches to the bone socket.
+        if (!m_camSetAbsoluteFn) {
+            m_camSetAbsoluteFn = m_pawnCamera->GetFunctionByNameInChain(FName(STR("SetAbsolute")));
+        }
+        if (m_camSetAbsoluteFn) {
+            struct { bool bAbsLoc; bool bAbsRot; bool bAbsScale; } p{false, false, false};
+            m_pawnCamera->ProcessEvent(m_camSetAbsoluteFn, &p);
+        }
+        m_camAbsoluteApplied = false;
+    }
+
+    void EngageBodyLock(UObject* pawn) {
+        if (m_bodyLockApplied) return;
+        // Snapshot current values so we can restore.
+        if (m_propUseCtrlYaw) {
+            bool* slot = m_propUseCtrlYaw->ContainerPtrToValuePtr<bool>(pawn);
+            if (slot) { m_savedUseCtrlYaw = *slot; *slot = true; }
+        }
+        if (m_propOrientToMove && m_charMoveComp && !m_charMoveComp->IsUnreachable()) {
+            bool* slot = m_propOrientToMove->ContainerPtrToValuePtr<bool>(m_charMoveComp);
+            if (slot) { m_savedOrientToMove = *slot; *slot = false; }
+        }
+        m_bodyLockApplied = true;
+    }
+    void DisengageBodyLock(UObject* pawn) {
+        if (!m_bodyLockApplied) return;
+        if (m_propUseCtrlYaw) {
+            bool* slot = m_propUseCtrlYaw->ContainerPtrToValuePtr<bool>(pawn);
+            if (slot) *slot = m_savedUseCtrlYaw;
+        }
+        if (m_propOrientToMove && m_charMoveComp && !m_charMoveComp->IsUnreachable()) {
+            bool* slot = m_propOrientToMove->ContainerPtrToValuePtr<bool>(m_charMoveComp);
+            if (slot) *slot = m_savedOrientToMove;
+        }
+        m_bodyLockApplied = false;
+    }
+
+    // Effect-based gesture detector. STALKER 2's gesture animations rotate the head
+    // bone (which the virtual jnt_camera socket derives from). At rest, jnt_camera
+    // socket yaw ≈ pawn actor yaw. During a gesture, head rotates independently and
+    // the delta grows. We use |delta| > threshold as our "gesture is playing" signal
+    // since reflection-based detection (Montage_IsAnyMontagePlaying, state_data bools,
+    // play_dialog_gesture hook) all failed on this game.
+    // Baseline is captured on dialogue entry so we only detect DEVIATIONS from rest,
+    // not the natural offset of jnt_camera from the actor forward.
+    double m_gestureBoneBaselineYaw = 0.0;
+    bool   m_gestureBaselineCaptured = false;
+    UFunction* m_getSocketRotFn = nullptr;
+    static constexpr double GESTURE_YAW_THRESHOLD_DEG = 3.0;
+    bool IsGestureAnimatingHead(UObject* pawn) {
+        if (!m_pawnMesh || m_pawnMesh->IsUnreachable()) return false;
+        if (!m_getSocketRotFn) {
+            m_getSocketRotFn = m_pawnMesh->GetFunctionByNameInChain(FName(STR("GetSocketRotation")));
+        }
+        if (!m_getSocketRotFn) return false;
+        struct { FName InSocketName; FRotatorD ReturnValue; } socketParams{
+            FName(STR("jnt_camera"), FNAME_Add), {0,0,0}};
+        m_pawnMesh->ProcessEvent(m_getSocketRotFn, &socketParams);
+        double boneYaw = socketParams.ReturnValue.Yaw;
+        double actorYaw = 0.0;
+        if (UFunction* fn = pawn->GetFunctionByNameInChain(FName(STR("K2_GetActorRotation")))) {
+            struct { FRotatorD Ret; } p{{0,0,0}};
+            pawn->ProcessEvent(fn, &p);
+            actorYaw = p.Ret.Yaw;
+        }
+        double localHeadYaw = boneYaw - actorYaw;
+        // Normalize to -180..180
+        while (localHeadYaw > 180.0)  localHeadYaw -= 360.0;
+        while (localHeadYaw < -180.0) localHeadYaw += 360.0;
+        // Snapshot the baseline on the first tick of dialogue (whatever the rest
+        // offset is, that's zero for our purposes).
+        if (!m_gestureBaselineCaptured) {
+            m_gestureBoneBaselineYaw = localHeadYaw;
+            m_gestureBaselineCaptured = true;
+        }
+        double delta = localHeadYaw - m_gestureBoneBaselineYaw;
+        while (delta > 180.0)  delta -= 360.0;
+        while (delta < -180.0) delta += 360.0;
+        return std::abs(delta) > GESTURE_YAW_THRESHOLD_DEG;
+    }
+
+    // Camera decouple in dialogue via bUsePawnControlRotation (UE native path).
+    // Edge-triggered: write once on dialogue entry (save prior value), restore once
+    // on exit. Writing every tick was in a possible fight loop with game code that
+    // could reset the flag, producing progressive glitches after seconds of use.
+    bool m_camPawnCtrlSaved      = false;
+    bool m_camPawnCtrlSavedValue = false;
+    bool m_camPawnCtrlLastInDlg  = false;
+    void ApplyGestureLockPerTick(UObject* pawn, bool inDlg) {
+        // Edge detection — only act on dialogue-state transitions.
+        if (inDlg == m_camPawnCtrlLastInDlg) return;
+        m_camPawnCtrlLastInDlg = inDlg;
+        ResolvePawnCameraForDialogueLock(pawn);
+        if (!m_pawnCamera || m_pawnCamera->IsUnreachable() || !m_camUsePawnCtrlProp) return;
+        bool* slot = m_camUsePawnCtrlProp->ContainerPtrToValuePtr<bool>(m_pawnCamera);
+        if (!slot) return;
+        if (inDlg) {
+            m_camPawnCtrlSavedValue = *slot;
+            m_camPawnCtrlSaved = true;
+            *slot = true;
+        } else if (m_camPawnCtrlSaved) {
+            *slot = m_camPawnCtrlSavedValue;
+            m_camPawnCtrlSaved = false;
+        }
+    }
+
 
     // One-time on first assets-loaded frame: patch the IMC_Dialog InputMappingContext
     // asset in memory to REMOVE the two Gamepad Left Thumbstick Up/Down bindings that
@@ -1996,6 +2320,60 @@ public:
     // previously tried in-place renaming to "None", but that left phantom mappings in
     // the array which caused the dialogue widget's keybind-hint layout code to
     // mis-position the F confirm glyph (rendering it above the option list).
+    // v1.1 diagnostic — log the three rotation sources every ~200ms in dialogue so we
+    // can see which one is actually changing during movement+gesture wildness.
+    // ControlRotation is what the mouse/right-stick drives. Camera RelativeRotation is
+    // the CameraComponent's local offset. Pawn actor Rotation is the mesh root.
+    // Timestamp lets us correlate what the user was doing.
+    uint64_t m_lastRotDiagMs = 0;
+    void LogRotationDiag(UObject* pawn, bool inDlg) {
+        if (!inDlg) return;
+        uint64_t now = GetTickCount64();
+        if (now - m_lastRotDiagMs < 200) return;
+        m_lastRotDiagMs = now;
+
+        // ControlRotation via GetControlRotation UFunction on the pawn.
+        FRotatorD ctrl{0,0,0};
+        if (UFunction* fn = pawn->GetFunctionByNameInChain(FName(STR("GetControlRotation")))) {
+            struct { FRotatorD Ret; } p{{0,0,0}};
+            pawn->ProcessEvent(fn, &p);
+            ctrl = p.Ret;
+        }
+        // Pawn actor Rotation via K2_GetActorRotation.
+        FRotatorD actor{0,0,0};
+        if (UFunction* fn = pawn->GetFunctionByNameInChain(FName(STR("K2_GetActorRotation")))) {
+            struct { FRotatorD Ret; } p{{0,0,0}};
+            pawn->ProcessEvent(fn, &p);
+            actor = p.Ret;
+        }
+        // Camera component RelativeRotation — via GetCameraComponent → K2_GetRelativeRotation.
+        FRotatorD camRel{0,0,0};
+        FRotatorD camWorld{0,0,0};
+        UObject* cam = nullptr;
+        if (UFunction* fn = pawn->GetFunctionByNameInChain(FName(STR("GetCameraComponent")))) {
+            struct { UObject* Ret; } p{nullptr};
+            pawn->ProcessEvent(fn, &p);
+            cam = p.Ret;
+        }
+        if (cam) {
+            // K2_GetComponentRotation returns world rotation of the component.
+            if (UFunction* fn = cam->GetFunctionByNameInChain(FName(STR("K2_GetComponentRotation")))) {
+                struct { FRotatorD Ret; } p{{0,0,0}};
+                cam->ProcessEvent(fn, &p);
+                camWorld = p.Ret;
+            }
+            // Relative rotation via property read.
+            if (FProperty* rp = cam->GetPropertyByNameInChain(STR("RelativeRotation"))) {
+                FRotatorD* slot = rp->ContainerPtrToValuePtr<FRotatorD>(cam);
+                if (slot) camRel = *slot;
+            }
+        }
+        Output::send<LogLevel::Verbose>(
+            STR("[ImmDlg] ROT ctrl(P={} Y={}) actor(P={} Y={}) camRel(P={} Y={}) camWorld(P={} Y={})\n"),
+            ctrl.Pitch, ctrl.Yaw, actor.Pitch, actor.Yaw,
+            camRel.Pitch, camRel.Yaw, camWorld.Pitch, camWorld.Yaw);
+    }
+
     bool m_dialogInputPatched = false;
     void PatchDialogInputMapping() {
         if (m_dialogInputPatched) return;
@@ -2138,6 +2516,23 @@ public:
         m_lookAtPropsDumped = false;
         m_mainAnimPropsDumped = false;
         m_lastLookAtRescanMs = 0;
+        m_pawnCamera = nullptr;
+        m_camUsePawnCtrlProp = nullptr;
+        m_camCtrlSaved = false;
+        m_camAbsoluteApplied = false;
+        m_camSetAbsoluteFn = nullptr;
+        m_camSetRelRotFn = nullptr;
+        m_camRelativeRotProp = nullptr;
+        m_isAnyMontagePlayingFn = nullptr;
+        m_bodyLockApplied = false;
+        m_camPawnCtrlSaved = false;
+        m_camPawnCtrlLastInDlg = false;
+        m_gestureBaselineCaptured = false;
+        m_gestureBoneBaselineYaw = 0.0;
+        m_getSocketRotFn = nullptr;
+        m_allDialogModifiers.clear();
+        m_allModifiersDisableFn = nullptr;
+        m_lastAllModifiersRescanMs = 0;
     }
 
     void PollHotkeys() {
@@ -2195,18 +2590,65 @@ public:
         }
     }
 
+    // Broader modifier suppression — during dialogue, walk EVERY UObject whose class
+    // derives from CameraModifier and disable it (except NVG, which is unrelated).
+    // Rescans every 2s so instances that spawn mid-dialogue also get caught. Used to
+    // hunt for whichever modifier is driving the movement+gesture camera hijack that
+    // ApplyCameraCenteringToggle's LookAt-only targeting missed.
+    std::vector<UObject*> m_allDialogModifiers;
+    uint64_t m_lastAllModifiersRescanMs = 0;
+    UFunction* m_allModifiersDisableFn = nullptr;
+    void DisableAllCameraModifiersDuringDialogue(bool inDlg) {
+        if (!inDlg) return;
+        uint64_t now = GetTickCount64();
+        bool needScan = m_allDialogModifiers.empty() || (now - m_lastAllModifiersRescanMs) > 2000;
+        if (needScan) {
+            m_lastAllModifiersRescanMs = now;
+            m_allDialogModifiers.clear();
+            UObjectGlobals::ForEachUObject([&](UObject* obj, int32_t, int32_t) -> LoopAction {
+                if (!obj) return LoopAction::Continue;
+                UClass* cls = obj->GetClassPrivate();
+                if (!cls) return LoopAction::Continue;
+                bool isModifier = false;
+                for (UStruct* w = cls; w; w = w->GetSuperStruct()) {
+                    if (w->GetName() == StringType(STR("CameraModifier"))) { isModifier = true; break; }
+                }
+                if (!isModifier) return LoopAction::Continue;
+                // Skip the class default objects.
+                StringType n = obj->GetName();
+                if (n.find(STR("Default__")) != StringType::npos) return LoopAction::Continue;
+                // Keep NVG modifier alive — unrelated to dialogue, breaks night vision if killed.
+                StringType clsName = cls->GetName();
+                if (clsName.find(STR("NVG")) != StringType::npos) return LoopAction::Continue;
+                m_allDialogModifiers.push_back(obj);
+                return LoopAction::Continue;
+            });
+            if (!m_allModifiersDisableFn && !m_allDialogModifiers.empty()) {
+                m_allModifiersDisableFn = m_allDialogModifiers[0]->GetFunctionByNameInChain(
+                    FName(STR("DisableModifier")));
+            }
+        }
+        if (!m_allModifiersDisableFn) return;
+        for (UObject* mod : m_allDialogModifiers) {
+            if (!mod || mod->IsUnreachable()) continue;
+            struct { bool bImmediate; } p{true};
+            mod->ProcessEvent(m_allModifiersDisableFn, &p);
+            CamMgrRemoveModifier(mod);
+            // Also stomp Alpha to 0 in case the subclass's DisableModifier doesn't.
+            if (FProperty* alphaProp = mod->GetPropertyByNameInChain(STR("Alpha"))) {
+                float* alpha = alphaProp->ContainerPtrToValuePtr<float>(mod);
+                if (alpha) *alpha = 0.0f;
+            }
+        }
+    }
+
     void ApplyCameraCenteringToggle(bool inDlg) {
         if (!m_camCenteringDisabled || !inDlg) return;
-        // Rescan strategy: while in dialogue, if we don't have any modifiers yet, scan
-        // EVERY frame (they may not exist at the exact moment we detected inDlg — the
-        // game spawns them a frame or two later). Once we find them, back off to every
-        // 2s (they persist for the whole dialogue session). Fixes the "camera centers on
-        // NPC for a second before releasing" symptom on dialogue entry.
-        uint64_t now = GetTickCount64();
-        bool needScan = m_lookAtModifiers.empty() || (now - m_lastLookAtRescanMs) > 2000;
-        if (needScan) {
-            m_lastLookAtRescanMs = now;
-            m_lookAtModifiers.clear();
+        // Scan only while list is empty (spawn timing — modifiers might not exist the
+        // exact frame we detect inDlg). Once found, they persist for the whole dialogue
+        // and get invalidated on dialogue exit, so no time-based rescan needed. Removing
+        // the per-2s rescan eliminated a periodic input-drop hitch users reported.
+        if (m_lookAtModifiers.empty()) {
             UObjectGlobals::FindAllOf(STR("CameraModifier_LookAt"), m_lookAtModifiers);
             if (!m_disableModifierFn && !m_lookAtModifiers.empty()) {
                 // UCameraModifier::DisableModifier(bool bImmediate) — UFUNCTION on base class.
@@ -2252,6 +2694,10 @@ public:
         // dangling caches crash the game. Nulling them here forces every Resolve*
         // function below to re-populate fresh on the next dialogue entry.
         if (!inDlg && m_prevInDialog) {
+            // Undo any active gesture lock before nulling the pointers we'd need to
+            // touch to un-set SetAbsolute / restore body rotation.
+            DisengageCameraAbsolute();
+            DisengageBodyLock(pawn);
             InvalidateCachesOnDialogueExit();
             m_prevInDialog = false;
             g_dx.exchange(0); g_dy.exchange(0);
@@ -2269,11 +2715,17 @@ public:
         ResolveBhChain(pawn);
         ResolveRotationControl(pawn);
         PatchDialogInputMapping();
+        // v1.1: camera decouple during dialogue. Body is never touched.
+        ApplyGestureLockPerTick(pawn, inDlg);
 
         // Hotkey polling every frame (works even outside dialogue).
         PollHotkeys();
         // Apply camera-centering-disable in dialogue if user has toggled it on.
         ApplyCameraCenteringToggle(inDlg);
+        // v1.1 exploratory: also kill every other CameraModifier subclass instance in
+        // dialogue, in case one of them is what's driving the movement+gesture wildness.
+        // (Removed) DisableAllCameraModifiersDuringDialogue — its per-2s ForEachUObject
+        // scan produced the periodic stutter, and it didn't fix anything anyway.
 
         if (!inDlg) {
             g_dx.exchange(0); g_dy.exchange(0);
@@ -2307,6 +2759,15 @@ public:
         if (padMoveY != 0.0) fwd    = padMoveY;
         if (padMoveX != 0.0) strafe = padMoveX;
         bool moving = (fwd != 0.0 || strafe != 0.0);
+        if (moving) m_lastMovementInputMs = GetTickCount64();
+        // Gesture fallback: if a gesture is animating the head bone (detected via bone
+        // yaw deviating from actor yaw), suppress WASD/left-stick movement this tick.
+        // The gesture+strafe interaction produces a camera hijack that we can't fix
+        // via reflection alone. Suppressing movement input during gestures gives up
+        // ~1s of walking to prevent the wild camera swing. Look input still works.
+        if (moving && IsGestureAnimatingHead(pawn)) {
+            fwd = 0.0; strafe = 0.0; moving = false;
+        }
         if (moving) {
             double yawDeg = ControlRotation(pawn).Yaw;
             double r = yawDeg * 3.14159265358979323846 / 180.0;

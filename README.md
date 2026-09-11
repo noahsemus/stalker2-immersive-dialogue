@@ -27,6 +27,13 @@ Slava Ukraini.
 - **Wwise footsteps fire during in-dialogue walking.** STALKER 2's anim graph
   suppresses foot notifies in dialogue; the mod triggers the appropriate
   `SFX_Skif_Footsteps` event on cadence so you still hear your steps.
+- **Camera stays stable when NPC gestures.** In vanilla dialogue, mesh gesture
+  animations (Skif waving his hand, shrugging, etc.) rotate the head bone which
+  the camera is attached to — combined with movement input this used to produce
+  a wild camera swing. v1.1 detects an active gesture via the `jnt_camera`
+  socket rotation and suppresses movement input for the ~1s the gesture is
+  playing. Look input (mouse / right stick) still works — you just can't
+  walk during a gesture. See "Known limitations" below.
 
 ## Companion mods (recommended)
 
@@ -41,18 +48,22 @@ Slava Ukraini.
 Drop the `.pak` into
 `<GAME>\Stalker2\Content\Paks\~mods\` alongside this mod.
 
-## Known issues in v1.0
+## Known limitations
 
-- **Dialog gestures still move the camera.** When Skif does a body gesture
-  (hand wave, shrug, etc.), his `jnt_camera` bone moves and drags the camera
-  with it, briefly stealing control from your mouse/right stick. A runtime
-  fix was implemented but crashed the game around the PDA-open flow and was
-  removed for stability. This is the top target for v1.1.
+- **Movement is suppressed while a gesture animation is playing.** This is the
+  tradeoff for the v1.1 gesture-camera fix. When Skif does an upper-body
+  gesture (~1s), WASD / left stick input is dropped for that window and the
+  character stops walking. Mouse / right-stick look works normally throughout.
+  The alternative was the wild camera swing you'd get from the compounded
+  strafe-plus-gesture bone rotation, which most players found worse. The mod
+  detects a gesture by watching the `jnt_camera` socket yaw relative to the
+  pawn's actor yaw — thresholded so natural walk-cycle head-bob doesn't
+  trigger a false stop.
 - **F confirm glyph on the highlighted dialogue option may render slightly
   higher than expected.** Purely cosmetic; the confirm key still works normally.
   Caused by the runtime `IMC_Dialog` patch keeping neutralized entries in the
   mapping array instead of removing them (removal corrupted UE runtime state
-  and crashed the PDA).
+  and crashed the PDA on v1.0-rc).
 
 ## Requirements
 
