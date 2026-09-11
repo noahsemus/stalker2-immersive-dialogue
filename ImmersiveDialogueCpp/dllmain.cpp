@@ -16,6 +16,9 @@
 //   - Open a working pause menu during dialogue (game gates it below the reflection layer).
 //   - Force footstep audio during dialogue movement (anim state manipulated via native C++).
 //   - Make Esc close the dialogue (game doesn't handle Esc-in-dialogue).
+//   - Suppress the dialogue FOV zoom. That value lives in CoreVariables.cfg as
+//     `DialogFOVDefault`; runtime tick-writes fight the game and flicker. Users install
+//     a separate Nexus "No Dialogue Zoom" pak alongside this mod for that.
 
 #include <Mod/CppUserModBase.hpp>
 #include <DynamicOutput/DynamicOutput.hpp>
@@ -32,7 +35,14 @@
 #include <map>
 
 #include <Windows.h>
+#include <Psapi.h>
 #include <Xinput.h>
+// PolyHook's inline detour — needed because the game calls XInputGetState via runtime
+// GetProcAddress rather than static import (IAT patching is a no-op for those callers).
+#include <polyhook2/Detour/x64Detour.hpp>
+#include <polyhook2/Enums.hpp>
+#include <polyhook2/ZydisDisassembler.hpp>
+#include <memory>
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
@@ -66,18 +76,161 @@ static bool    g_rawReady    = false;
 // this to distinguish our polling (return truth) from every other caller (return lie).
 static thread_local bool tl_selfDialogueQuery = false;
 
-// ================= Controller (XInput) with IAT-patched hook =================
-// Patch the game's IAT for XInputGetState so its polls see zeroed left stick during
-// dialogue (dialogue option list stops scrolling; D-pad still navigates). Our own
-// polling uses this DLL's IAT (separate), so we always get real values.
+// ================= Controller (GameInput COM vtable detour) =================
+// STALKER 2 (UE5.5 on Win11) reads gamepad state via GameInput.dll's IGameInput/
+// IGameInputReading COM interfaces — NOT XInput (confirmed via XInput call-counter:
+// game calls XInputGetState 4x at startup for presence probe then never again).
+// We two-stage detour:
+//   1. Detour IGameInput::GetCurrentReading (vtable slot 4). On first hit we snag
+//      the returned IGameInputReading and hook its GetGamepadState (vtable slot 22).
+//   2. Detour IGameInputReading::GetGamepadState (vtable slot 22). Zeroes left thumb-
+//      stick during dialogue so widget option list stops scrolling on left stick.
+// Vtable slots are per Microsoft's public gameinput.h (GameInput v1 / GDK).
+
+// Minimal COM types — just enough to name the vtable indices.
+struct IGameInput_MinCom;
+struct IGameInputReading_MinCom;
+struct IGameInputDevice_MinCom;
+using GameInputKind = uint32_t;
+constexpr GameInputKind GameInputKindGamepad = 0x00000020;
+
+// GameInputGamepadState layout matches Microsoft's gameinput.h struct.
+struct GameInputGamepadState_MinCom {
+    uint32_t buttons;
+    float leftTrigger;
+    float rightTrigger;
+    float leftThumbstickX;
+    float leftThumbstickY;
+    float rightThumbstickX;
+    float rightThumbstickY;
+};
+
+using GameInputCreateFn = HRESULT (WINAPI*)(IGameInput_MinCom**);
+using GetCurrentReadingFn = HRESULT (WINAPI*)(IGameInput_MinCom*, GameInputKind,
+                                               IGameInputDevice_MinCom*,
+                                               IGameInputReading_MinCom**);
+using GetGamepadStateFn = bool (WINAPI*)(IGameInputReading_MinCom*,
+                                          GameInputGamepadState_MinCom*);
+using ComReleaseFn = ULONG (WINAPI*)(void*);
+
+constexpr int kSlot_Release             = 2;
+constexpr int kSlot_GetCurrentReading   = 4;   // on IGameInput
+constexpr int kSlot_GetGamepadState     = 22;  // on IGameInputReading
+
+static bool g_gameInputHooked = false;
+static std::unique_ptr<PLH::x64Detour> g_giReadingDetour;
+static uint64_t g_giReadingTrampoline = 0;
+static std::unique_ptr<PLH::x64Detour> g_giStateDetour;
+static uint64_t g_giStateTrampoline = 0;
+static std::atomic<long> g_giStateCalls{0};
+static std::atomic<long> g_giStateCallsFromGame{0};
+static thread_local bool tl_selfGameInputQuery = false;
+
+// Hooked GetGamepadState — fills the state via the real function, then zeroes left
+// thumbstick during dialogue (unless our own poll set the thread-local guard).
+static bool WINAPI HookedGetGamepadState(IGameInputReading_MinCom* self,
+                                          GameInputGamepadState_MinCom* outState) {
+    if (!g_giStateTrampoline) return false;
+    bool r = reinterpret_cast<GetGamepadStateFn>(g_giStateTrampoline)(self, outState);
+    g_giStateCalls.fetch_add(1, std::memory_order_relaxed);
+    if (!tl_selfGameInputQuery) g_giStateCallsFromGame.fetch_add(1, std::memory_order_relaxed);
+    if (r && outState && !tl_selfGameInputQuery
+        && g_inDialogue.load(std::memory_order_relaxed)) {
+        outState->leftThumbstickX = 0.f;
+        outState->leftThumbstickY = 0.f;
+    }
+    return r;
+}
+
+static std::atomic<long> g_giReadingCalls{0};
+static std::atomic<long> g_giReadingOkCalls{0};
+static std::atomic<uint32_t> g_giLastReadingKind{0};
+// Hooked GetCurrentReading — on the first successful call we snag the returned
+// IGameInputReading and hook GetGamepadState from its vtable. Also chain-hook the
+// reading's other state-getters (slot 20-24) in case the game reads gamepad through
+// a different accessor (GetUiNavigationState, GetControllerAxisState, etc.).
+static HRESULT WINAPI HookedGetCurrentReading(IGameInput_MinCom* self,
+                                               GameInputKind kind,
+                                               IGameInputDevice_MinCom* device,
+                                               IGameInputReading_MinCom** out) {
+    if (!g_giReadingTrampoline) return E_FAIL;
+    HRESULT r = reinterpret_cast<GetCurrentReadingFn>(g_giReadingTrampoline)(
+        self, kind, device, out);
+    g_giReadingCalls.fetch_add(1, std::memory_order_relaxed);
+    g_giLastReadingKind.store(kind, std::memory_order_relaxed);
+    if (SUCCEEDED(r) && out && *out) {
+        g_giReadingOkCalls.fetch_add(1, std::memory_order_relaxed);
+        if (!g_giStateDetour) {
+            void** vtable = *reinterpret_cast<void***>(*out);
+            void* fnAddr = vtable[kSlot_GetGamepadState];
+            g_giStateDetour = std::make_unique<PLH::x64Detour>(
+                reinterpret_cast<uint64_t>(fnAddr),
+                reinterpret_cast<uint64_t>(&HookedGetGamepadState),
+                &g_giStateTrampoline);
+            if (!g_giStateDetour->hook()) g_giStateDetour.reset();
+        }
+    }
+    return r;
+}
+
+static void InstallGameInputHook() {
+    if (g_gameInputHooked) return;
+    HMODULE gi = GetModuleHandleA("GameInput.dll");
+    if (!gi) gi = GetModuleHandleA("gameinput.dll");
+    if (!gi) return; // DLL not loaded yet — caller should retry.
+    auto create = reinterpret_cast<GameInputCreateFn>(
+        GetProcAddress(gi, "GameInputCreate"));
+    if (!create) return;
+    IGameInput_MinCom* gameInput = nullptr;
+    HRESULT hr = create(&gameInput);
+    if (FAILED(hr) || !gameInput) return;
+    // Snapshot GetCurrentReading fn ptr from the vtable, then release the singleton
+    // (the vtable ptr is class-wide — no need to hold the instance).
+    void** vtable = *reinterpret_cast<void***>(gameInput);
+    void* readingFn = vtable[kSlot_GetCurrentReading];
+    reinterpret_cast<ComReleaseFn>(vtable[kSlot_Release])(gameInput);
+    if (!readingFn) return;
+    g_giReadingDetour = std::make_unique<PLH::x64Detour>(
+        reinterpret_cast<uint64_t>(readingFn),
+        reinterpret_cast<uint64_t>(&HookedGetCurrentReading),
+        &g_giReadingTrampoline);
+    if (g_giReadingDetour->hook()) {
+        g_gameInputHooked = true;
+    } else {
+        g_giReadingDetour.reset();
+    }
+}
+
+// ================= Controller (XInput) with inline detour =================
+// Inline-detour XInputGetState (via PolyHook x64Detour) so the game's polls — no matter
+// how it obtained the function pointer (static import OR runtime GetProcAddress) — see
+// zeroed left stick during dialogue (D-pad still navigates option list). Our own polling
+// bypasses the zeroing via a thread-local guard so left stick still moves the character.
 using XInputGetStateFn = DWORD (WINAPI*)(DWORD, XINPUT_STATE*);
 static XInputGetStateFn g_realXInputGetState = nullptr;
 static bool g_xinputHooked = false;
+static std::unique_ptr<PLH::x64Detour> g_xinputDetour;
+static uint64_t g_xinputTrampoline = 0;
+static thread_local bool tl_selfXInputQuery = false;
 
+static std::atomic<long> g_xinputHookCalls{0};
+static std::atomic<long> g_xinputHookCallsFromGame{0};
 static DWORD WINAPI HookedXInputGetState(DWORD userIndex, XINPUT_STATE* state) {
-    DWORD r = g_realXInputGetState ? g_realXInputGetState(userIndex, state)
-                                   : XInputGetState(userIndex, state);
-    if (r == ERROR_SUCCESS && state && g_inDialogue.load(std::memory_order_relaxed)) {
+    g_xinputHookCalls.fetch_add(1, std::memory_order_relaxed);
+    if (!tl_selfXInputQuery) g_xinputHookCallsFromGame.fetch_add(1, std::memory_order_relaxed);
+    // Prefer the PolyHook trampoline (real function bytes preserved) if the inline
+    // detour is up; otherwise fall back to the real function via saved pointer or the
+    // linker-imported symbol (used only during the brief startup window before hook).
+    DWORD r;
+    if (g_xinputTrampoline) {
+        r = reinterpret_cast<XInputGetStateFn>(g_xinputTrampoline)(userIndex, state);
+    } else if (g_realXInputGetState) {
+        r = g_realXInputGetState(userIndex, state);
+    } else {
+        r = XInputGetState(userIndex, state);
+    }
+    if (r == ERROR_SUCCESS && state && !tl_selfXInputQuery
+        && g_inDialogue.load(std::memory_order_relaxed)) {
         state->Gamepad.sThumbLX = 0;
         state->Gamepad.sThumbLY = 0;
     }
@@ -117,23 +270,77 @@ static bool PatchIATEntry(HMODULE hModule, const char* dllName, const char* func
     return false;
 }
 
+// Install an inline detour at the XInputGetState entry point in the loaded xinput DLL.
+// Retryable (returns without side effects until the DLL is present). Once the detour is
+// active it captures ALL callers regardless of how they obtained the function pointer.
 static void InstallXInputHook() {
-    HMODULE exe = GetModuleHandleW(nullptr);
-    void* orig = nullptr;
-    const char* dlls[] = { "xinput1_4.dll", "XINPUT1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll" };
+    if (g_xinputHooked) return;
+    const char* dlls[] = { "xinput1_4.dll", "XINPUT1_4.dll", "xinput1_3.dll",
+                           "XINPUT1_3.dll", "xinput9_1_0.dll", "xinputuap.dll" };
+    HMODULE xin = nullptr;
     for (auto* d : dlls) {
-        if (PatchIATEntry(exe, d, "XInputGetState", (void*)&HookedXInputGetState, &orig)) {
-            if (!g_realXInputGetState && orig) g_realXInputGetState = reinterpret_cast<XInputGetStateFn>(orig);
-            g_xinputHooked = true;
+        xin = GetModuleHandleA(d);
+        if (xin) break;
+    }
+    if (!xin) return; // DLL not loaded yet — caller should retry.
+    FARPROC addr = GetProcAddress(xin, "XInputGetState");
+    if (!addr) return;
+    g_realXInputGetState = reinterpret_cast<XInputGetStateFn>(addr);
+    g_xinputDetour = std::make_unique<PLH::x64Detour>(
+        reinterpret_cast<uint64_t>(addr),
+        reinterpret_cast<uint64_t>(&HookedXInputGetState),
+        &g_xinputTrampoline);
+    if (g_xinputDetour->hook()) {
+        g_xinputHooked = true;
+    } else {
+        g_xinputDetour.reset();
+    }
+}
+
+// Diagnostic: enumerate every loaded module in the game process and log any DLL name
+// containing "input", "game", "pad", "controller", or common gamepad-API keywords.
+// One-shot — fires from on_update once after we've had time to fully load.
+static bool g_inputProbeDone = false;
+static void ProbeInputModules() {
+    if (g_inputProbeDone) return;
+    HMODULE mods[1024]; DWORD cbNeeded = 0;
+    HANDLE proc = GetCurrentProcess();
+    if (!EnumProcessModules(proc, mods, sizeof(mods), &cbNeeded)) return;
+    DWORD count = cbNeeded / sizeof(HMODULE);
+    if (count > 1024) count = 1024;
+    g_inputProbeDone = true;
+    Output::send<LogLevel::Verbose>(
+        STR("[ImmDlg] INPUT-MOD probe: {} modules loaded\n"), count);
+    for (DWORD i = 0; i < count; ++i) {
+        char name[MAX_PATH]; name[0] = 0;
+        if (GetModuleFileNameA(mods[i], name, MAX_PATH) == 0) continue;
+        std::string s(name);
+        // Case-insensitive match.
+        std::string lower = s;
+        for (auto& c : lower) c = (char)tolower((unsigned char)c);
+        if (lower.find("input") != std::string::npos ||
+            lower.find("gamepad") != std::string::npos ||
+            lower.find("xinput") != std::string::npos ||
+            lower.find("hid") != std::string::npos ||
+            lower.find("gameinput") != std::string::npos ||
+            lower.find("windows.gaming") != std::string::npos ||
+            lower.find("sdl") != std::string::npos) {
+            Output::send<LogLevel::Verbose>(
+                STR("[ImmDlg]   INPUT-MOD: {}\n"),
+                std::wstring(s.begin(), s.end()));
         }
     }
 }
 
 // Read controller sticks + buttons. Left/right sticks normalized to [-1,+1] with deadzone.
+// Sets tl_selfXInputQuery so the inline hook returns raw (non-zeroed) values to US even
+// while the game sees zeros in dialogue.
 static bool ReadPadSticks(double& outMoveX, double& outMoveY,
                           double& outLookX, double& outLookY) {
     outMoveX = outMoveY = outLookX = outLookY = 0.0;
     XINPUT_STATE st{};
+    tl_selfXInputQuery = true;
+    struct Guard { ~Guard() { tl_selfXInputQuery = false; } } _g;
     for (DWORD i = 0; i < XUSER_MAX_COUNT; ++i) {
         if (XInputGetState(i, &st) == ERROR_SUCCESS) {
             auto apply = [](SHORT raw, SHORT dz) -> double {
@@ -287,18 +494,23 @@ public:
     // ini or via MCM, the game default (centering ON) is restored.
     bool       m_camCenteringDisabled = true;       // toggled by F6
 
-    // FOV control (config-only, no hotkey):
-    //   DisableDialogueFovChange=true  -> force FOV back to non-dialogue value in dialogue
-    //   DialogueFov=<float>            -> if > 0, force FOV to this exact value in dialogue
-    //                                     (takes precedence over DisableDialogueFovChange)
-    bool       m_disableDialogueFov = false;
-    float      m_dialogueFovOverride = 0.0f;
-    float      m_cachedNonDialogueFov = 0.0f;       // last FOV we saw outside dialogue
-    UObject*   m_pawnCamera = nullptr;              // UCameraComponent on the pawn
-    FProperty* m_fovProp = nullptr;                 // FloatProperty "FieldOfView"
+    // Camera lock during dialogue gestures. STALKER 2's CameraComponent is parented to
+    // `jnt_camera` bone on the mesh, so dialog-gesture animations that move upper-body
+    // bones drag the camera around and steal mouse control. Flipping the component's
+    // bUsePawnControlRotation to true tells UE to use the controller's rotation instead
+    // of the parent bone's rotation, so gestures animate the body normally but camera
+    // stays under player control. Cache the pre-dialogue value on entry, restore on exit.
+    UObject*   m_pawnCamera         = nullptr;
+    FProperty* m_camUsePawnCtrlProp = nullptr;
+    bool       m_camCtrlSaved       = false;
+    bool       m_camCtrlSavedValue  = false;
+
+    // FOV in-dialogue is handled by a separate Nexus mod ("No Dialogue Zoom" et al) that
+    // overrides DialogFOVDefault in CoreVariables.cfg — the config-driven single source of
+    // truth for STALKER 2's dialog FOV. Runtime code cannot cleanly beat the game's
+    // frame-by-frame FOV writes, so we deliberately do NOT touch FOV here.
     bool       m_configLoaded         = false;
     bool       m_f5Prev               = false; // (name lingering; actually tracks F6)
-    bool       m_f7Prev               = false;
     std::vector<UObject*> m_lookAtModifiers;
     UFunction* m_disableModifierFn = nullptr;
     UFunction* m_enableModifierFn  = nullptr;
@@ -325,9 +537,7 @@ public:
             if (eq == std::string::npos) continue;
             std::string k = trim(line.substr(0, eq));
             std::string v = trim(line.substr(eq + 1));
-            if      (k == "DisableCameraCentering")     m_camCenteringDisabled = (v == "true" || v == "1");
-            else if (k == "DisableDialogueFovChange")   m_disableDialogueFov   = (v == "true" || v == "1");
-            else if (k == "DialogueFov")                { try { m_dialogueFovOverride = std::stof(v); } catch(...) {} }
+            if (k == "DisableCameraCentering") m_camCenteringDisabled = (v == "true" || v == "1");
         }
     }
     void SaveConfig() {
@@ -336,9 +546,6 @@ public:
         if (!f) return;
         f << "; ImmersiveDialogue config — key/value ini format\n";
         f << "DisableCameraCentering=" << (m_camCenteringDisabled ? "true" : "false") << "\n";
-        f << "DisableDialogueFovChange=" << (m_disableDialogueFov ? "true" : "false") << "\n";
-        f << "; DialogueFov: 0 = no override, non-zero = force this FOV (deg) in dialogue\n";
-        f << "DialogueFov=" << m_dialogueFovOverride << "\n";
     }
 
     ImmersiveDialogue() {
@@ -479,6 +686,28 @@ public:
         if (!fn) return;
         struct { float InBlendOutTime; UObject* Montage; } p{0.0f, nullptr};
         animInstance->ProcessEvent(fn, &p);
+    }
+
+    // UAnimInstance::LinkAnimClassLayers(TSubclassOf<UAnimInstance> InClass).
+    // For each anim layer function InClass implements, links InClass as the currently-
+    // active layer instance for that group. Used to swap the linked layer at runtime.
+    // Test: swap dummy_C (currently linked, likely "no strafe" placeholder) → bh_C
+    // (latent, likely full locomotion layer with strafe blends). Returns void.
+    // Only run once per dialogue entry — repeated calls churn state.
+    bool m_linkedBhOnce = false;
+    void LinkAnimClassLayers(UObject* rootInst, UClass* layerClass) {
+        if (!rootInst || !layerClass) return;
+        UFunction* fn = Fn(rootInst, STR("LinkAnimClassLayers"));
+        if (!fn) return;
+        struct { UObject* InClass; } p{ reinterpret_cast<UObject*>(layerClass) };
+        rootInst->ProcessEvent(fn, &p);
+    }
+    void UnlinkAnimClassLayers(UObject* rootInst, UClass* layerClass) {
+        if (!rootInst || !layerClass) return;
+        UFunction* fn = Fn(rootInst, STR("UnlinkAnimClassLayers"));
+        if (!fn) return;
+        struct { UObject* InClass; } p{ reinterpret_cast<UObject*>(layerClass) };
+        rootInst->ProcessEvent(fn, &p);
     }
 
     // USceneComponent::K2_SetRelativeRotation(FRotator, bool bSweep, FHitResult, ETeleportType) → bool.
@@ -987,10 +1216,15 @@ public:
     std::map<StringType, int32_t> m_bhStateOffs;
     std::map<StringType, int32_t> m_bhLocoOffs;
     bool m_bhTriedResolve = false;
-    // Also cache dummy_C (the "dummy" placeholder anim instance) — it's a candidate for
-    // being swapped in during dialogue. If GetLinkedAnimLayerInstanceByClass(dummy) returns
-    // non-null in dialogue, we've found the layer STALKER 2 links to disable strafe.
+    // Also cache dummy_C. Per LAYER-SLOT probe, dummy is the ALWAYS-ACTIVE linked layer
+    // in both LinkedAnimLayer slots on main — so writing anim state to main might not
+    // reach the visible pose. Cache its state_data + locomotion_data props + offset
+    // maps so we can mirror writes onto dummy just like we do for main.
     UObject* m_dummyAnimInstance = nullptr;
+    FProperty* m_dummyStateProp = nullptr;
+    FProperty* m_dummyLocoProp = nullptr;
+    std::map<StringType, int32_t> m_dummyStateOffs;
+    std::map<StringType, int32_t> m_dummyLocoOffs;
 
     void ResolveShadowChain(UObject* pawn) {
         if (m_shadowAnimInstance) return;
@@ -1104,6 +1338,37 @@ public:
             m_bhStateProp ? STR("ok") : STR("null"),
             m_bhLocoProp ? STR("ok") : STR("null"),
             (int)m_bhStateOffs.size(), (int)m_bhLocoOffs.size());
+        // Also resolve dummy's state_data / locomotion_data offsets so we can write to
+        // it in ForceDummyLocomotion. Dummy is the ACTIVE linked layer (LAYER-SLOT probe
+        // confirmed both slots point to dummy in and out of dialogue) — writes here may
+        // reach the visible pose that writes to main don't.
+        if (m_dummyAnimInstance) {
+            for (auto* n : sdNames) { m_dummyStateProp = m_dummyAnimInstance->GetPropertyByNameInChain(n); if (m_dummyStateProp) break; }
+            for (auto* n : ldNames) { m_dummyLocoProp = m_dummyAnimInstance->GetPropertyByNameInChain(n); if (m_dummyLocoProp) break; }
+            if (m_dummyStateProp) {
+                FStructProperty* sfp = static_cast<FStructProperty*>(m_dummyStateProp);
+                UScriptStruct* stru = sfp->GetStruct();
+                for (UStruct* w = stru; w; w = w->GetSuperStruct()) {
+                    for (FProperty* p : TFieldRange<FProperty>(w, EFieldIterationFlags::None)) {
+                        if (p) m_dummyStateOffs[p->GetName()] = p->GetOffset_ForInternal();
+                    }
+                }
+            }
+            if (m_dummyLocoProp) {
+                FStructProperty* sfp = static_cast<FStructProperty*>(m_dummyLocoProp);
+                UScriptStruct* stru = sfp->GetStruct();
+                for (UStruct* w = stru; w; w = w->GetSuperStruct()) {
+                    for (FProperty* p : TFieldRange<FProperty>(w, EFieldIterationFlags::None)) {
+                        if (p) m_dummyLocoOffs[p->GetName()] = p->GetOffset_ForInternal();
+                    }
+                }
+            }
+            Output::send<LogLevel::Verbose>(
+                STR("[ImmDlg] DUMMY chain resolved: state_data={} locomotion_data={} stateOffs={} locoOffs={}\n"),
+                m_dummyStateProp ? STR("ok") : STR("null"),
+                m_dummyLocoProp ? STR("ok") : STR("null"),
+                (int)m_dummyStateOffs.size(), (int)m_dummyLocoOffs.size());
+        }
         // Dump the top-level class properties too — Blueprint may add fields specific to
         // AnimBP_player_bh_C that we don't know about yet.
         UClass* bhCls = m_bhAnimInstance->GetClassPrivate();
@@ -1119,21 +1384,26 @@ public:
         }
     }
 
-    // Mirror the write pattern from ForceLocomotionData onto the BH AnimInstance.
-    void ForceBhLocomotion(bool moving, double inputFwd, double inputStrafe) {
-        if (!m_bhAnimInstance) return;
+    // Mirror the write pattern from ForceLocomotionData onto ANY AnimInstance by writing
+    // its state_data + locomotion_data structs. Called for BH and DUMMY. Same convention
+    // and values as we use for main.
+    void ForceLocomotionOnInstance(UObject* inst,
+                                    FProperty* sdProp, const std::map<StringType, int32_t>& sdOffs,
+                                    FProperty* ldProp, const std::map<StringType, int32_t>& ldOffs,
+                                    bool moving, double inputFwd, double inputStrafe) {
+        if (!inst) return;
         // state_data first: DynamicGaitValue / CurveGaitValue + b* flags.
-        if (m_bhStateProp) {
-            uint8_t* base = m_bhStateProp->ContainerPtrToValuePtr<uint8_t>(m_bhAnimInstance);
+        if (sdProp) {
+            uint8_t* base = sdProp->ContainerPtrToValuePtr<uint8_t>(inst);
             if (base) {
                 auto wB = [&](const wchar_t* name, bool val) {
-                    auto it = m_bhStateOffs.find(name);
-                    if (it == m_bhStateOffs.end()) return;
+                    auto it = sdOffs.find(name);
+                    if (it == sdOffs.end()) return;
                     *reinterpret_cast<bool*>(base + it->second) = val;
                 };
                 auto wF = [&](const wchar_t* name, float val) {
-                    auto it = m_bhStateOffs.find(name);
-                    if (it == m_bhStateOffs.end()) return;
+                    auto it = sdOffs.find(name);
+                    if (it == sdOffs.end()) return;
                     *reinterpret_cast<float*>(base + it->second) = val;
                 };
                 wB(STR("bAlive"),     true);
@@ -1150,22 +1420,22 @@ public:
             }
         }
         // locomotion_data: Velocity / Direction / BPDirection / AngleDirection / PlayRate.
-        if (m_bhLocoProp) {
-            uint8_t* base = m_bhLocoProp->ContainerPtrToValuePtr<uint8_t>(m_bhAnimInstance);
+        if (ldProp) {
+            uint8_t* base = ldProp->ContainerPtrToValuePtr<uint8_t>(inst);
             if (base) {
                 auto wF = [&](const wchar_t* name, float val) {
-                    auto it = m_bhLocoOffs.find(name);
-                    if (it == m_bhLocoOffs.end()) return;
+                    auto it = ldOffs.find(name);
+                    if (it == ldOffs.end()) return;
                     *reinterpret_cast<float*>(base + it->second) = val;
                 };
                 auto wByte = [&](const wchar_t* name, uint8_t val) {
-                    auto it = m_bhLocoOffs.find(name);
-                    if (it == m_bhLocoOffs.end()) return;
+                    auto it = ldOffs.find(name);
+                    if (it == ldOffs.end()) return;
                     *reinterpret_cast<uint8_t*>(base + it->second) = val;
                 };
                 auto wB = [&](const wchar_t* name, bool val) {
-                    auto it = m_bhLocoOffs.find(name);
-                    if (it == m_bhLocoOffs.end()) return;
+                    auto it = ldOffs.find(name);
+                    if (it == ldOffs.end()) return;
                     *reinterpret_cast<bool*>(base + it->second) = val;
                 };
                 float playRate = 0.0f;
@@ -1203,6 +1473,20 @@ public:
                 wByte(STR("BPDirection"), bpDir);
             }
         }
+    }
+
+    void ForceBhLocomotion(bool moving, double inputFwd, double inputStrafe) {
+        ForceLocomotionOnInstance(m_bhAnimInstance,
+            m_bhStateProp, m_bhStateOffs,
+            m_bhLocoProp,  m_bhLocoOffs,
+            moving, inputFwd, inputStrafe);
+    }
+
+    void ForceDummyLocomotion(bool moving, double inputFwd, double inputStrafe) {
+        ForceLocomotionOnInstance(m_dummyAnimInstance,
+            m_dummyStateProp, m_dummyStateOffs,
+            m_dummyLocoProp,  m_dummyLocoOffs,
+            moving, inputFwd, inputStrafe);
     }
 
     // Mesh-rotation bypass: since STALKER 2 gates dialogue anim behind a native check we
@@ -1409,6 +1693,10 @@ public:
             m_offCrouchingOverride, m_offCombatMoveIdle, m_offCombatCrouchIdle);
 
         // Also resolve + dump locomotion_data and shadow_data properties, same technique.
+        // Recurses ONE level into nested StructProperty fields — critical: e.g.
+        // LocomotionData.MovementPlayRate is itself a struct with sub-fields
+        // (RightValue, ForwardValue, PlayRate) that the Walk BlendSpace reads.
+        // We store dotted keys like "MovementPlayRate.RightValue" -> offset.
         auto resolveAndDump = [&](const wchar_t* n1, const wchar_t* n2, const wchar_t* label,
                                   FProperty*& outProp, std::map<StringType, int32_t>& outMap) {
             FProperty* pp = m_animInstance->GetPropertyByNameInChain(n1);
@@ -1426,11 +1714,33 @@ public:
             while (walker2) {
                 for (FProperty* p : TFieldRange<FProperty>(walker2, EFieldIterationFlags::None)) {
                     if (!p) continue;
-                    outMap[p->GetName()] = p->GetOffset_ForInternal();
+                    int32_t topOff = p->GetOffset_ForInternal();
+                    StringType topName = p->GetName();
+                    outMap[topName] = topOff;
                     if (printed2 < 40) {
                         Output::send<LogLevel::Verbose>(STR("[ImmDlg]     {}.{} off={}\n"),
-                                                         label, p->GetName(), p->GetOffset_ForInternal());
+                                                         label, topName, topOff);
                         printed2++;
+                    }
+                    // If this field is a nested StructProperty, recurse one level and
+                    // store "TopName.SubName" -> topOff + subOff.
+                    FStructProperty* subSfp = CastField<FStructProperty>(p);
+                    if (!subSfp) continue;
+                    UScriptStruct* subStru = subSfp->GetStruct();
+                    if (!subStru) continue;
+                    UStruct* subWalker = subStru;
+                    while (subWalker) {
+                        for (FProperty* sp : TFieldRange<FProperty>(subWalker, EFieldIterationFlags::None)) {
+                            if (!sp) continue;
+                            StringType dotted = topName + StringType(STR(".")) + sp->GetName();
+                            outMap[dotted] = topOff + sp->GetOffset_ForInternal();
+                            if (printed2 < 40) {
+                                Output::send<LogLevel::Verbose>(STR("[ImmDlg]     {}.{} off={}\n"),
+                                                                 label, dotted, topOff + sp->GetOffset_ForInternal());
+                                printed2++;
+                            }
+                        }
+                        subWalker = subWalker->GetSuperStruct();
                     }
                 }
                 walker2 = walker2->GetSuperStruct();
@@ -1476,12 +1786,19 @@ public:
             if (it == m_locomotionOffsets.end()) return;
             *reinterpret_cast<bool*>(base + it->second) = val;
         };
-        // Ground-truth PlayRate outside dialogue: 0 for fwd/strafe (game reads velocity
-        // directly), -1 for backward (game plays fwd-walk anim in reverse). Our previous
-        // constant 1 was wrong for both directions.
-        float playRate = 0.0f;
-        if (moving && inputFwd < 0.0) playRate = -1.0f;
-        writeF(STR("MovementPlayRate"), playRate);
+        // CRITICAL: `MovementPlayRate` is NOT a single float — it's a struct with three
+        // sub-fields: RightValue, ForwardValue, PlayRate. Confirmed by opening the anim BP
+        // in Mod Editor: the Walk state's BlendSpacePlayer node's X input reads
+        // LocomotionData.MovementPlayRate.RightValue, Y reads .ForwardValue, PlayRate pin
+        // reads .PlayRate. These are the ACTUAL directional inputs the walk blend reads,
+        // not AngleDirection/Direction/BPDirection (those feed other systems). Writing to
+        // the "MovementPlayRate" name as a single float was clobbering only RightValue and
+        // leaving ForwardValue + PlayRate stale — which is why strafe animation never showed
+        // in dialogue despite everything else looking correct.
+        // Input convention: WASD gives fwd/strafe in -1..+1. Feed directly to sub-fields.
+        writeF(STR("MovementPlayRate.RightValue"),   (float)inputStrafe);
+        writeF(STR("MovementPlayRate.ForwardValue"), (float)inputFwd);
+        writeF(STR("MovementPlayRate.PlayRate"),     moving ? 1.0f : 0.0f);
         writeF(STR("LegIKAlpha"),       1.0f);
         writeB(STR("bLegIKEnabled"),    true);
         writeB(STR("bEnablePlayRateCurves"), true);
@@ -1871,8 +2188,58 @@ public:
         write(m_offWalking,    moving);
     }
 
-    // Resolve pawn camera + FOV property (once, on first dialogue entry).
-    void ResolvePawnCamera(UObject* pawn) {
+    // ---- PlayerCameraManager (minimal — for RemoveCameraModifier on look-at) ----
+    // FOV manipulation was removed from this mod: STALKER 2 stores dialog FOV as a
+    // config value (DialogFOVDefault in CoreVariables.cfg). Users install a separate
+    // "No Dialogue Zoom" pak mod for that; fighting the game every tick from here
+    // produced visible flicker. We keep the manager reference only to remove the
+    // look-at modifier from the modifier list on dialogue entry.
+    UObject*   m_camMgr             = nullptr;
+    UFunction* m_camMgrRemoveMod    = nullptr;
+    bool       m_camMgrTriedResolve = false;
+    FProperty* m_lookAtAlphaProp    = nullptr;
+    void ResolveCameraManager(UObject* pawn) {
+        if (m_camMgrTriedResolve) return;
+        // Try 1: PC's PlayerCameraManager UPROPERTY (standard APlayerController).
+        if (FProperty* p = pawn->GetPropertyByNameInChain(STR("PlayerCameraManager"))) {
+            UObject** slot = p->ContainerPtrToValuePtr<UObject*>(pawn);
+            if (slot && *slot) m_camMgr = *slot;
+        }
+        // Try 2: pawn's GetPlayerCameraManager UFunction (some subclasses expose it).
+        if (!m_camMgr) {
+            if (UFunction* fn = pawn->GetFunctionByNameInChain(FName(STR("GetPlayerCameraManager")))) {
+                struct { UObject* Ret; } p{nullptr};
+                pawn->ProcessEvent(fn, &p);
+                m_camMgr = p.Ret;
+            }
+        }
+        // Try 3: fall back to the first PlayerCameraManager in the world.
+        if (!m_camMgr) {
+            m_camMgr = UObjectGlobals::FindFirstOf(STR("PlayerCameraManager"));
+        }
+        if (!m_camMgr) {
+            // Log failure once so we don't spam.
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                Output::send<LogLevel::Verbose>(STR("[ImmDlg] camera manager resolve FAILED (prop+ufunc+findfirst all null)\n"));
+            }
+            return;
+        }
+        m_camMgrTriedResolve = true;
+        m_camMgrRemoveMod = m_camMgr->GetFunctionByNameInChain(FName(STR("RemoveCameraModifier")));
+        Output::send<LogLevel::Verbose>(
+            STR("[ImmDlg] camera manager resolved: {} RemoveMod={}\n"),
+            m_camMgr->GetFullName(), m_camMgrRemoveMod ? STR("ok") : STR("null"));
+    }
+    void CamMgrRemoveModifier(UObject* modifier) {
+        if (!m_camMgr || !m_camMgrRemoveMod || !modifier) return;
+        struct { UObject* Modifier; bool ReturnValue; } p{modifier, false};
+        m_camMgr->ProcessEvent(m_camMgrRemoveMod, &p);
+    }
+
+    // Resolve pawn's CameraComponent + the bUsePawnControlRotation property once.
+    void ResolvePawnCameraForDialogueLock(UObject* pawn) {
         if (m_pawnCamera) return;
         UFunction* getCam = pawn->GetFunctionByNameInChain(FName(STR("GetCameraComponent")));
         if (!getCam) getCam = pawn->GetFunctionByNameInChain(FName(STR("K2_GetCameraComponent")));
@@ -1881,68 +2248,147 @@ public:
         pawn->ProcessEvent(getCam, &p);
         m_pawnCamera = p.Ret;
         if (m_pawnCamera) {
-            m_fovProp = m_pawnCamera->GetPropertyByNameInChain(STR("FieldOfView"));
-            Output::send<LogLevel::Verbose>(STR("[ImmDlg] camera+fov resolved: cam={}, fovProp={}\n"),
-                                             m_pawnCamera ? STR("ok") : STR("null"),
-                                             m_fovProp    ? STR("ok") : STR("null"));
+            m_camUsePawnCtrlProp = m_pawnCamera->GetPropertyByNameInChain(STR("bUsePawnControlRotation"));
+            Output::send<LogLevel::Verbose>(
+                STR("[ImmDlg] cam dlg-lock resolved: cam=ok, bUsePawnCtrl prop={}\n"),
+                m_camUsePawnCtrlProp ? STR("ok") : STR("null"));
         }
     }
 
-    // Read current camera FOV via property. Returns 0 if not available.
-    float ReadCameraFov() {
-        if (!m_pawnCamera || !m_fovProp) return 0.0f;
-        float* slot = m_fovProp->ContainerPtrToValuePtr<float>(m_pawnCamera);
-        return slot ? *slot : 0.0f;
-    }
-    void WriteCameraFov(float fov) {
-        if (!m_pawnCamera || !m_fovProp) return;
-        float* slot = m_fovProp->ContainerPtrToValuePtr<float>(m_pawnCamera);
-        if (slot) *slot = fov;
-    }
-
-    // Camera is attached to a mesh socket (head bone for head-bob) — so when we rotate
-    // the mesh for the strafe bypass, camera rotation follows. Call USceneComponent::
-    // SetAbsolute(bAbsLoc, bAbsRot, bAbsScale) on the camera to make its rotation ignore
-    // the parent bone. Camera location still tracks head bone (fine for yaw rotation
-    // since head is directly above pawn origin — Y/X don't change).
-    bool m_camAbsRotApplied = false;
-    void SetCameraRotationAbsolute(bool absolute) {
-        if (!m_pawnCamera) return;
-        if (absolute == m_camAbsRotApplied) return;
-        UFunction* fn = m_pawnCamera->GetFunctionByNameInChain(FName(STR("SetAbsolute")));
-        if (!fn) return;
-        struct { bool bAbsLoc; bool bAbsRot; bool bAbsScale; } p{false, absolute, false};
-        m_pawnCamera->ProcessEvent(fn, &p);
-        m_camAbsRotApplied = absolute;
-        Output::send<LogLevel::Verbose>(
-            STR("[ImmDlg] camera rotation absolute -> {}\n"),
-            absolute ? STR("true") : STR("false"));
-    }
-
-    // Apply FOV policy in/out of dialogue.
-    // Outside dialogue: cache the current FOV as the "normal" value (updated every ~1s
-    // in case game changes it based on aiming/scope state — we grab the last stable one).
-    // In dialogue: if DialogueFov > 0, force it; else if DisableDialogueFovChange, force the cached non-dialogue FOV.
-    uint64_t m_lastFovSampleMs = 0;
-    void ApplyFovPolicy(bool inDlg) {
-        if (!m_pawnCamera || !m_fovProp) return;
-        uint64_t now = GetTickCount64();
-        if (!inDlg) {
-            if (now - m_lastFovSampleMs > 1000) {
-                float cur = ReadCameraFov();
-                if (cur > 30.0f && cur < 170.0f) m_cachedNonDialogueFov = cur;
-                m_lastFovSampleMs = now;
+    // Lock camera to controller rotation while in dialogue so gesture animations (which
+    // move mesh bones including jnt_camera) don't drag the camera around and steal
+    // mouse control. On dialogue entry: save the current value, force true. On exit:
+    // restore the saved value so we don't leak state into normal gameplay.
+    void ApplyCameraDialogueLock(bool inDlg) {
+        if (!m_pawnCamera || !m_camUsePawnCtrlProp) return;
+        bool* slot = m_camUsePawnCtrlProp->ContainerPtrToValuePtr<bool>(m_pawnCamera);
+        if (!slot) return;
+        if (inDlg) {
+            if (!m_camCtrlSaved) {
+                m_camCtrlSavedValue = *slot;
+                m_camCtrlSaved = true;
+                Output::send<LogLevel::Verbose>(
+                    STR("[ImmDlg] cam dlg-lock ON (was={})\n"),
+                    m_camCtrlSavedValue ? STR("true") : STR("false"));
             }
+            // Re-write every tick — game may set it back to its default.
+            *slot = true;
+        } else if (m_camCtrlSaved) {
+            *slot = m_camCtrlSavedValue;
+            m_camCtrlSaved = false;
+            Output::send<LogLevel::Verbose>(
+                STR("[ImmDlg] cam dlg-lock OFF (restored={})\n"),
+                m_camCtrlSavedValue ? STR("true") : STR("false"));
+        }
+    }
+
+    // One-time on first assets-loaded frame: patch the IMC_Dialog InputMappingContext
+    // asset in memory to REMOVE the two Gamepad Left Thumbstick Up/Down bindings that
+    // were mapped to IA_UI_Dialog_SelectAnswer (they made left-stick scroll dialogue
+    // options — conflicts with our free-movement-in-dialogue feature). D-pad Up/Down
+    // stays intact so gamepad navigation still works via D-pad.
+    //
+    // Strategy: locate IMC_Dialog UObject, walk its Mappings TArray<FEnhancedActionKey-
+    // Mapping>, and use FScriptArrayHelper::RemoveValues to properly delete entries
+    // whose Key.KeyName is "Gamepad_LeftStick_Up" or "Gamepad_LeftStick_Down". We
+    // previously tried in-place renaming to "None", but that left phantom mappings in
+    // the array which caused the dialogue widget's keybind-hint layout code to
+    // mis-position the F confirm glyph (rendering it above the option list).
+    bool m_dialogInputPatched = false;
+    void PatchDialogInputMapping() {
+        if (m_dialogInputPatched) return;
+        UObject* imc = nullptr;
+        UObjectGlobals::ForEachUObject([&](UObject* obj, int32_t, int32_t) -> LoopAction {
+            if (!obj) return LoopAction::Continue;
+            if (obj->GetName() != StringType(STR("IMC_Dialog"))) return LoopAction::Continue;
+            UClass* cls = obj->GetClassPrivate();
+            if (!cls) return LoopAction::Continue;
+            for (UStruct* w = cls; w; w = w->GetSuperStruct()) {
+                if (w->GetName() == StringType(STR("InputMappingContext"))) {
+                    imc = obj;
+                    return LoopAction::Break;
+                }
+            }
+            return LoopAction::Continue;
+        });
+        if (!imc) return; // asset not loaded yet — retry next tick
+        FProperty* mappingsProp = imc->GetPropertyByNameInChain(STR("Mappings"));
+        FArrayProperty* arrProp = mappingsProp ? CastField<FArrayProperty>(mappingsProp) : nullptr;
+        if (!arrProp) {
+            m_dialogInputPatched = true;
+            Output::send<LogLevel::Verbose>(STR("[ImmDlg] IMC_Dialog patch: Mappings prop missing or not array\n"));
             return;
         }
-        float target = 0.0f;
-        if (m_dialogueFovOverride > 0.0f)     target = m_dialogueFovOverride;
-        else if (m_disableDialogueFov)        target = m_cachedNonDialogueFov;
-        if (target > 30.0f && target < 170.0f) WriteCameraFov(target);
+        FStructProperty* innerStruct = CastField<FStructProperty>(arrProp->GetInner());
+        if (!innerStruct) {
+            m_dialogInputPatched = true;
+            Output::send<LogLevel::Verbose>(STR("[ImmDlg] IMC_Dialog patch: inner not struct\n"));
+            return;
+        }
+        UScriptStruct* elemStruct = innerStruct->GetStruct();
+        // Find the Key field's offset within FEnhancedActionKeyMapping.
+        int32_t keyOff = -1;
+        for (UStruct* w = elemStruct; w; w = w->GetSuperStruct()) {
+            for (FProperty* p : TFieldRange<FProperty>(w, EFieldIterationFlags::None)) {
+                if (p && p->GetName() == StringType(STR("Key"))) {
+                    keyOff = p->GetOffset_ForInternal();
+                    break;
+                }
+            }
+            if (keyOff >= 0) break;
+        }
+        if (keyOff < 0) {
+            m_dialogInputPatched = true;
+            Output::send<LogLevel::Verbose>(STR("[ImmDlg] IMC_Dialog patch: Key field not found\n"));
+            return;
+        }
+        // Manual TArray manipulation — FScriptArrayHelper::RemoveValues fails to link
+        // against RE-UE4SS's exported symbols (FMemoryImageAllocatorBase unresolved).
+        // TArray header layout: Data* @0, Num @8, Max @12. Since FEnhancedActionKey-
+        // Mapping contains no self-referencing pointers (its owned TObjectPtrs and
+        // TArrays reference external allocations that remain valid regardless of the
+        // struct's position), we can safely memmove-shift elements down. The
+        // downside is that removed elements' owned TArray storage (Triggers,
+        // Modifiers) leaks — but that's tiny (~32 bytes per entry × 2 entries) and
+        // reclaimed when IMC_Dialog itself is destroyed.
+        int32_t elemSize = arrProp->GetInner()->GetElementSize();
+        uint8_t* arrHdr = mappingsProp->ContainerPtrToValuePtr<uint8_t>(imc);
+        if (!arrHdr) return;
+        uint8_t** dataSlot = reinterpret_cast<uint8_t**>(arrHdr);
+        int32_t* numSlot   = reinterpret_cast<int32_t*>(arrHdr + 8);
+        uint8_t* data = *dataSlot;
+        int32_t num   = *numSlot;
+        if (!data || num <= 0) return;
+        int removed = 0;
+        for (int32_t i = num - 1; i >= 0; --i) {
+            uint8_t* elem = data + (int64_t)i * elemSize;
+            FName* keyName = reinterpret_cast<FName*>(elem + keyOff);
+            StringType s = keyName->ToString();
+            // Narrow match — only the exact FNames we observed on the 27-mapping
+            // IMC_Dialog. Broader matching (e.g. any "LeftStick") risked hitting
+            // future STALKER 2 updates in unintended ways.
+            bool isLeftStick =
+                s == StringType(STR("Gamepad_LeftStick_Up")) ||
+                s == StringType(STR("Gamepad_LeftStick_Down"));
+            if (!isLeftStick) continue;
+            Output::send<LogLevel::Verbose>(
+                STR("[ImmDlg] IMC_Dialog patch: removing binding [{}] {}\n"), i, s);
+            int32_t after = num - i - 1;
+            if (after > 0) {
+                memmove(elem, elem + elemSize, (size_t)after * elemSize);
+            }
+            num--;
+            *numSlot = num;
+            removed++;
+        }
+        m_dialogInputPatched = true;
+        Output::send<LogLevel::Verbose>(
+            STR("[ImmDlg] IMC_Dialog patch complete: {} removed, {} mappings remaining\n"),
+            removed, num);
     }
 
     void PollHotkeys() {
-        // F6 — camera centering (F5 is quicksave in STALKER 2, don't stomp it).
+        // F6 — toggle camera centering (F5 is quicksave in STALKER 2, don't stomp it).
         bool f6 = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
         if (f6 && !m_f5Prev) {
             m_camCenteringDisabled = !m_camCenteringDisabled;
@@ -1952,25 +2398,60 @@ public:
                 m_camCenteringDisabled ? STR("DISABLED (camera free)") : STR("enabled (game default)"));
         }
         m_f5Prev = f6;
+    }
 
-        // F7 — disable dialogue FOV change.
-        bool f7 = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
-        if (f7 && !m_f7Prev) {
-            m_disableDialogueFov = !m_disableDialogueFov;
-            SaveConfig();
-            Output::send<LogLevel::Verbose>(
-                STR("[ImmDlg] disable dialogue FOV change (F7) -> {}\n"),
-                m_disableDialogueFov ? STR("YES (keep non-dialogue FOV)") : STR("no (game's dialogue FOV shift applies)"));
+    bool m_lookAtPropsDumped = false;
+    void DumpLookAtModifierProps() {
+        if (m_lookAtPropsDumped) return;
+        if (m_lookAtModifiers.empty()) return;
+        // Find first non-CDO instance (skip class defaults).
+        UObject* target = nullptr;
+        for (UObject* m : m_lookAtModifiers) {
+            if (!m) continue;
+            StringType n = m->GetName();
+            if (n.find(STR("Default__")) != StringType::npos) continue;
+            target = m; break;
         }
-        m_f7Prev = f7;
+        if (!target) return;
+        m_lookAtPropsDumped = true;
+        // Cache the Alpha property so we can write it directly every frame in dialogue —
+        // the log confirms Alpha=1 while modifier is active, and DisableModifier isn't
+        // fully snapping it off. Writing Alpha=0 directly is the surest kill.
+        m_lookAtAlphaProp = target->GetPropertyByNameInChain(STR("Alpha"));
+        UClass* cls = target->GetClassPrivate();
+        Output::send<LogLevel::Verbose>(STR("[ImmDlg] LOOKAT-MOD props on {}:\n"), target->GetFullName());
+        int n = 0;
+        for (UStruct* w = cls; w && n < 200; w = w->GetSuperStruct()) {
+            StringType wn = w->GetName();
+            for (FProperty* p : TFieldRange<FProperty>(w, EFieldIterationFlags::None)) {
+                if (!p || n >= 200) break;
+                // Best-effort read of first 4 bytes as float and 1 byte as bool for
+                // primitive types.
+                uint8_t* base = p->ContainerPtrToValuePtr<uint8_t>(target);
+                StringType ptype = p->GetClass().GetName();
+                float fv = 0.f; int bv = -1;
+                if (base) {
+                    if (ptype == StringType(STR("FloatProperty"))) fv = *reinterpret_cast<float*>(base);
+                    else if (ptype == StringType(STR("BoolProperty"))) bv = *reinterpret_cast<bool*>(base) ? 1 : 0;
+                }
+                Output::send<LogLevel::Verbose>(
+                    STR("[ImmDlg]   LOOKAT {}.{} class={} off={} f={} b={}\n"),
+                    wn, p->GetName(), ptype, p->GetOffset_ForInternal(), fv, bv);
+                n++;
+            }
+        }
     }
 
     void ApplyCameraCenteringToggle(bool inDlg) {
         if (!m_camCenteringDisabled || !inDlg) return;
-        // Rescan every ~2s for CameraModifier_LookAt instances (game may add/remove them on
-        // dialogue enter/exit or per-NPC).
+        // Rescan strategy: while in dialogue, if we don't have any modifiers yet, scan
+        // EVERY frame (they may not exist at the exact moment we detected inDlg — the
+        // game spawns them a frame or two later). Once we find them, back off to every
+        // 2s (they persist for the whole dialogue session). Fixes the "camera centers on
+        // NPC for a second before releasing" symptom on dialogue entry.
         uint64_t now = GetTickCount64();
-        if (m_lookAtModifiers.empty() || (now - m_lastLookAtRescanMs) > 2000) {
+        bool needScan = m_lookAtModifiers.empty() || (now - m_lastLookAtRescanMs) > 2000;
+        if (needScan) {
             m_lastLookAtRescanMs = now;
             m_lookAtModifiers.clear();
             UObjectGlobals::FindAllOf(STR("CameraModifier_LookAt"), m_lookAtModifiers);
@@ -1985,30 +2466,78 @@ public:
             }
         }
         if (!m_disableModifierFn) return;
+        DumpLookAtModifierProps();
         // Call DisableModifier(true) on every instance every frame — game may re-enable.
+        // ALSO call APlayerCameraManager::RemoveCameraModifier(mod) so the modifier is
+        // fully removed from the manager's ModifierList (not just disabled).
+        // ALSO write Alpha=0 directly on the modifier — log confirms DisableModifier isn't
+        // actually zeroing Alpha in STALKER 2's LookAt subclass.
         for (UObject* mod : m_lookAtModifiers) {
             if (!mod) continue;
             struct { bool bImmediate; } p{true};
             mod->ProcessEvent(m_disableModifierFn, &p);
+            CamMgrRemoveModifier(mod);
+            if (m_lookAtAlphaProp) {
+                float* alpha = m_lookAtAlphaProp->ContainerPtrToValuePtr<float>(mod);
+                if (alpha) *alpha = 0.0f;
+            }
         }
     }
 
+    uint64_t m_lastXInputRetryMs = 0;
+    uint64_t m_lastGameInputRetryMs = 0;
     auto on_update() -> void override {
         UObject* pawn = GetPawn();
         if (!pawn) return;
+        // XInput import in the game exe / UE middleware DLLs is lazy — retry every ~1s
+        // until we successfully patch the IAT so the game's polls see zeroed left stick
+        // during dialogue (stops D-pad-equivalent dialogue option selection).
+        if (!g_xinputHooked) {
+            uint64_t now = GetTickCount64();
+            if (now - m_lastXInputRetryMs > 1000) {
+                m_lastXInputRetryMs = now;
+                InstallXInputHook();
+            }
+        }
+        // GameInput is what STALKER 2 actually reads — retry every second until we land
+        // the inline detour on GetCurrentReading (the GetGamepadState detour is chained
+        // from inside the reading hook on first successful invocation).
+        if (!g_gameInputHooked) {
+            uint64_t now = GetTickCount64();
+            if (now - m_lastGameInputRetryMs > 1000) {
+                m_lastGameInputRetryMs = now;
+                InstallGameInputHook();
+                if (g_gameInputHooked) {
+                    Output::send<LogLevel::Verbose>(STR("[ImmDlg] GameInput hook installed on retry\n"));
+                }
+            }
+        }
+        // Every 2s, log GetGamepadState call counts so we can verify the game routes
+        // through our hook (and confirm the vtable slot indices are correct).
+        {
+            static uint64_t lastLog = 0;
+            uint64_t now = GetTickCount64();
+            if (now - lastLog > 2000) {
+                lastLog = now;
+                Output::send<LogLevel::Verbose>(
+                    STR("[ImmDlg] GAMEINPUT-HOOK reading_calls={} reading_ok={} lastKind=0x{:x} gs_calls={} gs_fromGame={}\n"),
+                    g_giReadingCalls.load(), g_giReadingOkCalls.load(),
+                    g_giLastReadingKind.load(),
+                    g_giStateCalls.load(), g_giStateCallsFromGame.load());
+            }
+        }
         // Our own poll must bypass the lie hook — set thread-local guard around the call.
         tl_selfDialogueQuery = true;
         bool inDlg = CallBool(pawn, STR("IsInStaticDialog"));
         tl_selfDialogueQuery = false;
         g_inDialogue.store(inDlg, std::memory_order_relaxed);
 
-        // Resolve camera once (runs in AND out of dialogue so we can sample non-dialogue FOV).
-        ResolvePawnCamera(pawn);
+        ResolveCameraManager(pawn);
         ResolvePawnAnimInstance(pawn);
         ResolveShadowChain(pawn);
         ResolveBhChain(pawn);
         ResolveRotationControl(pawn);
-        ApplyFovPolicy(inDlg);
+        PatchDialogInputMapping();
         LogPcState(pawn, inDlg);
 
         // Hotkey polling every frame (works even outside dialogue).
@@ -2083,6 +2612,7 @@ public:
             ForceLocomotionData(moving, fwd, strafe);
             ForceShadowAnimState(moving);
             ForceBhLocomotion(moving, fwd, strafe);
+            ForceDummyLocomotion(moving, fwd, strafe);
         }
         // Comparison logging: dumps current anim-instance values every 500ms in BOTH dialogue
         // and non-dialogue. Walk outside dialogue -> see what "correct walking" looks like;

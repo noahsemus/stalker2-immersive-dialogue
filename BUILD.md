@@ -55,6 +55,17 @@ Launch the game, talk to an NPC: WASD to move, MOUSE to look. Check ue4ss\UE4SS.
 for `[ImmDlg]` lines. Expect a compile-fix pass first — send me the exact compiler
 errors and I'll correct the reflection API calls against your headers.
 
+## 5. Suggested companion mod: "No Dialogue Zoom"
+This mod does not touch the dialogue FOV zoom — that value lives in
+`CoreVariables.cfg` as `DialogFOVDefault` and every runtime override loses a frame
+war with the game's own writes. Install one of the Nexus "No Dialogue Zoom" paks
+alongside this DLL (pick the variant matching your normal in-game FOV):
+
+- https://www.nexusmods.com/stalker2heartofchornobyl/mods/71
+- https://www.nexusmods.com/stalker2heartofchornobyl/mods/1933
+
+Drop the .pak in `...\S.T.A.L.K.E.R. 2 Heart of Chornobyl\Stalker2\Content\Paks\~mods\`.
+
 ## Tuning (top of dllmain.cpp)
 - WALK_SCALE  (movement speed)
 - MOUSE_SENS  (look sensitivity)
