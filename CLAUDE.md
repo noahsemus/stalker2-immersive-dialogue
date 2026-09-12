@@ -2,7 +2,9 @@
 
 Purpose: UE4SS C++ mod for **S.T.A.L.K.E.R. 2 (UE5.5)**. During interactive NPC dialogue, injects free WASD movement + raw-mouse look into the player pawn (UClass `PC`, `/Script/Stalker2.PC`) via UE4SS reflection, gated on `PC:IsInStaticDialog()`.
 
-Current shipped state: **v1.0** on Nexus (<https://www.nexusmods.com/stalker2heartofchornobyl/mods/2698>) and GitHub releases. First Nexus release cut on 2026-09-11; the gesture-camera fix ("v1.1" work in earlier commits) is folded into that v1.0 tag rather than shipped as a separate version.
+Current shipped state: **v1.0.2** on Nexus (<https://www.nexusmods.com/stalker2heartofchornobyl/mods/2698>) and GitHub releases. First Nexus release (v1.0) cut on 2026-09-11; the gesture-camera fix ("v1.1" work in earlier commits) is folded into that v1.0 tag. v1.0.1 (2026-09-12): `IsUnreachable()` check on the LookAt modifier loop. v1.0.2 (2026-09-12): the `Resolve*` cache calls in `on_update` are gated on `inDlg` — they used to re-run one tick after every dialogue exit and cache the current world's camera manager / mesh / anim instances, which a subsequent save load destroyed; `IsUnreachable()` doesn't catch freed slots, so the next dialogue crashed in `RemoveCameraModifier`.
+
+**Change discipline (learned the hard way on 2026-09-12 — see memory `feedback_polish_regression_2026_09_12`):** one surgical diff per build on top of the shipped commit, tested by Noah before the next. Never introduce a UE4SS type/function the shipped build doesn't already call without its own single-purpose test build. `FWeakObjectPtr` in particular crashes this game (RE-UE4SS allocates serial numbers via a Kismet call). A full rewrite attempt lives on branch `polish-attempt-2026-09-12`; do not merge it.
 
 ## Layout
 ```

@@ -89,7 +89,7 @@ Slava Ukraini.
 
 ### Vortex
 
-1. Grab `ImmersiveDialogue-v1.0.zip` (from Nexus or this repo's Releases page)
+1. Grab the latest `ImmersiveDialogue-vX.Y.Z.zip` (from Nexus or this repo's Releases page)
    and drop it into Vortex.
 2. Deploy.
 3. Open Vortex's **UE4SS Load Order** tab. `ImmersiveDialogueCpp` will appear
