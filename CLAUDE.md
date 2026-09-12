@@ -2,18 +2,22 @@
 
 Purpose: UE4SS C++ mod for **S.T.A.L.K.E.R. 2 (UE5.5)**. During interactive NPC dialogue, injects free WASD movement + raw-mouse look into the player pawn (UClass `PC`, `/Script/Stalker2.PC`) via UE4SS reflection, gated on `PC:IsInStaticDialog()`.
 
+Current shipped state: **v1.0** on Nexus (<https://www.nexusmods.com/stalker2heartofchornobyl/mods/2698>) and GitHub releases. First Nexus release cut on 2026-09-11; the gesture-camera fix ("v1.1" work in earlier commits) is folded into that v1.0 tag rather than shipped as a separate version.
+
 ## Layout
 ```
 stalker2-immersive-dialogue\
   CMakeLists.txt                 root (adds RE-UE4SS + ImmersiveDialogueCpp)
   ImmersiveDialogueCpp\
-    CMakeLists.txt               builds main.dll, links UE4SS + user32
+    CMakeLists.txt               builds main.dll, links UE4SS + user32 + xinput
     dllmain.cpp                  raw-mouse WndProc hook + on_update reflection
   RE-UE4SS\                      cloned; do NOT commit; needs Epic-linked GitHub
   Output\                        CMake build tree (Visual Studio generator)
   BUILD.md                       install/run steps for the end user
   CLAUDE.md                      this file
 ```
+
+`config.ini` is generated next to the deployed DLL at first launch (game-side, not in the repo). Contains: `DisableCameraCentering`, `CameraCenteringToggleKey`, `MouseSensitivity`, `GamepadLookSensitivity`, `WalkSpeed`. All optional; missing keys use built-in defaults.
 
 ## Build (Shipping — the only config that matches STALKER 2's shipping CRT)
 ```
@@ -65,14 +69,38 @@ Header renames to watch for:
 - `Unreal/UClass.hpp` and `Unreal/UFunction.hpp` are forwarding shims that print deprecation warnings; the canonical path is `<Unreal/CoreUObject/UObject/Class.hpp>`. Non-blocking today.
 
 ## UE5.5 math types
-STALKER 2 is UE5.5 (LWC), so `FVector` / `FRotator` are `double`-based. dllmain.cpp defines local `FVectorD` / `FRotatorD` structs to match the wire layout when calling `AddMovementInput`, `AddControllerYawInput/PitchInput`, `GetControlRotation`. Do not swap them for `float` structs.
+STALKER 2 is UE5.5 (LWC), so `FVector` / `FRotator` are `double`-based. dllmain.cpp defines local `FVectorD` / `FRotatorD` structs to match the wire layout when calling `AddMovementInput`, `AddControllerYawInput/PitchInput`, `GetControlRotation`, and `GetSocketRotation`. Do not swap them for `float` structs.
 
-## Tuning knobs (top of `dllmain.cpp`)
-- `WALK_SCALE` — movement speed (default 0.35)
-- `MOUSE_SENS` — raw counts → yaw/pitch input (default 0.06)
+## Tuning knobs
+Runtime-configurable via the deployed `config.ini` (not source-file constants). Members live at the top of `ImmersiveDialogue` in `dllmain.cpp`:
+- `m_walkScale` — fraction of MaxWalkSpeed (default 0.15, `WalkSpeed` in config)
+- `m_mouseSens` — multiplied by in-game `MouseSensitivityCoef` (default 0.10, `MouseSensitivity` in config)
+- `m_padLookScale` — multiplied by in-game `GamepadSensitivityCoef` (default 0.4, `GamepadLookSensitivity` in config)
+- `m_camCenteringDisabled` (default true, `DisableCameraCentering`) and `m_camCenteringToggleVk` (default `VK_F6`, `CameraCenteringToggleKey`)
+
+Constants that are still source-only:
+- Gesture detector: `GESTURE_YAW_ENTRY_DEG = 2.5`, `GESTURE_YAW_EXIT_DEG = 0.6`, `GESTURE_TAIL_MS = 1000`, `GESTURE_BASELINE_LPF_ALPHA = 0.02`
+- CMC in-dialogue rotation rate: `DIALOGUE_YAW_RATE_DEG_PER_SEC = 180.0`
+- Mesh visual body-turn ramp: `MESH_YAW_RATE_DEG_PER_SEC = 240.0` (currently unused — the `ApplyMeshMovementRotation` call is commented out because mesh yaw couples to camera through the socket)
+
+## Gesture-camera fix (v1.0 shipped)
+Root cause: STALKER 2's FPS camera pipeline drags `ControlRotation` on every degree of actor yaw change. Default in-dialogue `bOrientRotationToMovement=true` rotates the actor on every strafe input → drags control rotation → camera view swings. Head-bone animation from an NPC gesture compounds through the mesh socket the camera is attached to.
+
+Fix, layered — all in `dllmain.cpp`, all wired up during dialogue only:
+1. `ApplyDialogueRotationControl` forces `bOrientRotationToMovement=false` on entry; `RestoreOutsideDialogueRotationControl` restores on exit.
+2. `ApplyDialogueRotationRate` slows CMC `RotationRate.Yaw` to 180°/sec as a safety net.
+3. `IsGestureAnimatingHead` runs each tick: reads `jnt_camera` socket yaw, subtracts actor yaw and our own mesh-yaw offset, compares to an LPF-drifted baseline with hysteresis (2.5° enter / 0.6° exit / 1000 ms tail).
+4. When the detector fires: `ApplyGestureBodyLock` sets `bOrient=false` (belt-and-suspenders), movement input is zeroed, and we engage `SetAbsolute(bAbsRot=true)` on the CameraComponent + a predictive per-tick `RelativeRotation` write. The engage captures the current camera-view-vs-ControlRotation offset and applies it to every write so the view doesn't snap when the lock engages.
+
+Dead ends recorded in memory (`~/.claude/projects/.../memory/project_v1_1_gesture_camera_fix.md`) — read before proposing any camera rework: SetAbsolute over full dialogue, per-tick RelativeRotation without prediction, mesh RelativeRotation ramp, StopMovementImmediately, defensive re-apply of pawn control flags.
 
 ## Install & run
 See `BUILD.md` for the end-user copy-the-DLL steps.
+
+### Vortex quirk to remember
+The STALKER 2 Vortex extension (Nexus mod 958, ChemBoy1) explicitly strips `enabled.txt` from UE4SS DLL archives (see extension source at `%APPDATA%\Vortex\plugins\STALKER 2 HoC Vortex Extension .../index.js`, `installDll`). It manages `mods.txt` via its **UE4SS Load Order** tab instead — but the tab only serializes to `mods.txt` when the user interacts with it (toggle, reorder, save). So a Vortex install deploys the DLL correctly but the mod stays inert until the user visits that tab. The README's Install → Vortex section walks users through this.
+
+Ship the ZIP with the flat `<ModName>/dlls/main.dll` structure (plus an `enabled.txt` marker for manual installers — Vortex will strip it, that's fine).
 
 ## Collaboration workflow (this project only)
 
