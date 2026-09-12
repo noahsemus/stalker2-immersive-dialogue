@@ -265,6 +265,12 @@ public:
     bool       m_camCtrlSaved       = false;
     bool       m_camCtrlSavedValue  = false;
     uint64_t   m_lastMovementInputMs = 0;
+    // Soft-ramp anim-facing input. See INPUT_RAMP_ALPHA in on_update.
+    double     m_smoothFwd    = 0.0;
+    double     m_smoothStrafe = 0.0;
+    bool       m_prevMoving   = false;
+    double     m_camEngageOffsetYaw   = 0.0;
+    double     m_camEngageOffsetPitch = 0.0;
     // Direct-owned controller rotation for dialogue. Initialized to the current
     // ControlRotation on dialogue entry, then accumulated by our own mouse/right-stick
     // deltas and written back via SetControlRotation every tick. This makes gesture-
@@ -940,6 +946,7 @@ public:
     UObject*   m_charMoveComp = nullptr;
     FProperty* m_propUseCtrlYaw = nullptr;   // on pawn — bool
     FProperty* m_propOrientToMove = nullptr; // on CMC   — bool
+    FProperty* m_propRotationRate = nullptr; // on CMC   — FRotator (double)
     bool m_rotationCtrlResolved = false;
 
     void ResolveRotationControl(UObject* pawn) {
@@ -957,37 +964,95 @@ public:
         }
         if (m_charMoveComp) {
             m_propOrientToMove = m_charMoveComp->GetPropertyByNameInChain(STR("bOrientRotationToMovement"));
+            m_propRotationRate = m_charMoveComp->GetPropertyByNameInChain(STR("RotationRate"));
         }
         Output::send<LogLevel::Verbose>(
-            STR("[ImmDlg] rotation control resolved: bUseCtrlYaw prop={}, CMC={}, bOrientToMove prop={}\n"),
+            STR("[ImmDlg] rotation control resolved: bUseCtrlYaw prop={}, CMC={}, bOrientToMove prop={}, RotationRate prop={}\n"),
             m_propUseCtrlYaw ? STR("ok") : STR("null"),
             m_charMoveComp   ? STR("ok") : STR("null"),
-            m_propOrientToMove ? STR("ok") : STR("null"));
+            m_propOrientToMove ? STR("ok") : STR("null"),
+            m_propRotationRate ? STR("ok") : STR("null"));
     }
 
-    // In dialogue: flip pawn's rotation control so body follows movement direction (like
-    // it does outside dialogue) instead of being locked to camera yaw.
-    void ApplyDialogueRotationControl(UObject* pawn) {
-        if (m_propUseCtrlYaw) {
-            bool* slot = m_propUseCtrlYaw->ContainerPtrToValuePtr<bool>(pawn);
-            if (slot) *slot = false;
-        }
+    // In dialogue: force bOrientRotationToMovement=false so the CMC doesn't rotate
+    // the pawn actor toward the movement direction. The game's dialogue-default
+    // for this flag is TRUE, and STALKER 2's FPS camera pipeline drags the
+    // ControlRotation (which the camera reads via bUsePawnControlRotation) along
+    // with every degree of actor yaw change — meaning every strafe would push
+    // the camera view. Killing that at the root, then providing the visible
+    // body-turn via mesh RelativeRotation (see ApplyMeshMovementRotation),
+    // gives the appearance of a strafing body without touching the ControlRotation.
+    // bUseControllerRotationYaw is left at the game's default; toggling it in
+    // dialogue produced no observable difference and risks fighting other systems.
+    void ApplyDialogueRotationControl(UObject* /*pawn*/) {
         if (m_propOrientToMove && m_charMoveComp) {
             bool* slot = m_propOrientToMove->ContainerPtrToValuePtr<bool>(m_charMoveComp);
-            if (slot) *slot = true;
+            if (slot) {
+                m_savedDialogOrient = *slot;
+                m_savedDialogOrientCaptured = true;
+                *slot = false;
+            }
         }
     }
-    void RestoreOutsideDialogueRotationControl(UObject* pawn) {
-        // Restore the defaults the game expects outside dialogue: body follows camera,
-        // no orient-to-movement (STALKER 2 is FPS, camera IS the body yaw).
-        if (m_propUseCtrlYaw) {
-            bool* slot = m_propUseCtrlYaw->ContainerPtrToValuePtr<bool>(pawn);
-            if (slot) *slot = true;
-        }
-        if (m_propOrientToMove && m_charMoveComp) {
+    void RestoreOutsideDialogueRotationControl(UObject* /*pawn*/) {
+        if (m_propOrientToMove && m_charMoveComp && m_savedDialogOrientCaptured) {
             bool* slot = m_propOrientToMove->ContainerPtrToValuePtr<bool>(m_charMoveComp);
-            if (slot) *slot = false;
+            if (slot) *slot = m_savedDialogOrient;
+            m_savedDialogOrientCaptured = false;
         }
+    }
+    bool m_savedDialogOrient          = true;
+    bool m_savedDialogOrientCaptured  = false;
+
+    // Gesture body-orient lock: while a gesture is animating the head bone, disable
+    // the CharacterMovementComponent's bOrientRotationToMovement flag so strafe
+    // input doesn't rotate the body. The camera-swing during gesture+strafe is
+    // caused by the compound of (body rotating via orient-to-move) × (head bone
+    // rotating via gesture animation) at the anim layer. Killing body rotation
+    // for the ~1s the gesture plays kills the compound. The character keeps
+    // strafing (translates sideways) — they just don't turn to face the strafe
+    // direction until the gesture ends. This is edge-triggered: write once on
+    // gesture entry (save prior value), restore once on exit.
+    bool m_gestureBodyLockActive = false;
+    bool m_gestureBodyLockSavedOrient = false;
+    void ApplyGestureBodyLock(bool wantLocked) {
+        if (wantLocked == m_gestureBodyLockActive) return;
+        if (!m_charMoveComp || m_charMoveComp->IsUnreachable() || !m_propOrientToMove) return;
+        bool* slot = m_propOrientToMove->ContainerPtrToValuePtr<bool>(m_charMoveComp);
+        if (!slot) return;
+        if (wantLocked) {
+            m_gestureBodyLockSavedOrient = *slot;
+            *slot = false;
+        } else {
+            *slot = m_gestureBodyLockSavedOrient;
+        }
+        m_gestureBodyLockActive = wantLocked;
+    }
+
+    // Slow the CMC's RotationRate while in dialogue. STALKER 2's default yaw
+    // rate is fast enough that the first tick of a new strafe input snaps the
+    // body toward movement direction visibly — reads as a "split-second jerk"
+    // on strafe start. Cutting yaw rate in dialogue softens that snap while
+    // still letting the body-turn feature work over a few frames. Edge-triggered
+    // on dialogue entry / exit like the other body helpers.
+    // FRotator layout in UE5.5 LWC is 3× double: Pitch, Yaw, Roll.
+    bool     m_rotationRateSlowed = false;
+    FRotatorD m_savedRotationRate{0.0, 0.0, 0.0};
+    static constexpr double DIALOGUE_YAW_RATE_DEG_PER_SEC = 180.0;
+    void ApplyDialogueRotationRate(bool inDlg) {
+        if (inDlg == m_rotationRateSlowed) return;
+        if (!m_charMoveComp || m_charMoveComp->IsUnreachable() || !m_propRotationRate) return;
+        FRotatorD* slot = m_propRotationRate->ContainerPtrToValuePtr<FRotatorD>(m_charMoveComp);
+        if (!slot) return;
+        if (inDlg) {
+            m_savedRotationRate = *slot;
+            FRotatorD slow = *slot;
+            slow.Yaw = DIALOGUE_YAW_RATE_DEG_PER_SEC;
+            *slot = slow;
+        } else {
+            *slot = m_savedRotationRate;
+        }
+        m_rotationRateSlowed = inDlg;
     }
 
     // Once-per-500ms diagnostic: log the dialogue-suspicion levers we can read on the pawn,
@@ -1428,22 +1493,34 @@ public:
     // Apply mesh rotation offset for movement direction. Called each frame in dialogue.
     // yawOffsetDeg = atan2(strafe, fwd) — 0 for pure fwd, +90 for pure right, -90 for pure left.
     // When moving==false, reset both meshes to baseline.
+    //
+    // Ramped rate-limited: mesh yaw approaches target at MESH_YAW_RATE_DEG_PER_SEC.
+    // A step-function apply (v0's original design) snapped the mesh ±90° in one
+    // frame on strafe start, which showed up as a visible camera jerk (the
+    // socket-attached camera has partial coupling to the mesh in STALKER 2's
+    // camera pipeline that `bUsePawnControlRotation` doesn't fully break).
+    // Ramping the mesh yaw at 180 °/s converts the snap into a smooth swing.
+    double m_currentMeshYawOffset = 0.0;
+    static constexpr double MESH_YAW_RATE_DEG_PER_SEC = 240.0;
     void ApplyMeshMovementRotation(bool moving, double yawOffsetDeg) {
         CacheMeshBaseRotations();
-        if (moving) {
-            if (m_pawnMesh && m_meshBaseCached) {
-                SetMeshRelativeYaw(m_pawnMesh, m_meshBaseYaw + yawOffsetDeg);
-            }
-            if (m_shadowMeshComp && m_shadowBaseCached) {
-                SetMeshRelativeYaw(m_shadowMeshComp, m_shadowBaseYaw + yawOffsetDeg);
-            }
-        } else {
-            if (m_pawnMesh && m_meshBaseCached) {
-                SetMeshRelativeYaw(m_pawnMesh, m_meshBaseYaw);
-            }
-            if (m_shadowMeshComp && m_shadowBaseCached) {
-                SetMeshRelativeYaw(m_shadowMeshComp, m_shadowBaseYaw);
-            }
+        double target = moving ? yawOffsetDeg : 0.0;
+        // Approximate per-frame delta assuming 60 fps; the mod's tick rate is
+        // the game's frame rate. If the game runs slower, ramp is slower — that
+        // shows as a slower body-turn, not a jerk, so no dt-tracking needed.
+        constexpr double dt = 1.0 / 60.0;
+        double maxStep = MESH_YAW_RATE_DEG_PER_SEC * dt;
+        double diff = target - m_currentMeshYawOffset;
+        while (diff > 180.0)  diff -= 360.0;
+        while (diff < -180.0) diff += 360.0;
+        if (diff >  maxStep) diff =  maxStep;
+        if (diff < -maxStep) diff = -maxStep;
+        m_currentMeshYawOffset += diff;
+        if (m_pawnMesh && m_meshBaseCached) {
+            SetMeshRelativeYaw(m_pawnMesh, m_meshBaseYaw + m_currentMeshYawOffset);
+        }
+        if (m_shadowMeshComp && m_shadowBaseCached) {
+            SetMeshRelativeYaw(m_shadowMeshComp, m_shadowBaseYaw + m_currentMeshYawOffset);
         }
     }
 
@@ -2349,7 +2426,25 @@ public:
     double m_gestureBoneBaselineYaw = 0.0;
     bool   m_gestureBaselineCaptured = false;
     UFunction* m_getSocketRotFn = nullptr;
-    static constexpr double GESTURE_YAW_THRESHOLD_DEG = 3.0;
+    ULONGLONG m_gestureLastAboveExitMs = 0;
+    bool      m_gestureActive = false;
+    // Hysteresis with an adaptive baseline. Head bone yaw at rest during dialogue
+    // isn't fixed — it slowly drifts as the game re-aims Skif at different NPCs /
+    // as idle anims progress. A fixed baseline captured on dialogue entry becomes
+    // wrong after a few seconds, and a single low threshold gets stuck permanently.
+    // Solution: while NOT in gesture state, low-pass-filter the head-bone yaw into
+    // the baseline. That tracks slow drift. Fast gestures never affect the baseline
+    // because we're in gesture state during them, and the LPF is frozen.
+    //   ENTRY (2.5°): low enough to catch the ramp before the swing hits the camera.
+    //   EXIT  (0.6°): well below any real gesture but above natural LPF residual.
+    //   TAIL (500 ms): covers internal troughs during a multi-peak gesture.
+    static constexpr double   GESTURE_YAW_ENTRY_DEG = 2.5;
+    static constexpr double   GESTURE_YAW_EXIT_DEG  = 0.6;
+    static constexpr ULONGLONG GESTURE_TAIL_MS = 1000;
+    // LPF coefficient — 0.02 ≈ 5 s time constant at 60 fps. Slow enough that a real
+    // gesture peak doesn't shift the baseline meaningfully across the ~50-100 ms
+    // it takes for the detector to trip.
+    static constexpr double   GESTURE_BASELINE_LPF_ALPHA = 0.02;
     bool IsGestureAnimatingHead(UObject* pawn) {
         if (!m_pawnMesh || m_pawnMesh->IsUnreachable()) return false;
         if (!m_getSocketRotFn) {
@@ -2366,12 +2461,15 @@ public:
             pawn->ProcessEvent(fn, &p);
             actorYaw = p.Ret.Yaw;
         }
-        double localHeadYaw = boneYaw - actorYaw;
-        // Normalize to -180..180
+        // Subtract our own mesh yaw offset so the detector measures head-bone
+        // animation independent of the visible body-turn we drive via
+        // ApplyMeshMovementRotation. Otherwise, ramping the mesh yaw during a
+        // strafe start crosses the gesture entry threshold and false-triggers
+        // "gesture is playing", which then cuts strafe input and freezes the
+        // character in dialogue.
+        double localHeadYaw = boneYaw - actorYaw - m_currentMeshYawOffset;
         while (localHeadYaw > 180.0)  localHeadYaw -= 360.0;
         while (localHeadYaw < -180.0) localHeadYaw += 360.0;
-        // Snapshot the baseline on the first tick of dialogue (whatever the rest
-        // offset is, that's zero for our purposes).
         if (!m_gestureBaselineCaptured) {
             m_gestureBoneBaselineYaw = localHeadYaw;
             m_gestureBaselineCaptured = true;
@@ -2379,7 +2477,27 @@ public:
         double delta = localHeadYaw - m_gestureBoneBaselineYaw;
         while (delta > 180.0)  delta -= 360.0;
         while (delta < -180.0) delta += 360.0;
-        return std::abs(delta) > GESTURE_YAW_THRESHOLD_DEG;
+        double absDelta = std::abs(delta);
+        ULONGLONG now = GetTickCount64();
+        if (absDelta > GESTURE_YAW_ENTRY_DEG) {
+            m_gestureActive = true;
+            m_gestureLastAboveExitMs = now;
+            return true;
+        }
+        if (m_gestureActive) {
+            if (absDelta > GESTURE_YAW_EXIT_DEG) {
+                m_gestureLastAboveExitMs = now;
+                return true;
+            }
+            if ((now - m_gestureLastAboveExitMs) < GESTURE_TAIL_MS) {
+                return true;
+            }
+            m_gestureActive = false;
+        }
+        // Not in gesture state — drift the baseline toward the current head bone
+        // yaw so slow rest-position changes don't accumulate into false positives.
+        m_gestureBoneBaselineYaw += GESTURE_BASELINE_LPF_ALPHA * delta;
+        return false;
     }
 
     // Camera decouple in dialogue via bUsePawnControlRotation (UE native path).
@@ -2630,6 +2748,20 @@ public:
         m_gestureBaselineCaptured = false;
         m_gestureBoneBaselineYaw = 0.0;
         m_getSocketRotFn = nullptr;
+        m_gestureLastAboveExitMs = 0;
+        m_gestureActive = false;
+        m_gestureBodyLockActive = false;
+        m_gestureBodyLockSavedOrient = false;
+        m_rotationRateSlowed = false;
+        m_savedRotationRate = {0.0, 0.0, 0.0};
+        m_propRotationRate = nullptr;
+        m_smoothFwd = 0.0;
+        m_smoothStrafe = 0.0;
+        m_prevMoving = false;
+        m_currentMeshYawOffset = 0.0;
+        m_savedDialogOrientCaptured = false;
+        m_camEngageOffsetYaw = 0.0;
+        m_camEngageOffsetPitch = 0.0;
         m_allDialogModifiers.clear();
         m_allModifiersDisableFn = nullptr;
         m_lastAllModifiersRescanMs = 0;
@@ -2799,6 +2931,21 @@ public:
             // touch to un-set SetAbsolute / restore body rotation.
             DisengageCameraAbsolute();
             DisengageBodyLock(pawn);
+            // Restore CMC RotationRate before we null m_propRotationRate.
+            ApplyDialogueRotationRate(false);
+            // Also restore bOrientRotationToMovement if a gesture happened to be
+            // active when the user closed dialogue.
+            ApplyGestureBodyLock(false);
+            // Restore the game's dialogue default bOrientRotationToMovement value.
+            RestoreOutsideDialogueRotationControl(pawn);
+            // Reset the mesh yaw to its baseline so the body isn't left twisted.
+            if (m_pawnMesh && m_meshBaseCached && !m_pawnMesh->IsUnreachable()) {
+                SetMeshRelativeYaw(m_pawnMesh, m_meshBaseYaw);
+            }
+            if (m_shadowMeshComp && m_shadowBaseCached && !m_shadowMeshComp->IsUnreachable()) {
+                SetMeshRelativeYaw(m_shadowMeshComp, m_shadowBaseYaw);
+            }
+            m_currentMeshYawOffset = 0.0;
             InvalidateCachesOnDialogueExit();
             m_prevInDialog = false;
             g_dx.exchange(0); g_dy.exchange(0);
@@ -2818,6 +2965,26 @@ public:
         PatchDialogInputMapping();
         // v1.1: camera decouple during dialogue. Body is never touched.
         ApplyGestureLockPerTick(pawn, inDlg);
+        // v1.1: soften the CMC's yaw rotation rate while in dialogue so the
+        // first-tick body-orient snap on a fresh strafe input reads smooth
+        // rather than as a split-second camera jerk. Kept as a safety net even
+        // though bOrientRotationToMovement is now forced off in dialogue.
+        ApplyDialogueRotationRate(inDlg);
+        // v1.1 (also): force bOrientRotationToMovement=false in dialogue so the
+        // CMC never rotates the actor. STALKER 2 drags ControlRotation with
+        // every degree of actor yaw, which the camera then reads via
+        // bUsePawnControlRotation — that's the root cause of the strafe-start
+        // camera drag we chased across many iterations. Visual body-turn is
+        // provided independently by ApplyMeshMovementRotation below.
+        if (inDlg && !m_savedDialogOrientCaptured) {
+            ApplyDialogueRotationControl(pawn);
+        }
+        // Camera decouple was previously edge-triggered on dialogue entry, but
+        // that broke the vanilla NPC-centering smooth-zoom on entry (SetAbsolute
+        // makes the camera ignore that modifier's gradual view update) and
+        // introduced a persistent stutter that continued past gesture end
+        // (some game code fights our per-tick RelativeRotation write). Now
+        // gated on gesture state instead — see below, near IsGestureAnimatingHead.
 
         // Hotkey polling every frame (works even outside dialogue).
         PollHotkeys();
@@ -2861,12 +3028,81 @@ public:
         if (padMoveX != 0.0) strafe = padMoveX;
         bool moving = (fwd != 0.0 || strafe != 0.0);
         if (moving) m_lastMovementInputMs = GetTickCount64();
-        // Gesture fallback: if a gesture is animating the head bone (detected via bone
-        // yaw deviating from actor yaw), suppress WASD/left-stick movement this tick.
-        // The gesture+strafe interaction produces a camera hijack that we can't fix
-        // via reflection alone. Suppressing movement input during gestures gives up
-        // ~1s of walking to prevent the wild camera swing. Look input still works.
-        if (moving && IsGestureAnimatingHead(pawn)) {
+        // Diagnostic + defensive re-apply on strafe start. Hypothesis: STALKER 2
+        // resets bUsePawnControlRotation and/or CMC RotationRate when movement
+        // events fire, undoing our dialogue-entry edge-triggered writes and
+        // briefly recoupling the camera to bone rotation → "split-second jerk".
+        // On the false→true movement transition, re-assert both properties AND
+        // log their pre-write values so we can see whether they were drifting.
+        m_prevMoving = moving;
+        // Gesture fallback. Belt-and-suspenders during a detected gesture:
+        //   1. Turn OFF bOrientRotationToMovement so residual velocity can't rotate
+        //      the body via the CMC.
+        //   2. Zero the movement input this tick so the character stops walking.
+        // Killing body-rotation alone doesn't stop the camera swing (the head bone
+        // gesture drives it directly through the socket-attached camera even when
+        // the body is stationary). Killing input alone leaves body-orient to keep
+        // rotating from residual velocity. We need both.
+        bool gesture = IsGestureAnimatingHead(pawn);
+        ApplyGestureBodyLock(gesture);
+        // Camera decouple during gesture: SetAbsolute(rot=true) so head-bone
+        // rotation doesn't drag the view. Engaged edge-triggered on gesture
+        // start, disengaged on gesture end (respecting the tail from the
+        // detector so we don't flicker between states).
+        //   Engage:  SetAbsolute(rot=true), snapshot the RelativeRotation
+        //            baseline (0,0,0 is fine since it's about to be overwritten
+        //            each tick from ControlRotation + mouse deltas below).
+        //   Disengage: reset RelativeRotation to (0,0,0) and clear the flag so
+        //              the camera re-couples to the parent socket cleanly.
+        if (gesture && !m_camAbsoluteApplied) {
+            ResolvePawnCameraForDialogueLock(pawn);
+            if (m_pawnCamera && !m_pawnCamera->IsUnreachable()) {
+                if (!m_camSetAbsoluteFn) {
+                    m_camSetAbsoluteFn = m_pawnCamera->GetFunctionByNameInChain(FName(STR("SetAbsolute")));
+                }
+                if (!m_camRelativeRotProp) {
+                    m_camRelativeRotProp = m_pawnCamera->GetPropertyByNameInChain(STR("RelativeRotation"));
+                }
+                // Capture the offset between current camera view and current
+                // control rotation. By the time the detector fires (delta >
+                // entry threshold), the bone has already pulled the camera
+                // by ~entry-threshold degrees. Seeding RelativeRotation with
+                // plain ControlRotation would snap the view BACK by that amount.
+                // Instead, apply the captured offset to every predictive write
+                // for the duration of the gesture — camera view stays exactly
+                // where it was at engage, then tracks the mouse from there.
+                FRotatorD camView{0.0, 0.0, 0.0};
+                if (m_camMgr && !m_camMgr->IsUnreachable()) {
+                    if (UFunction* fn = m_camMgr->GetFunctionByNameInChain(FName(STR("GetCameraRotation")))) {
+                        struct { FRotatorD Ret; } p{{0,0,0}};
+                        m_camMgr->ProcessEvent(fn, &p);
+                        camView = p.Ret;
+                    }
+                }
+                FRotatorD ctrl = ControlRotation(pawn);
+                m_camEngageOffsetYaw   = camView.Yaw   - ctrl.Yaw;
+                m_camEngageOffsetPitch = camView.Pitch - ctrl.Pitch;
+                while (m_camEngageOffsetYaw >  180.0) m_camEngageOffsetYaw -= 360.0;
+                while (m_camEngageOffsetYaw < -180.0) m_camEngageOffsetYaw += 360.0;
+                if (m_camRelativeRotProp) {
+                    FRotatorD seed{ctrl.Pitch + m_camEngageOffsetPitch,
+                                   ctrl.Yaw   + m_camEngageOffsetYaw,
+                                   0.0};
+                    FRotatorD* slot = m_camRelativeRotProp->ContainerPtrToValuePtr<FRotatorD>(m_pawnCamera);
+                    if (slot) *slot = seed;
+                }
+                if (m_camSetAbsoluteFn) {
+                    struct { bool bAbsLoc; bool bAbsRot; bool bAbsScale; } p{false, true, false};
+                    m_pawnCamera->ProcessEvent(m_camSetAbsoluteFn, &p);
+                    m_camAbsoluteApplied = true;
+                }
+            }
+        } else if (!gesture && m_camAbsoluteApplied) {
+            DisengageCameraAbsolute();
+            m_camEngageOffsetYaw = 0.0;
+            m_camEngageOffsetPitch = 0.0;
+        }
+        if (gesture && moving) {
             fwd = 0.0; strafe = 0.0; moving = false;
         }
         if (moving) {
@@ -2879,22 +3115,44 @@ public:
             if (fwd    != 0.0) AddMovement(pawn, fX, fY, (float)(fwd    * fwdScale));
             if (strafe != 0.0) AddMovement(pawn, rX, rY, (float)(strafe * m_walkScale));
         }
+        // Visual body-turn via mesh rotation is DISABLED. Rotating the main
+        // mesh's RelativeRotation.Yaw was intended to give a visible body-turn
+        // without touching actor yaw, but the camera's jnt_camera socket lives
+        // ON the mesh — so mesh yaw pulls the camera view with it just as
+        // strongly as actor yaw did. Kept the tracking variable + gesture-
+        // detector subtraction infrastructure for a possible future path where
+        // we rotate only the SHADOW mesh (which doesn't carry the socket).
+        // atan2(strafe, fwd): 0=forward, ±90=pure strafe, ±180=backward.
+        // double moveYawOffset = moving
+        //     ? std::atan2(strafe, fwd) * 180.0 / 3.14159265358979323846 : 0.0;
+        // ApplyMeshMovementRotation(moving, moveYawOffset);
         MaybeFireFootstep(moving);
         // Force anim state overrides (in dialogue). Idle/dialogue flags always false; walking
         // flags true only when actually moving. Locomotion + shadow driven by numeric writes.
         if (inDlg) {
-            // Call the game's own input-feed primitive with the raw WASD/stick vector.
+            // Soft-ramp the anim-facing input values. Feeding raw step-function 0→1
+            // strafe on the first tick of movement makes the anim graph transition
+            // from idle to strafe pose in a single frame, which reads as the
+            // "split-second jerk" on strafe start. Interpolating over ~5 frames
+            // (alpha 0.25 ≈ 80 ms to 63% at 60 fps) gives the graph time to blend
+            // smoothly. AddMovementInput above uses the raw values because the CMC
+            // already ramps velocity via its own acceleration curve.
+            constexpr double INPUT_RAMP_ALPHA = 0.25;
+            m_smoothFwd    += (fwd    - m_smoothFwd)    * INPUT_RAMP_ALPHA;
+            m_smoothStrafe += (strafe - m_smoothStrafe) * INPUT_RAMP_ALPHA;
+            bool smoothMoving = (std::abs(m_smoothFwd) > 0.01 || std::abs(m_smoothStrafe) > 0.01);
+            // Call the game's own input-feed primitive with the smoothed WASD/stick vector.
             // Outside dialogue the game's input pipeline calls this every frame; in dialogue
             // it's gated, so anim state (Direction/Gait) never gets the correct directional
             // signal. Feeding it ourselves lets the game's natural locomotion pipeline drive
             // the anim graph — same class of bypass as the Wwise footstep fix.
             //   Pawn-relative convention: X=forward, Y=right (strafe), Z=0
-            SetMoveVector(pawn, fwd, strafe, 0.0);
-            ForceAnimState(moving);
-            ForceLocomotionData(moving, fwd, strafe);
-            ForceShadowAnimState(moving);
-            ForceBhLocomotion(moving, fwd, strafe);
-            ForceDummyLocomotion(moving, fwd, strafe);
+            SetMoveVector(pawn, m_smoothFwd, m_smoothStrafe, 0.0);
+            ForceAnimState(smoothMoving);
+            ForceLocomotionData(smoothMoving, m_smoothFwd, m_smoothStrafe);
+            ForceShadowAnimState(smoothMoving);
+            ForceBhLocomotion(smoothMoving, m_smoothFwd, m_smoothStrafe);
+            ForceDummyLocomotion(smoothMoving, m_smoothFwd, m_smoothStrafe);
         }
 
         // ---- Look: mouse (smoothed) + right stick ----
@@ -2917,6 +3175,22 @@ public:
 
         if (yawVal   != 0.0) AddYaw  (pawn, (float)yawVal);
         if (pitchVal != 0.0) AddPitch(pawn, (float)pitchVal);
+
+        // Predictive camera RelativeRotation write. SetAbsolute(rot=true) was
+        // set on dialogue entry above → camera world rotation now comes from
+        // this RelativeRotation. Reading ControlRotation NOW gives us the
+        // previous frame's post-input value (the PlayerController tick
+        // applying our AddYaw/AddPitch runs after our on_update). Adding this
+        // frame's yawVal/pitchVal predicts what ControlRotation will be after
+        // this frame's input processes, so the camera view renders WITHOUT
+        // 1-frame lag against the mouse.
+        if (m_camAbsoluteApplied && m_camRelativeRotProp && m_pawnCamera && !m_pawnCamera->IsUnreachable()) {
+            FRotatorD ctrl = ControlRotation(pawn);
+            ctrl.Yaw   += yawVal   + m_camEngageOffsetYaw;
+            ctrl.Pitch += pitchVal + m_camEngageOffsetPitch;
+            FRotatorD* slot = m_camRelativeRotProp->ContainerPtrToValuePtr<FRotatorD>(m_pawnCamera);
+            if (slot) *slot = ctrl;
+        }
     }
 };
 
