@@ -419,7 +419,7 @@ public:
 
     ImmersiveDialogue() {
         ModName        = STR("ImmersiveDialogue");
-        ModVersion     = STR("1.0");
+        ModVersion     = STR("1.0.1");
         ModAuthors     = STR("Noah");
         ModDescription = STR("Free movement + mouse/pad look during NPC dialogue.");
     }
@@ -2731,7 +2731,7 @@ public:
         m_disableModifierFn = nullptr;
         m_enableModifierFn = nullptr;
         m_lookAtAlphaProp = nullptr;
-        m_lookAtPropsDumped = false;
+        m_lookAtAlphaResolved = false;
         m_mainAnimPropsDumped = false;
         m_lastLookAtRescanMs = 0;
         m_pawnCamera = nullptr;
@@ -2781,46 +2781,27 @@ public:
         m_f5Prev = pressed;
     }
 
-    bool m_lookAtPropsDumped = false;
-    void DumpLookAtModifierProps() {
-        if (m_lookAtPropsDumped) return;
+    // Cache the Alpha property once per dialogue so per-tick disable can write it
+    // directly (safest kill — DisableModifier alone doesn't zero Alpha in STALKER 2's
+    // LookAt subclass). The previous version also dumped every property on the
+    // modifier for diagnostics; that read raw memory at arbitrary offsets and
+    // wasn't needed functionally, so it was removed after a crash report where
+    // the enumeration itself is not what caused the crash — but stripping the
+    // dump narrows the code that runs on the modifier to only well-typed calls.
+    bool m_lookAtAlphaResolved = false;
+    void ResolveLookAtAlphaProp() {
+        if (m_lookAtAlphaResolved) return;
         if (m_lookAtModifiers.empty()) return;
-        // Find first non-CDO instance (skip class defaults).
         UObject* target = nullptr;
         for (UObject* m : m_lookAtModifiers) {
-            if (!m) continue;
+            if (!m || m->IsUnreachable()) continue;
             StringType n = m->GetName();
             if (n.find(STR("Default__")) != StringType::npos) continue;
             target = m; break;
         }
         if (!target) return;
-        m_lookAtPropsDumped = true;
-        // Cache the Alpha property so we can write it directly every frame in dialogue —
-        // the log confirms Alpha=1 while modifier is active, and DisableModifier isn't
-        // fully snapping it off. Writing Alpha=0 directly is the surest kill.
         m_lookAtAlphaProp = target->GetPropertyByNameInChain(STR("Alpha"));
-        UClass* cls = target->GetClassPrivate();
-        Output::send<LogLevel::Verbose>(STR("[ImmDlg] LOOKAT-MOD props on {}:\n"), target->GetFullName());
-        int n = 0;
-        for (UStruct* w = cls; w && n < 200; w = w->GetSuperStruct()) {
-            StringType wn = w->GetName();
-            for (FProperty* p : TFieldRange<FProperty>(w, EFieldIterationFlags::None)) {
-                if (!p || n >= 200) break;
-                // Best-effort read of first 4 bytes as float and 1 byte as bool for
-                // primitive types.
-                uint8_t* base = p->ContainerPtrToValuePtr<uint8_t>(target);
-                StringType ptype = p->GetClass().GetName();
-                float fv = 0.f; int bv = -1;
-                if (base) {
-                    if (ptype == StringType(STR("FloatProperty"))) fv = *reinterpret_cast<float*>(base);
-                    else if (ptype == StringType(STR("BoolProperty"))) bv = *reinterpret_cast<bool*>(base) ? 1 : 0;
-                }
-                Output::send<LogLevel::Verbose>(
-                    STR("[ImmDlg]   LOOKAT {}.{} class={} off={} f={} b={}\n"),
-                    wn, p->GetName(), ptype, p->GetOffset_ForInternal(), fv, bv);
-                n++;
-            }
-        }
+        m_lookAtAlphaResolved = true;
     }
 
     // Broader modifier suppression — during dialogue, walk EVERY UObject whose class
@@ -2893,22 +2874,46 @@ public:
                 }
             }
         }
-        if (!m_disableModifierFn) return;
-        DumpLookAtModifierProps();
-        // Call DisableModifier(true) on every instance every frame — game may re-enable.
-        // ALSO call APlayerCameraManager::RemoveCameraModifier(mod) so the modifier is
-        // fully removed from the manager's ModifierList (not just disabled).
-        // ALSO write Alpha=0 directly on the modifier — log confirms DisableModifier isn't
-        // actually zeroing Alpha in STALKER 2's LookAt subclass.
+        if (!m_disableModifierFn || m_disableModifierFn->IsUnreachable()) {
+            // UFunction pointer went stale — invalidate cache and let the scan
+            // re-populate on the next tick.
+            m_lookAtModifiers.clear();
+            m_disableModifierFn = nullptr;
+            m_lookAtAlphaProp = nullptr;
+            m_lookAtAlphaResolved = false;
+            return;
+        }
+        ResolveLookAtAlphaProp();
+        // Call DisableModifier(true) + RemoveCameraModifier + Alpha=0 on every
+        // instance every frame — game may re-enable, and Alpha=0 is the surest
+        // visual kill (log confirmed DisableModifier alone doesn't zero it in
+        // STALKER 2's LookAt subclass).
+        //
+        // Robustness: check IsUnreachable() on every modifier before touching it.
+        // v1.0 crashed on ProcessEvent(DisableModifier, ...) when STALKER 2 GC'd
+        // a modifier mid-dialogue (typically on the second-or-later dialogue in
+        // a play session, after some intervening menu/PDA activity). If ANY
+        // modifier in the list is stale, invalidate the whole list so the next
+        // tick's scan repopulates from live pointers.
+        bool anyStale = false;
         for (UObject* mod : m_lookAtModifiers) {
-            if (!mod) continue;
+            if (!mod || mod->IsUnreachable()) { anyStale = true; continue; }
             struct { bool bImmediate; } p{true};
             mod->ProcessEvent(m_disableModifierFn, &p);
-            CamMgrRemoveModifier(mod);
+            if (m_camMgr && !m_camMgr->IsUnreachable() && m_camMgrRemoveMod
+                && !m_camMgrRemoveMod->IsUnreachable()) {
+                CamMgrRemoveModifier(mod);
+            }
             if (m_lookAtAlphaProp) {
                 float* alpha = m_lookAtAlphaProp->ContainerPtrToValuePtr<float>(mod);
                 if (alpha) *alpha = 0.0f;
             }
+        }
+        if (anyStale) {
+            m_lookAtModifiers.clear();
+            m_disableModifierFn = nullptr;
+            m_lookAtAlphaProp = nullptr;
+            m_lookAtAlphaResolved = false;
         }
     }
 
