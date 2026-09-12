@@ -419,7 +419,7 @@ public:
 
     ImmersiveDialogue() {
         ModName        = STR("ImmersiveDialogue");
-        ModVersion     = STR("1.0.1");
+        ModVersion     = STR("1.0.2");
         ModAuthors     = STR("Noah");
         ModDescription = STR("Free movement + mouse/pad look during NPC dialogue.");
     }
@@ -2962,11 +2962,20 @@ public:
             return;
         }
 
-        ResolveCameraManager(pawn);
-        ResolvePawnAnimInstance(pawn);
-        ResolveShadowChain(pawn);
-        ResolveBhChain(pawn);
-        ResolveRotationControl(pawn);
+        // v1.0.2: resolve ONLY while in dialogue. Previously these ran on the first
+        // tick after every dialogue exit (outside dialogue), re-caching the camera
+        // manager / mesh / anim instances / CMC of the CURRENT world. Loading a
+        // different save then destroyed those objects, IsUnreachable() didn't catch
+        // the freed slots, and the next dialogue's RemoveCameraModifier call on the
+        // dead PlayerCameraManager crashed (crash_2026_09_12_13_41_37). Caching only
+        // in dialogue + the existing invalidate-on-exit means nothing survives a load.
+        if (inDlg) {
+            ResolveCameraManager(pawn);
+            ResolvePawnAnimInstance(pawn);
+            ResolveShadowChain(pawn);
+            ResolveBhChain(pawn);
+            ResolveRotationControl(pawn);
+        }
         PatchDialogInputMapping();
         // v1.1: camera decouple during dialogue. Body is never touched.
         ApplyGestureLockPerTick(pawn, inDlg);
