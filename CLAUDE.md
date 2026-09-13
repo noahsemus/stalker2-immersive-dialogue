@@ -96,6 +96,16 @@ Fix, layered — all in `dllmain.cpp`, all wired up during dialogue only:
 
 Dead ends recorded in memory (`~/.claude/projects/.../memory/project_v1_1_gesture_camera_fix.md`) — read before proposing any camera rework: SetAbsolute over full dialogue, per-tick RelativeRotation without prediction, mesh RelativeRotation ramp, StopMovementImmediately, defensive re-apply of pawn control flags.
 
+## Release checklist (only when Noah says "cut a release")
+
+1. Noah has confirmed the candidate in-game. Version string in `dllmain.cpp` is the final `X.Y.Z`.
+2. Commit each fix on `main`; nothing is committed/tagged before Noah asks.
+3. Stage `ImmersiveDialogueCpp\enabled.txt` + `ImmersiveDialogueCpp\dlls\main.dll` (from the last Shipping build), zip as `ImmersiveDialogue-vX.Y.Z.zip`, copy the DLL as `main-vX.Y.Z.dll`.
+4. Update the "Current shipped state" line above, commit docs, `git tag -a vX.Y.Z`, push `main` + tag.
+5. `gh release create vX.Y.Z <zip> <dll> --title vX.Y.Z --notes-file <notes>` — notes in plain player language.
+6. **Delete `Stalker2\Binaries\Win64\ue4ss\Mods\ImmersiveDialogueCpp\` from the game folder** (game must not be running). Mandatory, no exceptions: Noah plays real playthroughs on the Nexus/Vortex copy, and the dev DLL is written over Vortex's hardlink. Say in the summary that it was done.
+7. Copy the zip to `C:\Users\noahs\Downloads\` and tell Noah it's ready for the Nexus upload (mod 2698); the release notes double as the Nexus changelog.
+
 ## Install & run
 See `BUILD.md` for the end-user copy-the-DLL steps.
 
