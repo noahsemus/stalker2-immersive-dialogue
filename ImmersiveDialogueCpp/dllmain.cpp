@@ -294,7 +294,14 @@ public:
 
     std::wstring ConfigPath() {
         // Config lives next to the mod DLL for MCM-mod parity with other UE4SS mods.
-        wchar_t buf[MAX_PATH]; GetModuleFileNameW((HMODULE)GetModuleHandleW(L"main.dll"), buf, MAX_PATH);
+        // v1.0.3: resolve OUR module by address. Every UE4SS C++ mod ships as
+        // `<Mod>/dlls/main.dll`, so GetModuleHandleW(L"main.dll") returns whichever
+        // mod's DLL loaded first — with another C++ mod installed the config was read
+        // from / written to that mod's folder instead of ours.
+        HMODULE self = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(&g_inDialogue), &self);
+        wchar_t buf[MAX_PATH] = {0}; GetModuleFileNameW(self, buf, MAX_PATH);
         std::wstring p(buf);
         size_t slash = p.find_last_of(L'\\');
         if (slash != std::wstring::npos) p.resize(slash + 1);
@@ -375,7 +382,14 @@ public:
         m_configLoaded = true;
         std::wstring path = ConfigPath();
         std::ifstream f(path.c_str());
-        if (!f) return;
+        if (!f) {
+            // v1.0.3: no config yet — write the defaults so users can find and edit
+            // the file. Previously it only appeared after the first F6 press.
+            SaveConfig();
+            Output::send<LogLevel::Verbose>(STR("[ImmDlg] config.ini created with defaults at {}\n"), path);
+            return;
+        }
+        Output::send<LogLevel::Verbose>(STR("[ImmDlg] config.ini loaded from {}\n"), path);
         std::string line;
         while (std::getline(f, line)) {
             auto eq = line.find('=');
@@ -419,7 +433,7 @@ public:
 
     ImmersiveDialogue() {
         ModName        = STR("ImmersiveDialogue");
-        ModVersion     = STR("1.0.2");
+        ModVersion     = STR("1.0.3");
         ModAuthors     = STR("Noah");
         ModDescription = STR("Free movement + mouse/pad look during NPC dialogue.");
     }
@@ -464,6 +478,29 @@ public:
 
     static UFunction* Fn(UObject* o, const wchar_t* name) {
         return o->GetFunctionByNameInChain(FName(name));
+    }
+    // True when `obj`'s class, or any ancestor, is named `className`.
+    static bool ClassChainHas(UObject* obj, const wchar_t* className) {
+        if (!obj) return false;
+        for (UStruct* w = obj->GetClassPrivate(); w; w = w->GetSuperStruct()) {
+            if (w->GetName() == StringType(className)) return true;
+        }
+        return false;
+    }
+    // v1.0.3: the game's IsInStaticDialog reads through [PC+0x650] with no null
+    // check. That pointer is null while the player is being torn down (quit, sleep,
+    // load), and our per-tick poll took the game down there (crash dumps 2026-09-12
+    // 20:07 on v1.0.2 and 20:10 on a candidate: same fault, same call site).
+    static constexpr size_t PC_DIALOG_STATE_PTR_OFFSET = 0x650;
+    bool m_dlgStateWasNull = false;
+    bool DialogStateReady(UObject* pawn) {
+        void* p = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(pawn) + PC_DIALOG_STATE_PTR_OFFSET);
+        if ((p == nullptr) != m_dlgStateWasNull) {
+            m_dlgStateWasNull = (p == nullptr);
+            Output::send<LogLevel::Verbose>(STR("[ImmDlg] PC+0x650 is now {}\n"),
+                                            m_dlgStateWasNull ? STR("NULL (IsInStaticDialog poll skipped)") : STR("set"));
+        }
+        return p != nullptr;
     }
     bool CallBool(UObject* o, const wchar_t* name) {
         UFunction* fn = Fn(o, name); if (!fn) return false;
@@ -1238,23 +1275,27 @@ public:
     // main mesh as AnimBP_Player_C — writes to the top-level instance don't reach it.
     void ResolveBhChain(UObject* pawn) {
         if (m_bhTriedResolve || !pawn) return;
+        // v1.0.3: no more full-object scan (it was ~0.5 s of frozen game thread on the
+        // first dialogue tick). The BH and dummy instances are linked anim layers of
+        // the main mesh, listed in USkeletalMeshComponent::LinkedInstances.
+        if (!m_pawnMesh || m_pawnMesh->IsUnreachable()) return;   // retry next tick once the mesh is resolved
         m_bhTriedResolve = true;
-        StringType pawnFull = pawn->GetFullName();
-        size_t sp = pawnFull.find(STR(' '));
-        StringType pawnPath = (sp != StringType::npos) ? pawnFull.substr(sp + 1) : pawnFull;
         UObject* found = nullptr;
-        UObjectGlobals::ForEachUObject([&](UObject* obj, int32_t, int32_t) -> LoopAction {
-            if (!obj) return LoopAction::Continue;
-            UClass* cls = obj->GetClassPrivate();
-            if (!cls) return LoopAction::Continue;
-            StringType clsName = cls->GetName();
-            StringType full = obj->GetFullName();
-            if (full.find(pawnPath) == StringType::npos) return LoopAction::Continue;
-            if (!found && clsName == StringType(STR("AnimBP_player_bh_C"))) found = obj;
-            if (!m_dummyAnimInstance && clsName == StringType(STR("AnimBP_player_dummy_C")))
-                m_dummyAnimInstance = obj;
-            return LoopAction::Continue;
-        });
+        if (FProperty* lp = m_pawnMesh->GetPropertyByNameInChain(STR("LinkedInstances"))) {
+            uint8_t* arr = lp->ContainerPtrToValuePtr<uint8_t>(m_pawnMesh);
+            UObject** data = arr ? *reinterpret_cast<UObject***>(arr) : nullptr;
+            int32_t num = arr ? *reinterpret_cast<int32_t*>(arr + 8) : 0;
+            for (int32_t i = 0; data && i < num && i < 64; i++) {
+                UObject* obj = data[i];
+                if (!obj || obj->IsUnreachable()) continue;
+                StringType clsName = obj->GetClassPrivate()->GetName();
+                if (!found && clsName == StringType(STR("AnimBP_player_bh_C"))) found = obj;
+                if (!m_dummyAnimInstance && clsName == StringType(STR("AnimBP_player_dummy_C"))) m_dummyAnimInstance = obj;
+            }
+            Output::send<LogLevel::Verbose>(STR("[ImmDlg] BH probe: LinkedInstances={} bh={} dummy={}\n"), num, found ? 1 : 0, m_dummyAnimInstance ? 1 : 0);
+        } else {
+            Output::send<LogLevel::Verbose>(STR("[ImmDlg] BH probe: LinkedInstances prop MISSING on mesh\n"));
+        }
         if (!found) {
             Output::send<LogLevel::Verbose>(STR("[ImmDlg] BH probe: AnimBP_player_bh_C NOT FOUND for pawn\n"));
             return;
@@ -2863,7 +2904,19 @@ public:
         // and get invalidated on dialogue exit, so no time-based rescan needed. Removing
         // the per-2s rescan eliminated a periodic input-drop hitch users reported.
         if (m_lookAtModifiers.empty()) {
-            UObjectGlobals::FindAllOf(STR("CameraModifier_LookAt"), m_lookAtModifiers);
+            // v1.0.3: was UObjectGlobals::FindAllOf — a full object-array walk on the
+            // entry tick. The modifiers live in the camera manager's own ModifierList.
+            if (m_camMgr && !m_camMgr->IsUnreachable()) {
+                if (FProperty* ml = m_camMgr->GetPropertyByNameInChain(STR("ModifierList"))) {
+                    uint8_t* arr = ml->ContainerPtrToValuePtr<uint8_t>(m_camMgr);
+                    UObject** data = arr ? *reinterpret_cast<UObject***>(arr) : nullptr;
+                    int32_t num = arr ? *reinterpret_cast<int32_t*>(arr + 8) : 0;
+                    for (int32_t i = 0; data && i < num && i < 32; i++) {
+                        UObject* m = data[i];
+                        if (m && !m->IsUnreachable() && ClassChainHas(m, STR("CameraModifier_LookAt"))) m_lookAtModifiers.push_back(m);
+                    }
+                }
+            }
             if (!m_disableModifierFn && !m_lookAtModifiers.empty()) {
                 // UCameraModifier::DisableModifier(bool bImmediate) — UFUNCTION on base class.
                 m_disableModifierFn = m_lookAtModifiers[0]->GetFunctionByNameInChain(FName(STR("DisableModifier")));
@@ -2920,10 +2973,13 @@ public:
     auto on_update() -> void override {
         UObject* pawn = GetPawn();
         if (!pawn) return;
-        // Our own poll must bypass the lie hook — set thread-local guard around the call.
-        tl_selfDialogueQuery = true;
-        bool inDlg = CallBool(pawn, STR("IsInStaticDialog"));
-        tl_selfDialogueQuery = false;
+        bool inDlg = false;
+        if (DialogStateReady(pawn)) {
+            // Our own poll must bypass the lie hook — set thread-local guard around the call.
+            tl_selfDialogueQuery = true;
+            inDlg = CallBool(pawn, STR("IsInStaticDialog"));
+            tl_selfDialogueQuery = false;
+        }
         g_inDialogue.store(inDlg, std::memory_order_relaxed);
 
         // Invalidate cached UObject pointers on dialogue exit BEFORE anything else
@@ -3019,9 +3075,14 @@ public:
         // Refresh in-game sensitivity on each dialogue entry.
         if (!m_prevInDialog) {
             LoadStalker2Settings();
-            ProbeFootstepAudio(pawn);
-            ProbeAllAnimInstances(pawn);
-            DumpMainAnimInstanceProps();
+            // v1.0.3: the dialogue-entry freeze. Every entry used to run three full
+            // scans of the ~420k-object UObject array (footstep probe, anim-instance
+            // probe, BH-chain probe) plus a 250-line property dump inside the FIRST
+            // in-dialogue tick — 1.44 s of stopped game thread by log timestamps.
+            // Audio kept playing, screen and input were dead, and the FOV blend ran
+            // under the freeze, so it read as "no control during the zoom". Footsteps
+            // are a no-op (the probe fed nothing), the anim-instance probe and the
+            // dump were log-only, and ResolveBhChain now reads LinkedInstances.
             m_prevInDialog = true;
         }
 
