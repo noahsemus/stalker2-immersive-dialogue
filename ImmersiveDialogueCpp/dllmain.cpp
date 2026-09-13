@@ -7,6 +7,9 @@
 //     events are swallowed at WndProc so the dialogue option list doesn't also scroll.
 //   - Raw mouse and right stick look. Sensitivity + invert-Y from the game's own
 //     AppliedSettingsWin64.cfg (mouse + gamepad honored independently).
+//   - Pad sticks come from XInput when a (real or Steam-Input-virtual) Xbox pad is
+//     present, else from a natively-connected Sony pad's HID reports via raw input
+//     (v1.0.4 — PS5 pads with Steam Input off used to be invisible to the mod).
 //   - The CameraModifier_LookAt that vanilla dialogue attaches to pull the camera onto
 //     the NPC is disabled + removed from the modifier list each tick (config toggle,
 //     F6 to flip at runtime).
@@ -76,6 +79,23 @@ static std::atomic<bool>   g_invertPadY   {false};
 static WNDPROC g_origWndProc = nullptr;
 static bool    g_rawReady    = false;
 
+// v1.0.4: native Sony pad (DualSense / DualSense Edge / DualShock 4) sticks, read
+// from the pad's HID input reports via raw input. A PS5 pad is NOT an XInput device:
+// XInputGetState only sees it while Steam Input (or DS4Windows) is translating it
+// into a virtual Xbox pad. Players who turn Steam Input off to keep the game's
+// native DualSense haptics had a pad the game saw but we didn't ("works on keyboard,
+// not on controller"). Values are XInput-convention normalized [-1,+1], Y up = +.
+// Written by the WndProc thread on every HID report, read by the game thread.
+static std::atomic<double>    g_dsLX{0.0};
+static std::atomic<double>    g_dsLY{0.0};
+static std::atomic<double>    g_dsRX{0.0};
+static std::atomic<double>    g_dsRY{0.0};
+static std::atomic<ULONGLONG> g_dsLastReportMs{0};   // GetTickCount64 of the last report
+static std::atomic<bool>      g_dsSeen{false};       // a Sony pad has reported at least once
+static std::atomic<bool>      g_hidRegistered{false};
+static WNDPROC                g_origWndProcHid = nullptr; // set only if the game routes
+                                                           // HID raw input to another window
+
 // Thread-local: set true right before OUR own IsInStaticDialog polls; the post-hook uses
 // this to distinguish our polling (return truth) from every other caller (return lie).
 static thread_local bool tl_selfDialogueQuery = false;
@@ -90,11 +110,16 @@ static thread_local bool tl_selfDialogueQuery = false;
 // `Gamepad_LeftStick_Up/Down` FKey bindings out of the `IMC_Dialog` InputMappingContext
 // asset at runtime — see `PatchDialogInputMapping()` further down.
 
+// Which path ReadPadSticks took — for the log only.
+enum class PadSource { None, XInput, SonyHid };
+
 // Read controller sticks. Left/right sticks normalized to [-1,+1] with deadzone.
 // The game doesn't call XInput itself (see note above), so we just get real values.
 static bool ReadPadSticks(double& outMoveX, double& outMoveY,
-                          double& outLookX, double& outLookY) {
+                          double& outLookX, double& outLookY,
+                          PadSource* outSrc = nullptr) {
     outMoveX = outMoveY = outLookX = outLookY = 0.0;
+    if (outSrc) *outSrc = PadSource::None;
     XINPUT_STATE st{};
     for (DWORD i = 0; i < XUSER_MAX_COUNT; ++i) {
         if (XInputGetState(i, &st) == ERROR_SUCCESS) {
@@ -109,11 +134,101 @@ static bool ReadPadSticks(double& outMoveX, double& outMoveY,
             outMoveY = apply(st.Gamepad.sThumbLY, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE);
             outLookX = apply(st.Gamepad.sThumbRX, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE);
             outLookY = apply(st.Gamepad.sThumbRY, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE);
+            if (outSrc) *outSrc = PadSource::XInput;
             return (outMoveX != 0.0 || outMoveY != 0.0 ||
                     outLookX != 0.0 || outLookY != 0.0);
         }
     }
+    // No XInput pad: fall back to a natively-connected Sony pad (see g_dsLX). Values
+    // older than half a second are treated as a disconnect so an unplug mid-hold
+    // doesn't leave Skif walking into a wall.
+    ULONGLONG last = g_dsLastReportMs.load(std::memory_order_relaxed);
+    if (last != 0 && GetTickCount64() - last < 500) {
+        if (outSrc) *outSrc = PadSource::SonyHid;
+        outMoveX = g_dsLX.load(std::memory_order_relaxed);
+        outMoveY = g_dsLY.load(std::memory_order_relaxed);
+        outLookX = g_dsRX.load(std::memory_order_relaxed);
+        outLookY = g_dsRY.load(std::memory_order_relaxed);
+        return (outMoveX != 0.0 || outMoveY != 0.0 ||
+                outLookX != 0.0 || outLookY != 0.0);
+    }
     return false;
+}
+
+// ---- Sony pad HID report parsing ----
+// Sticks are one unsigned byte each, 0..255, centre 128, Y axis 0 = up. Offsets of
+// LX within the report (LY/RX/RY follow) depend on the report ID:
+//   0x01  USB (DualSense + DS4) and the DualSense's initial Bluetooth report: LX at 1
+//   0x31  DualSense full Bluetooth report (after the game enables it):         LX at 2
+//   0x11  DualShock 4 full Bluetooth report:                                  LX at 3
+// Buttons/triggers are ignored — the game already handles those natively.
+static bool IsSonyPad(DWORD vid, DWORD pid) {
+    if (vid != 0x054C) return false;
+    return pid == 0x0CE6   // DualSense
+        || pid == 0x0DF2   // DualSense Edge
+        || pid == 0x05C4   // DualShock 4 (v1)
+        || pid == 0x09CC;  // DualShock 4 (v2)
+}
+
+static bool IsSonyPadDevice(HANDLE hDevice) {
+    // Cache per device handle: reports arrive at 250-1000 Hz, GetRawInputDeviceInfo
+    // is not free. Tiny fixed table; handles are stable for the device's lifetime.
+    struct Entry { HANDLE h; bool sony; };
+    static Entry cache[8]{};
+    static int   cacheN = 0;
+    for (int i = 0; i < cacheN; ++i) if (cache[i].h == hDevice) return cache[i].sony;
+    RID_DEVICE_INFO info{}; info.cbSize = sizeof(info);
+    UINT sz = sizeof(info);
+    bool sony = false;
+    UINT r = GetRawInputDeviceInfo(hDevice, RIDI_DEVICEINFO, &info, &sz);
+    if (r != (UINT)-1 && r > 0 && info.dwType == RIM_TYPEHID) {
+        sony = IsSonyPad(info.hid.dwVendorId, info.hid.dwProductId);
+    }
+    if (cacheN < 8) cache[cacheN++] = Entry{hDevice, sony};
+    return sony;
+}
+
+static void ParseSonyReport(const BYTE* rep, DWORD len) {
+    int off;
+    switch (rep[0]) {
+        case 0x01: off = 1; break;
+        case 0x31: off = 2; break;
+        case 0x11: off = 3; break;
+        default:   return;
+    }
+    if (len < (DWORD)off + 4) return;
+    // Same deadzone fractions as the XInput path (7849/32767 left, 8689/32767 right),
+    // rescaled so full deflection still reads 1.0.
+    auto norm = [](BYTE raw, double dz) -> double {
+        double v = ((double)raw - 128.0) / 127.0;
+        if (v >  1.0) v =  1.0;
+        if (v < -1.0) v = -1.0;
+        if (v >  dz) return (v - dz) / (1.0 - dz);
+        if (v < -dz) return (v + dz) / (1.0 - dz);
+        return 0.0;
+    };
+    const double dzL = XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE  / 32767.0;
+    const double dzR = XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE / 32767.0;
+    g_dsLX.store( norm(rep[off + 0], dzL), std::memory_order_relaxed);
+    g_dsLY.store(-norm(rep[off + 1], dzL), std::memory_order_relaxed); // HID Y down = +
+    g_dsRX.store( norm(rep[off + 2], dzR), std::memory_order_relaxed);
+    g_dsRY.store(-norm(rep[off + 3], dzR), std::memory_order_relaxed);
+    g_dsLastReportMs.store(GetTickCount64(), std::memory_order_relaxed);
+    g_dsSeen.store(true, std::memory_order_relaxed);
+}
+
+// Shared by both WndProc hooks: consume a WM_INPUT if it's a Sony pad HID report.
+static void HandleHidRawInput(const RAWINPUT* ri) {
+    if (ri->header.dwType != RIM_TYPEHID) return;
+    if (!IsSonyPadDevice(ri->header.hDevice)) return;
+    DWORD n = ri->data.hid.dwCount, sz = ri->data.hid.dwSizeHid;
+    if (n == 0 || sz == 0) return;
+    // Only the newest report in the batch matters. Bounds-check against the
+    // RAWINPUT block we actually received before touching it.
+    const BYTE* rep = ri->data.hid.bRawData + (size_t)(n - 1) * sz;
+    const BYTE* end = reinterpret_cast<const BYTE*>(ri) + ri->header.dwSize;
+    if (rep + sz > end) return;
+    ParseSonyReport(rep, sz);
 }
 
 // ================= Settings reader (AppliedSettingsWin64.cfg) =================
@@ -157,6 +272,8 @@ static LRESULT CALLBACK HookedWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
                     (ri->data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) == 0) {
                     g_dx.fetch_add(ri->data.mouse.lLastX, std::memory_order_relaxed);
                     g_dy.fetch_add(ri->data.mouse.lLastY, std::memory_order_relaxed);
+                } else {
+                    HandleHidRawInput(ri);
                 }
             }
         }
@@ -172,6 +289,63 @@ static LRESULT CALLBACK HookedWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
 
     // Everything else — including Escape — passes through to the game's native handling.
     return CallWindowProc(g_origWndProc, h, msg, w, l);
+}
+
+// Installed only when the game already registered gamepad raw input to a window
+// other than the main one (its WM_INPUTs land there, not on the hook above).
+// Passive: reads HID reports, forwards everything untouched.
+static LRESULT CALLBACK HookedWndProcHid(HWND h, UINT msg, WPARAM w, LPARAM l) {
+    if (msg == WM_INPUT) {
+        UINT sz = 0;
+        GetRawInputData((HRAWINPUT)l, RID_INPUT, nullptr, &sz, sizeof(RAWINPUTHEADER));
+        if (sz > 0 && sz <= 1024) {
+            BYTE buf[1024];
+            if (GetRawInputData((HRAWINPUT)l, RID_INPUT, buf, &sz, sizeof(RAWINPUTHEADER)) == sz)
+                HandleHidRawInput(reinterpret_cast<RAWINPUT*>(buf));
+        }
+    }
+    return CallWindowProc(g_origWndProcHid, h, msg, w, l);
+}
+
+// Register for HID gamepad raw input (usage page 0x01, usage 0x05 — what a DualSense
+// enumerates as). Raw input registration is per-process and per-usage: if the game
+// (or another mod) already registered this usage, re-registering would REDIRECT its
+// WM_INPUT stream to our window and could break the game's own native pad support.
+// So: already registered to the main window → we already see it via HookedWndProc;
+// already registered elsewhere → subclass that window read-only; not registered →
+// register it on the main window. Never re-registers an existing registration.
+static void SetupHidGamepadInput(HWND mainWnd) {
+    if (g_hidRegistered.load()) return;
+    UINT n = 0;
+    GetRegisteredRawInputDevices(nullptr, &n, sizeof(RAWINPUTDEVICE));
+    HWND existing = nullptr; bool found = false;
+    if (n > 0 && n < 64) {
+        RAWINPUTDEVICE regs[64]{};
+        UINT got = GetRegisteredRawInputDevices(regs, &n, sizeof(RAWINPUTDEVICE));
+        if (got != (UINT)-1) {
+            for (UINT i = 0; i < got; ++i) {
+                if (regs[i].usUsagePage == 0x01 && regs[i].usUsage == 0x05) {
+                    found = true; existing = regs[i].hwndTarget; break;
+                }
+            }
+        }
+    }
+    if (found) {
+        if (existing == nullptr || existing == mainWnd) {
+            // Null target = "the window with keyboard focus" = the game window in play.
+            g_hidRegistered.store(true);
+            return;
+        }
+        if (g_origWndProcHid == nullptr) {
+            g_origWndProcHid = reinterpret_cast<WNDPROC>(
+                SetWindowLongPtr(existing, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(HookedWndProcHid)));
+            if (g_origWndProcHid) g_hidRegistered.store(true);
+        }
+        return;
+    }
+    RAWINPUTDEVICE rid{};
+    rid.usUsagePage = 0x01; rid.usUsage = 0x05; rid.dwFlags = RIDEV_INPUTSINK; rid.hwndTarget = mainWnd;
+    if (RegisterRawInputDevices(&rid, 1, sizeof(rid))) g_hidRegistered.store(true);
 }
 
 static BOOL CALLBACK FindGameWindow(HWND h, LPARAM out) {
@@ -194,6 +368,8 @@ static void SetupInputHook() {
         g_origWndProc = reinterpret_cast<WNDPROC>(
             SetWindowLongPtr(h, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(HookedWndProc)));
         g_rawReady = true;
+        // Separate call so a failure here can't take the mouse hook down with it.
+        SetupHidGamepadInput(h);
     }
 }
 
@@ -269,6 +445,7 @@ public:
     bool       m_camCtrlSaved       = false;
     bool       m_camCtrlSavedValue  = false;
     uint64_t   m_lastMovementInputMs = 0;
+    PadSource  m_padSourceLogged = PadSource::None; // last pad source written to the log
     // Soft-ramp anim-facing input. See INPUT_RAMP_ALPHA in on_update.
     double     m_smoothFwd    = 0.0;
     double     m_smoothStrafe = 0.0;
@@ -437,7 +614,7 @@ public:
 
     ImmersiveDialogue() {
         ModName        = STR("ImmersiveDialogue");
-        ModVersion     = STR("1.0.3");
+        ModVersion     = STR("1.0.4");
         ModAuthors     = STR("Noah");
         ModDescription = STR("Free movement + mouse/pad look during NPC dialogue.");
     }
@@ -466,9 +643,10 @@ public:
         LoadStalker2Settings();
         LoadConfig();
         Output::send<LogLevel::Verbose>(
-            STR("[ImmDlg] unreal init v{} (mouse={}, mouseSens={}, padSens={}, invertY={})\n"),
+            STR("[ImmDlg] unreal init v{} (mouse={}, hidPad={}, mouseSens={}, padSens={}, invertY={})\n"),
             ModVersion,
             g_rawReady ? STR("ok") : STR("FAILED"),
+            g_hidRegistered.load() ? (g_origWndProcHid ? STR("ok-subclassed") : STR("ok")) : STR("FAILED"),
             g_mouseSensCoef.load(),
             g_padSensCoef.load(),
             g_invertMouseY.load() ? STR("true") : STR("false"));
@@ -3144,7 +3322,16 @@ public:
 
         // ---- Controller poll (once per frame) ----
         double padMoveX = 0.0, padMoveY = 0.0, padLookX = 0.0, padLookY = 0.0;
-        ReadPadSticks(padMoveX, padMoveY, padLookX, padLookY);
+        PadSource src = PadSource::None;
+        ReadPadSticks(padMoveX, padMoveY, padLookX, padLookY, &src);
+        // v1.0.4: say once per change which pad path is live, so a "controller does
+        // nothing" report can be diagnosed from the log alone.
+        if (src != m_padSourceLogged) {
+            m_padSourceLogged = src;
+            Output::send<LogLevel::Verbose>(STR("[ImmDlg] pad source: {} (sonyHidSeen={})\n"),
+                src == PadSource::XInput ? STR("xinput") : src == PadSource::SonyHid ? STR("sony-hid") : STR("none"),
+                g_dsSeen.load() ? 1 : 0);
+        }
 
         // ---- Movement: WASD + left stick (pad overrides keyboard per axis) ----
         bool w = (GetAsyncKeyState('W') & 0x8000) != 0;
