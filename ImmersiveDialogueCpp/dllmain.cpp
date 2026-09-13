@@ -61,6 +61,9 @@ struct FRotatorD { double Pitch, Yaw, Roll; };
 static std::atomic<long>  g_dx{0};
 static std::atomic<long>  g_dy{0};
 static std::atomic<bool>  g_inDialogue{false};
+// True while an in-dialogue UI that wants the keyboard is open (trade backpack /
+// inventory, PDA). Movement + look injection and the WASD swallow pause meanwhile.
+static std::atomic<bool>  g_uiBusy{false};
 
 // Settings loaded from AppliedSettingsWin64.cfg (refreshed on each dialogue entry).
 static std::atomic<double> g_mouseSensCoef{1.0};
@@ -163,7 +166,7 @@ static LRESULT CALLBACK HookedWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     // Only swallow W/A/S/D during dialogue so option list doesn't scroll on movement keys.
     // GetAsyncKeyState still sees them so our movement code still works.
     if ((msg == WM_KEYDOWN || msg == WM_KEYUP || msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP)
-        && g_inDialogue.load(std::memory_order_relaxed)) {
+        && g_inDialogue.load(std::memory_order_relaxed) && !g_uiBusy.load(std::memory_order_relaxed)) {
         if (w == 'W' || w == 'A' || w == 'S' || w == 'D') return 0;
     }
 
@@ -213,6 +216,7 @@ public:
     double m_pending_dx = 0.0;
     double m_pending_dy = 0.0;
     bool   m_prevInDialog = false;
+    bool   m_uiBusyPrev   = false;
 
     // Footstep audio (best-effort: fire PostEvent on cadence while character moves in dialogue).
     // We enumerate at first dialogue entry — game's anim graph doesn't play walk cycles during
@@ -3094,6 +3098,46 @@ public:
             // are a no-op (the probe fed nothing), the anim-instance probe and the
             // dump were log-only, and ResolveBhChain now reads LinkedInstances.
             m_prevInDialog = true;
+        }
+
+        // Pause while an in-dialogue inventory UI is open (trade -> backpack, PDA):
+        // those screens use S (sort) and other letters, and our WASD injection was
+        // walking the player around behind the trade window. Everything above this
+        // point (camera centering kill, caches, exit path) keeps running; only the
+        // input pipeline below is skipped, and WndProc stops swallowing W/A/S/D.
+        // The trade window (TradeView, an inventory screen) doesn't set the backpack
+        // or PDA state. What every inventory-style screen does do is show the mouse
+        // cursor, while plain dialogue keeps it hidden (answers are key/scroll
+        // driven). Gate on the controller's bShowMouseCursor as well.
+        bool showCursor = false;
+        if (UObject* ctrl = GetPawnController(pawn)) {
+            if (FProperty* p = ctrl->GetPropertyByNameInChain(STR("bShowMouseCursor"))) {
+                if (FBoolProperty* bp = CastField<FBoolProperty>(p)) showCursor = bp->GetPropertyValueInContainer(ctrl);
+            }
+        }
+        bool uiBusy = showCursor || CallBool(pawn, STR("IsUsingBackpack")) || CallBool(pawn, STR("IsUsingPDA"));
+        g_uiBusy.store(uiBusy, std::memory_order_relaxed);
+        if (uiBusy != m_uiBusyPrev) {
+            m_uiBusyPrev = uiBusy;
+            Output::send<LogLevel::Verbose>(STR("[ImmDlg] dialogue UI {} (cursor={} backpack={} pda={} canUseInv={})\n"),
+                uiBusy ? STR("OPEN — input paused") : STR("closed — input resumed"), showCursor ? 1 : 0,
+                CallBool(pawn, STR("IsUsingBackpack")) ? 1 : 0, CallBool(pawn, STR("IsUsingPDA")) ? 1 : 0,
+                CallBool(pawn, STR("CanUseInventory")) ? 1 : 0);
+            if (uiBusy) {
+                SetMoveVector(pawn, 0.0, 0.0, 0.0);
+                m_smoothFwd = 0.0; m_smoothStrafe = 0.0; m_prevMoving = false;
+                ForceAnimState(false);
+                ForceLocomotionData(false, 0.0, 0.0);
+                ForceShadowAnimState(false);
+                ForceBhLocomotion(false, 0.0, 0.0);
+                ForceDummyLocomotion(false, 0.0, 0.0);
+            }
+        }
+        if (uiBusy) {
+            g_dx.exchange(0); g_dy.exchange(0);
+            m_pending_dx = 0.0; m_pending_dy = 0.0;
+            PollHotkeys();
+            return;
         }
 
         ResetIgnore(pawn);
