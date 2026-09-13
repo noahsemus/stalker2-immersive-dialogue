@@ -67,3 +67,40 @@ whole mod can be a pak. If not, the BP-tick polling fallback is the next test.
 - Overrides of `BP_Stalker2Character` / `AnimBP_Player` conflict with any other
   mod overriding those assets. `IMC_Dialog` and cfg overrides are low-conflict.
 - Every game update requires re-cooking against the new Zone Kit build.
+
+## Results (2026-09-13 evening, in-game, DLL disabled)
+
+| Feature | Pak status | How |
+|---|---|---|
+| Left stick scrolls answers | fixed | `IMC_Dialog` override drops the 4 W/S/left-stick rows |
+| Look (mouse + right stick) | works, incl. during the zoom-in | `IMC_Dialog` override carries `IA_LookUp` rows copied (real modifier objects) from `IMC_Exploration` |
+| Move (WASD + left stick) | works | native handler drops `IA_LocomotionForward` in dialogue, so the `BP_Stalker2Character` override handles the action itself: Branch on `IsInStaticDialog` → `AddMovementInput` (control-yaw forward/right × 0.35) + `SetMoveVector`; `Completed` → `SetMoveVector(0)` |
+| Control during the zoom-in | works | pawn Tick in dialogue: `AddMappingContext(IMC_Dialog, 1)` if not already active |
+| Camera centering off | works | pawn Tick in dialogue: `FindCameraModifierByClass(CameraModifier_LookAt)` → `DisableModifier(true)` → `RemoveCameraModifier` |
+| Walk / strafe animation | **not done** | see below |
+| Config / F6 toggle | not done | would need a cfg read or a keybind in the pawn BP |
+
+Mod sources are mirrored in `zonekit/ImmersiveDialogue/` (uplugin + Content). The
+override BP was built by hand in the editor (Blueprint graphs can't be authored
+from Python); `zonekit/tools/make_imc_override.py` rebuilds the IMC.
+
+### Animation: why it is hard in a pak
+
+The game freezes the anim instance's `StateData` / `LocomotionData` while in
+static dialogue (native update skipped). The DLL force-wrote `bMoving`,
+`bWalking`, gait, and `MovementPlayRate.{Right,Forward,PlayRate}` each tick.
+None of those struct members is Blueprint-writable (`Set members in
+AnimPlayerStateData` exposes only `CombatIdleDuration`; `AnimPlayerDialogData`
+exposes nothing). The anim graph reads them via fast-path bindings:
+- Moving state machine: `Idle → IsMoving` rule = `StateData.Moving`;
+  `IsMoving → StartWalk` = `NOT StateData.Crouching`.
+- Walk state: 7 BlendSpace players with X/Y/PlayRate bound to
+  `LocomotionData.MovementPlayRate.RightValue/ForwardValue/PlayRate`.
+- The active linked layer (`AnimBP_player_dummy`) has no bindings of its own.
+
+A pak fix means an `AnimBP_Player` override whose event graph computes
+`DlgMoving/DlgFwd/DlgRight` from the pawn's velocity while `IsInStaticDialog`,
+and rebinding: the Idle→IsMoving rule (`Moving OR DlgMoving`), the
+Walk→StopWalk rule, and the Walk state's blendspace pins to
+`DlgMoving ? Dlg* : MovementPlayRate.*`. Roughly 25 manual edits in the editor.
+Alternative: hybrid pak + slim DLL that only does the anim writes (keeps UE4SS).
