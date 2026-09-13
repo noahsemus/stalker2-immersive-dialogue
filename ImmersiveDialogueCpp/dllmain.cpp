@@ -3007,6 +3007,16 @@ public:
                 SetMeshRelativeYaw(m_shadowMeshComp, m_shadowBaseYaw);
             }
             m_currentMeshYawOffset = 0.0;
+            // Clear the move vector we fed the game every tick in dialogue. Outside
+            // dialogue the game's input pipeline only writes it on key changes, so
+            // leaving dialogue mid-walk with no key held kept Skif walking until the
+            // next movement key event (present in v1.0.2 too).
+            SetMoveVector(pawn, 0.0, 0.0, 0.0);
+            ForceAnimState(false);
+            ForceLocomotionData(false, 0.0, 0.0);
+            ForceShadowAnimState(false);
+            ForceBhLocomotion(false, 0.0, 0.0);
+            ForceDummyLocomotion(false, 0.0, 0.0);
             InvalidateCachesOnDialogueExit();
             m_prevInDialog = false;
             g_dx.exchange(0); g_dy.exchange(0);
