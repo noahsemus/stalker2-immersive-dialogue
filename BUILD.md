@@ -193,6 +193,34 @@ Event Tick ─► Branch (Is In Static Dialog)
 Pick the `/Game/…/IMC_Dialog` asset in those pins (not the `/ImmersiveDialogue/`
 one); at runtime that path resolves to the override.
 
+**Dialogue-exit cleanup (2.0.1, in progress — not yet in the committed asset)**
+
+The `Add Mapping Context` above runs on every tick where `IsInStaticDialog()` is
+true, which includes the ticks *after* the dialogue UI has already removed
+`IMC_Dialog` on its way out (closing a trade screen, ending the conversation).
+The context gets re-added and nobody removes it, so its rows keep consuming
+`Q`, `E`, `F`, `L`, the pad face buttons, D-pad up/down and mouse wheel in normal
+play until a save is loaded. Reported on Nexus 2026-09-14 as "quick slots Q/E
+stop working after talking to NPCs" (Zenzi0) and "can't open the backpack on a
+PS5 pad after a trade" (Saigaiii866). Fix: remember that *we* added it and take
+it back out the first tick after dialogue ends.
+
+Add a Boolean variable `DlgImcAdded` (default false) and change the tick chain to:
+
+```
+Event Tick ─► Branch (Is In Static Dialog)
+  True  ─► … (LookAt modifier removal, unchanged) …
+        ─► Branch (Has Mapping Context (IMC_Dialog))
+              False ─► Add Mapping Context (IMC_Dialog, Priority 1) ─► Set DlgImcAdded = true
+  False ─► Branch (DlgImcAdded)
+              True  ─► Remove Mapping Context (IMC_Dialog) ─► Set DlgImcAdded = false
+```
+
+`Remove Mapping Context` is on the same `EnhancedInputLocalPlayerSubsystem`
+node (drag from its data pin). Removing a context that the game already removed
+is a no-op, so the order of the game's own removal versus ours does not matter.
+Keep `Add`/`Remove` on the same asset pin (`/Game/…/IMC_Dialog`).
+
 ### 5.4 AnimBP_Player (player animation Blueprint)
 
 Checkout `/Game/_STALKER2/Animations/Player/AnimBP_Player` the same way.

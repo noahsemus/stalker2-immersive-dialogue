@@ -13,6 +13,7 @@ Key 2.0 facts (details in BUILD.md):
 - Editor traps: `AnimBP_Player` crashes on auto-reopen; opening the pawn BP crashes while the anim override is in the mod folder (move it out to edit the pawn); Property Access nodes only in AnimGraph, not the event graph.
 - Cook: `zonekit/tools/cook_and_install.ps1` (RunUAT `GSCCookMod` with `-UnrealExe=<kit>\Stalker2\Binaries\Win64\Stalker2ModEditor-Win64-Shipping-Cmd.exe`), 5-6 min. The editor may stay open.
 - Diagnostics: `ImmDlgProbeCpp/` (UE4SS C++ probe; must be listed before `UObjectCacheMod` in mods.txt; reads only in dialogue; SEH-guarded). Not shipped.
+- **Open bug (2.0.1 WIP, branch `th-/dazzling-meitner-jis1gq`):** `IMC_Dialog` leaks into free play after dialogue exit (the pawn tick re-adds it after the UI removed it; nothing removes it) → Q/E quick slots and pad face buttons dead until a save reload (Nexus reports 2026-09-14, Zenzi0 + Saigaiii866). Fix = `DlgImcAdded` flag + `RemoveMappingContext` on the first non-dialogue tick; steps in BUILD.md §5.3. Needs an editor edit of the pawn BP (move `AnimBP_Player.uasset` out of the mod folder first), cook, in-game check.
 - Known cosmetic: ~0.5 s walk-start before a strafe begins in dialogue. Tried and discarded: direct IsMoving→Walk transition, blend durations, `GetLastMovementInputVector`, constant PlayRate (broke gestures). Needs a recording before another attempt.
 
 ### Collaboration workflow for 2.0

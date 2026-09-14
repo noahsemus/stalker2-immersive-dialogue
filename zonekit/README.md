@@ -185,3 +185,41 @@ jittery camera push while strafing after any dialogue). Direction inputs are
 `Normalize(UnrotateVector(Velocity, ActorRotation)) * 0.86`; StartWalk's blendspace
 X/Y are rebound like Walk's. Trading inside dialogue works. Known cosmetic: ~0.5 s
 of straight walk-start before a strafe begins in dialogue.
+
+### 2.0.1 — post-release bug reports (2026-09-14)
+
+Two Nexus reports within hours of the 2.0.0 upload, both "input stops working
+after a dialogue, reload fixes it", both **pak only** (the 1.x DLL is fine):
+
+- Zenzi0: quick-slot `Q` / `E` dead after talking to NPCs; a save reload fixes it.
+  Also runs Achievements Enabler, Better Vaulting, Ultra Plus, WRP.
+- Saigaiii866 (PS5 pad, Steam Input off): after leaving a conversation via
+  trade, the backpack button on the pad does nothing; opening it once from the
+  keyboard and switching back to the pad clears it.
+
+Diagnosis (no in-game repro yet, from the assets): the vanilla `IMC_Dialog`
+name table (parsed from the override `.uasset`, `zonekit/tools/dump_names.py`,
+which until now missed 1-2 character key names) binds exactly the keys that die:
+`Q`, `E`, `F`, `L`, `Gamepad_FaceButton_Top/Left/Right/Bottom`,
+`Gamepad_RightShoulder`, `Gamepad_DPad_Up/Down`, `MouseWheelAxis`, `Escape`,
+`Enter` → `IA_UI_Dialog_OpenTrade / OpenUpgrade / Close / AnswerConfirm /
+SelectAnswer`, `IA_UI_Flashlight`, `IA_UI_NightVision`. Nothing in the 1.x DLL
+touched mapping contexts; the one thing in 2.0 that does is the pawn tick's
+`AddMappingContext(IMC_Dialog, 1)` gated only on `IsInStaticDialog()`. The
+dialogue UI removes `IMC_Dialog` when it closes, but `IsInStaticDialog()` stays
+true for the tail of the exit (camera un-zoom / trade screen teardown), so the
+tick re-adds it and it leaks into free play at priority 1, consuming those keys
+ahead of `IMC_Exploration`. Loading a save rebuilds the local player's contexts,
+which is why a reload fixes it. The keyboard-then-pad workaround fits too: the
+inventory screen's own context push/pop rewrites the stack.
+
+Fix (BUILD.md §5.3, "Dialogue-exit cleanup"): a `DlgImcAdded` flag on the pawn,
+`RemoveMappingContext(IMC_Dialog)` on the first non-dialogue tick. Pending an
+editor session + cook + Noah's in-game check (talk → trade → close → try Q/E and
+the pad backpack button).
+
+Not tried/ruled out yet: whether the game adds `IMC_Dialog` at a priority other
+than 1 (if so the vanilla UI's `Add` on top of ours just updates the priority,
+which is fine); whether Zenzi0's WRP `AnimBP_Player` conflict is a separate
+issue (it would show as *no walking in dialogue*, not dead quick slots).
+

@@ -75,6 +75,9 @@ To uninstall, delete the three files.
 
 ## Known limitations
 
+- **2.0.0: quick slots (Q/E) or pad face buttons can stop responding after a
+  dialogue** (typically after a trade). Reloading a save clears it. Fixed in
+  2.0.1 (in progress).
 - **Strafe start in dialogue.** For roughly half a second after you start
   strafing from a standstill inside a dialogue, the body plays the walk-start
   before settling into the strafe. Cosmetic.
