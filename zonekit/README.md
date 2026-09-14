@@ -220,13 +220,10 @@ the pad backpack button).
 
 Does the fix touch trading? No: the trade screen opens inside the dialogue
 (`IsInStaticDialog()` stays true), so the removal branch only runs after the
-conversation ends. Separate 2.0.0 gap noticed while reviewing it: the move
-handler has no "UI open" guard, so WASD / left stick can walk the player while
-the trade screen is up. The DLL (1.0.3) gated on `PlayerController.bShowMouseCursor`
-(every inventory-style screen shows the cursor, plain dialogue does not; verified
-in-game then). Same guard goes into the pawn BP with this release: move handler
-and the IMC re-add both skip while the cursor is shown; a held key gets
-`SetMoveVector(0)` as the screen opens.
+conversation ends. A `bShowMouseCursor` guard on the move handler (the 1.x DLL's
+rule) was considered and dropped: Noah confirms 2.0.0 does not walk the player
+while the trade screen is open, so there is nothing to guard and the 2.0.1 edit
+stays a single change.
 
 Not tried/ruled out yet: whether the game adds `IMC_Dialog` at a priority other
 than 1 (if so the vanilla UI's `Add` on top of ours just updates the priority,
