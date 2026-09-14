@@ -26,6 +26,8 @@ public:
     }
     uint64_t m_lastMs = 0;
     uint64_t m_lastHeartbeatMs = 0;
+    uint64_t m_burstUntilMs = 0, m_burstStartMs = 0;
+    bool m_prevMoving = false;
     bool m_prevDlg = false;
 
     static UFunction* Fn(UObject* o, const wchar_t* n) { return o->GetFunctionByNameInChain(FName(n)); }
@@ -72,6 +74,32 @@ public:
         }
         __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
     }
+    // Call fn(FName Name) -> float/bool on inst; returns false on fault/layout problem.
+    bool CallNameFn(UObject* inst, const wchar_t* fnName, const wchar_t* arg, float* outF, bool* outB) {
+        UFunction* fn = Fn(inst, fnName); if (!fn) return false;
+        uint8_t buf[128]; std::memset(buf, 0, sizeof buf);
+        int32_t offArg = -1, offRet = -1; bool retIsBool = false;
+        for (FProperty* p : TFieldRange<FProperty>(fn, EFieldIterationFlags::None)) {
+            if (!p) continue;
+            StringType n = p->GetName();
+            if (n == STR("ReturnValue")) { offRet = p->GetOffset_ForInternal(); retIsBool = p->GetClass().GetName() == STR("BoolProperty"); }
+            else if (offArg < 0) offArg = p->GetOffset_ForInternal();
+        }
+        if (offArg < 0 || offRet < 0 || offRet + 8 > (int)sizeof buf) return false;
+        *reinterpret_cast<FName*>(buf + offArg) = FName(arg, FNAME_Add);
+        if (!GuardedProcessEvent(inst, fn, buf)) return false;
+        if (retIsBool) { if (outB) *outB = *reinterpret_cast<bool*>(buf + offRet); }
+        else { if (outF) *outF = *reinterpret_cast<float*>(buf + offRet); }
+        return true;
+    }
+    StringType GestureSignals(UObject* inst) {
+        float cv = -9; bool slot = false, mont = false;
+        bool okC = CallNameFn(inst, STR("GetCurveValue"), STR("AdditiveMovingUpperBody"), &cv, nullptr);
+        bool okS = CallNameFn(inst, STR("IsSlotActive"), STR("UpperBody"), nullptr, &slot);
+        if (UFunction* f = Fn(inst, STR("IsAnyMontagePlaying"))) { struct { bool R = false; } p; if (GuardedProcessEvent(inst, f, &p)) mont = p.R; }
+        wchar_t b[96]; swprintf(b, 96, L"curve=%s%.2f slot=%s%d montage=%d", okC ? L"" : L"?", cv, okS ? L"" : L"?", slot ? 1 : 0, mont ? 1 : 0);
+        return b;
+    }
     // Call UAnimInstance::GetCurrentStateName(int32) using the UFunction's real param layout.
     StringType StateName(UObject* inst, UFunction* fn, int32_t machine) {
         uint8_t buf[128]; std::memset(buf, 0, sizeof buf);
@@ -106,7 +134,16 @@ public:
         if (UFunction* f = Fn(pawn, STR("IsInStaticDialog"))) { struct { bool R = false; } p; if (GuardedProcessEvent(pawn, f, &p)) inDlg = p.R; }
         if (!inDlg) { m_prevDlg = false; return; }   // read anim data only inside dialogue (the window the DLL used safely)
         uint64_t now = GetTickCount64();
-        if (now - m_lastMs < 500 && m_prevDlg) return;
+        // Burst mode: once DlgMoving rises, log every frame for ~1.5 s so the start-of-move timeline is visible.
+        bool dlgMovingNow = false;
+        {
+            UObject* mesh0 = ObjProp(pawn, STR("Mesh")); UObject* inst0 = mesh0 ? ObjProp(mesh0, STR("AnimScriptInstance")) : nullptr;
+            if (inst0) if (FProperty* p = inst0->GetPropertyByNameInChain(STR("DlgMoving"))) { bool* b = p->ContainerPtrToValuePtr<bool>(inst0); if (b) dlgMovingNow = *b; }
+        }
+        if (dlgMovingNow && !m_prevMoving) { m_burstUntilMs = now + 1500; m_burstStartMs = now; }
+        m_prevMoving = dlgMovingNow;
+        bool burst = now < m_burstUntilMs;
+        if (!burst && now - m_lastMs < 500 && m_prevDlg) return;
         m_lastMs = now; m_prevDlg = true;
 
         UObject* mesh = ObjProp(pawn, STR("Mesh"));
@@ -128,13 +165,18 @@ public:
 
         // State machines.
         StringType states = STR("Moving=") + dbgState;
+        int gestureVar = -1, speedLim = -1;
+        if (FProperty* p = inst->GetPropertyByNameInChain(STR("GestureActive"))) { bool* b = p->ContainerPtrToValuePtr<bool>(inst); if (b) gestureVar = *b ? 1 : 0; }
+        if (FProperty* p = inst->GetPropertyByNameInChain(STR("SpeedLimited")))  { bool* b = p->ContainerPtrToValuePtr<bool>(inst); if (b) speedLim = *b ? 1 : 0; }
+        states += STR(" gestureVar=") + std::to_wstring(gestureVar) + STR(" speedLim=") + std::to_wstring(speedLim);
+        states += STR(" MAIN{") + GestureSignals(inst) + STR("}");
 
         // Linked layer instances on the mesh.
         StringType linked;
         if (FProperty* p = mesh->GetPropertyByNameInChain(STR("LinkedInstances"))) {
             uint8_t* hdr = p->ContainerPtrToValuePtr<uint8_t>(mesh);
             UObject* arr[16]; int32_t num = 0;
-            if (hdr && GuardedReadPtrArray(hdr, arr, 16, &num)) { for (int32_t i = 0; i < num; ++i) linked += ClassName(arr[i]) + STR(","); }
+            if (hdr && GuardedReadPtrArray(hdr, arr, 16, &num)) { for (int32_t i = 0; i < num; ++i) { if (!arr[i]) continue; linked += ClassName(arr[i]) + STR("{") + GestureSignals(arr[i]) + STR("},"); } }
             else linked = STR("(read fault)");
         } else linked = STR("(no LinkedInstances prop)");
 
@@ -175,8 +217,8 @@ public:
         if (UFunction* f = Fn(inst, STR("IsAnyMontagePlaying"))) { struct { bool R = false; } p; if (GuardedProcessEvent(inst, f, &p)) anyMontage = p.R; }
 
         Output::send<LogLevel::Verbose>(
-            STR("[Probe] inDlg={} class={} Dlg(moving={} fwd={:.2f} right={:.2f}) states=[{}] linked=[{}] montage={} | sd: moving={} walking={} running={} sprint={} walkOvr={} dynGait={:.1f} curveGait={:.1f} enumGait={} cutscene={} actionSlot={} fullBody={} | ld: vel={:.0f} MPR(R={:.2f} F={:.2f} P={:.2f}) angle={:.0f} | dialog={}\n"),
-            inDlg ? 1 : 0, ClassName(inst), dlgMoving, dlgFwd, dlgRight, states, linked, anyMontage ? 1 : 0,
+            STR("[Probe] t+{}ms inDlg={} class={} Dlg(moving={} fwd={:.2f} right={:.2f}) states=[{}] linked=[{}] montage={} | sd: moving={} walking={} running={} sprint={} walkOvr={} dynGait={:.1f} curveGait={:.1f} enumGait={} cutscene={} actionSlot={} fullBody={} | ld: vel={:.0f} MPR(R={:.2f} F={:.2f} P={:.2f}) angle={:.0f} | dialog={}\n"),
+            burst ? (now - m_burstStartMs) : 0, inDlg ? 1 : 0, ClassName(inst), dlgMoving, dlgFwd, dlgRight, states, linked, anyMontage ? 1 : 0,
             rb(sdP, sd, STR("bMoving")), rb(sdP, sd, STR("bWalking")), rb(sdP, sd, STR("bRunning")), rb(sdP, sd, STR("bSprinting")), rb(sdP, sd, STR("bWalkingOverride")),
             rf(sdP, sd, STR("DynamicGaitValue")), rf(sdP, sd, STR("CurveGaitValue")), ru8(sdP, sd, STR("EnumGaitState")),
             rb(sdP, sd, STR("bCutscene")), rb(sdP, sd, STR("bActionSlotActive")), rb(sdP, sd, STR("bFullBodySlotActive")),

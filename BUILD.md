@@ -1,71 +1,342 @@
-# ImmersiveDialogue (C++) — build & install
+# Building ImmersiveDialogue 2.0 (Zone Kit pak)
 
-## Prereqs (Windows 11)
-- Visual Studio 2022 Community, with the **"Desktop development with C++"** workload.
-  (This is the full VS IDE, NOT VS Code.)
-- CMake 3.22+  (winget install Kitware.CMake)
-- git
+This document is for anyone who wants to rebuild, modify or extend the mod. It
+covers the toolchain, what the mod changes and exactly how, how to cook and
+install it, and the traps we hit. The 1.x UE4SS DLL build is described at the
+end for reference.
 
-## 1. Get the UE4SS source (needed to compile against)
-In an empty working folder (e.g. C:\dev\immdlg\), put this project so it looks like:
+Everything below was done on Windows 11 with the Zone Kit that matches the
+game's current patch. Paths assume the kit at `G:\Epic Games\STALKER2ZoneKit`
+and the game at `C:\Program Files (x86)\Steam\steamapps\common\S.T.A.L.K.E.R. 2 Heart of Chornobyl`;
+adjust in the scripts if yours differ.
 
-    immdlg\
-      CMakeLists.txt            <- from this zip (root)
-      ImmersiveDialogueCpp\     <- from this zip
-        dllmain.cpp
-        CMakeLists.txt
-      RE-UE4SS\                 <- you clone this next
+## 1. Prerequisites
 
-Clone RE-UE4SS INTO that folder:
+- **S.T.A.L.K.E.R. 2 Zone Kit** (GSC's Unreal 5.5 mod editor). Install it from
+  the Epic Games Store. First launch compiles shaders and can take a long time.
+- ~600 GB free where the kit lives (its content paks are huge).
+- Git, and this repository cloned somewhere short-pathed.
+- Optional, for the C++ diagnostic probe only: Visual Studio 2022 with the
+  Desktop C++ workload, CMake 3.22+, Rust, and a clone of RE-UE4SS (see §7).
 
-    cd C:\dev\immdlg
-    git clone --recursive https://github.com/UE4SS-RE/RE-UE4SS.git
+No Python installation is needed; the kit ships its own
+(`Engine\Binaries\ThirdParty\Python3\Win64\python.exe`).
 
-(If it forgets submodules: `cd RE-UE4SS && git submodule update --init --recursive`)
+## 2. What the mod is
 
-## 2. Configure + build (Shipping)
-    cd C:\dev\immdlg
-    cmake -S . -B Output
-    cmake --build Output --config Game__Shipping__Win64 --target ImmersiveDialogue
+A Zone Kit "plain mod" plugin named `ImmersiveDialogue` that **overrides four
+game files** by placing edited copies at the same relative path under the mod's
+`Content` folder. The kit cooks them into an "OverrideContent" pak; at runtime
+they replace the originals.
 
-RE-UE4SS does NOT use the standard `Release`/`Debug` configs — it defines its own
-triplets: `Game__Debug__Win64`, `Game__Dev__Win64`, `Game__Test__Win64`,
-`Game__Shipping__Win64`. STALKER 2 ships in Shipping, so `Game__Shipping__Win64`
-is the only config that matches its C runtime — mixing configs will crash the game.
+| File (under `Content/`) | Kind | What the edit does |
+|---|---|---|
+| `GameLite/GameData/CoreVariables.cfg` | text config | `DialogFOVDefault = 90.0` (vanilla 70): kills the dialogue zoom |
+| `_Stalker_2/data/input/InputMappingContexts/IMC_Dialog.uasset` | Input Mapping Context | removes the W / S / left-stick "select answer" rows; adds the move (`IA_LocomotionForward`) and look (`IA_LookUp`) rows copied from `IMC_Exploration` |
+| `GameLite/Blueprints/Characters/Player/BP_Stalker2Character.uasset` | player pawn Blueprint | handles the move action itself in dialogue; per tick in dialogue disables the LookAt camera modifier and makes sure `IMC_Dialog` is active |
+| `_STALKER2/Animations/Player/AnimBP_Player.uasset` | player animation Blueprint | feeds walk/strafe from real movement while the game's own inputs are frozen; camera decouple; gesture handling |
 
-Requires Rust (`winget install --id Rustlang.Rustup`) — RE-UE4SS's `patternsleuth`
-submodule is a Rust crate and CMake configure will refuse to proceed without `rustc`.
+Why each piece exists (verified with an in-game probe):
 
-Output path:
-    Output\ImmersiveDialogueCpp\Game__Shipping__Win64\main.dll
+- The game's native player class drops the **move** action while
+  `IsInStaticDialog()` is true, but not the **look** action. So look only needs
+  the mapping context; move needs the pawn Blueprint to add movement itself.
+- `IMC_Dialog` only becomes active when the dialogue UI opens, so the pawn adds
+  it as soon as `IsInStaticDialog()` is true (gives control during the zoom-in).
+- In dialogue the anim instance's native update keeps running but leaves
+  `StateData.bMoving`, `StateData.bWalking` and
+  `LocomotionData.MovementPlayRate.{Right,Forward}` frozen at 0 and sets
+  `bWalkingOverride = 1`. Those struct members are not Blueprint-writable, so the
+  anim Blueprint computes its own values and the graph's bindings are rerouted
+  to them while in dialogue.
+- Player dialogue gestures are montages on the main anim instance
+  (`IsAnyMontagePlaying()` is true while one plays).
 
-## 3. Install
-Copy that `main.dll` to:
+The complete mod source, including the binary `.uasset` files with all edits
+applied, is committed in [`zonekit/ImmersiveDialogue/`](zonekit/ImmersiveDialogue/).
+**The fastest way to build is to use those files as-is (§4).** §5 documents
+every edit so they can be reproduced or changed.
 
-    ...\S.T.A.L.K.E.R. 2 Heart of Chornobyl\Stalker2\Binaries\Win64\ue4ss\Mods\ImmersiveDialogueCpp\dlls\main.dll
+## 3. Repository layout
 
-Enable it: add a line to `ue4ss\Mods\mods.txt` ABOVE the keybind mods:
+```
+zonekit/
+  ImmersiveDialogue/          the Zone Kit mod plugin (copy into <kit>\Stalker2\Mods\)
+    ImmersiveDialogue.uplugin
+    Content/                  the four overrides + the plugin's GameFeature data asset
+  tools/
+    cook_and_install.ps1      cook + install in one go (edit the two paths at the top)
+    install_paktest.ps1       install the last cooked pak under the _20_P name
+    revert_paktest.ps1        remove it
+    make_imc_override.py      regenerates IMC_Dialog.uasset headlessly (§5.2)
+    dump_imc.py               dumps any mapping context to JSON
+    extract_from_pak.py       pulls uncooked assets out of the kit's editor pak
+    dump_names.py             string dump of a .uasset (find what it references)
+    ue_exec.py                run editor Python via remote execution (if enabled)
+    probe/main.lua            UE4SS Lua probe (limited; see §7)
+    OverridePackages.txt / NewPackages.txt   package classifier lists the cook reads
+  builds/                     cooked paks of each checkpoint and release
+  README.md                   engineering log: how every mechanism was found
+ImmDlgProbeCpp/               UE4SS C++ diagnostic probe (§7), not part of the mod
+ImmersiveDialogueCpp/         the 1.x UE4SS DLL (legacy, §8)
+```
 
-    ImmersiveDialogueCpp : 1
+## 4. Build the mod from the committed source
 
-(Disable the Lua v1.0 ImmersiveDialogue while testing this so they don't both run.)
+1. Copy `zonekit\ImmersiveDialogue\` to `<kit>\Stalker2\Mods\ImmersiveDialogue\`.
+2. Copy `zonekit\tools\OverridePackages.txt` and `NewPackages.txt` to
+   `<kit>\Stalker2\SavedMods\PackageClassifier\ImmersiveDialogue\` (create the
+   folder). The cook reads these lists to know which packages are overrides.
+3. Cook and install:
+   ```
+   powershell -File zonekit\tools\cook_and_install.ps1
+   ```
+   This runs the same UAT command the editor's *Package Mod* button runs:
+   ```
+   <kit>\Engine\Build\BatchFiles\RunUAT.bat GSCCookMod
+       "-Project=<kit>\Stalker2\Stalker2.uproject"
+       "-PluginPath=<kit>\Stalker2\Mods\ImmersiveDialogue\ImmersiveDialogue.uplugin"
+       "-PackageClassifierOutputDir=<kit>\Stalker2\SavedMods\PackageClassifier\ImmersiveDialogue"
+       "-UnrealExe=<kit>\Stalker2\Binaries\Win64\Stalker2ModEditor-Win64-Shipping-Cmd.exe"
+       -TargetPlatform=Win64 -nocompile -nocompileuat
+   ```
+   (`-UnrealExe` is required; without it UAT looks for a stock `UnrealEditor-Cmd.exe`.)
+   It takes 5-6 minutes. Output:
+   `<kit>\Stalker2\SavedMods\Staged\ImmersiveDialogue\Windows\OverrideContent\Windows\Stalker2\Mods\ImmersiveDialogue\Content\Paks\Windows\ImmersiveDialogueStalker2-Windows-OverrideContent.{pak,ucas,utoc}`.
+4. The install step copies those three files to
+   `<game>\Stalker2\Content\Paks\~mods\zzz_ImmersiveDialogue_PakTest\` renamed
+   `zzz_ImmersiveDialogue_20_P.{pak,ucas,utoc}`. **The rename matters**: Zone
+   Kit paks mount at priority 3; many Nexus mods use `_P` (103) or `_10_P`
+   (1103) names and one of them may ship its own `AnimBP_Player`. `_20_P`
+   mounts at 2103, above them. Without it the anim override silently loses and
+   nothing animates. (Priority = 3 + 100 × (N+1) for a `_N_P` suffix.)
 
-## 4. Run
-Launch the game, talk to an NPC: WASD to move, MOUSE to look. Check ue4ss\UE4SS.log
-for `[ImmDlg]` lines. Expect a compile-fix pass first — send me the exact compiler
-errors and I'll correct the reflection API calls against your headers.
+The kit's *Package Mod* toolbar button does the same cook; if you use it, copy
+and rename the output by hand. Note it also generates an
+`Autogenerated_*_ActorReplacementData.uasset` for the pawn override; the mod
+works without it (plain path override) and we ship without it.
 
-## 5. Suggested companion mod: "No Dialogue Zoom"
-This mod does not touch the dialogue FOV zoom — that value lives in
-`CoreVariables.cfg` as `DialogFOVDefault` and every runtime override loses a frame
-war with the game's own writes. Install one of the Nexus "No Dialogue Zoom" paks
-alongside this DLL (pick the variant matching your normal in-game FOV):
+You do not need the editor open to cook. If it is open, that's fine too.
 
-- https://www.nexusmods.com/stalker2heartofchornobyl/mods/71
-- https://www.nexusmods.com/stalker2heartofchornobyl/mods/1933
+## 5. The edits, asset by asset
 
-Drop the .pak in `...\S.T.A.L.K.E.R. 2 Heart of Chornobyl\Stalker2\Content\Paks\~mods\`.
+### 5.1 CoreVariables.cfg
 
-## Tuning (top of dllmain.cpp)
-- WALK_SCALE  (movement speed)
-- MOUSE_SENS  (look sensitivity)
+Copy `<kit>\Stalker2\Content\GameLite\GameData\CoreVariables.cfg` to the same
+path under the mod's `Content`, change line `DialogFOVDefault = 70.0` to `90.0`.
+
+### 5.2 IMC_Dialog (generated by script)
+
+`zonekit\tools\make_imc_override.py` is a Python script that runs **inside the
+editor** as a commandlet (about 4.5 minutes, editor need not be open):
+
+```
+<kit>\Stalker2\Binaries\Win64\Stalker2ModEditor-Win64-Shipping-Cmd.exe "<kit>\Stalker2\Stalker2.uproject" -run=pythonscript -script=<repo>\zonekit\tools\make_imc_override.py -unattended -nosplash -stdout -NoShaderCompile
+```
+
+(Edit the `LOG` path at the top first.) It:
+
+1. Duplicates `/Game/_Stalker_2/data/input/InputMappingContexts/IMC_Dialog` to
+   `/ImmersiveDialogue/_Stalker_2/data/input/InputMappingContexts/IMC_Dialog`.
+2. Removes the four `IA_UI_Dialog_SelectAnswer` rows bound to `W`, `S`,
+   `Gamepad_LeftStick_Up`, `Gamepad_LeftStick_Down`. (Up / Down arrows, D-pad
+   and mouse wheel rows stay.)
+3. Duplicates `IMC_Exploration` to a temporary asset and **moves** its modifier
+   and trigger objects (`rename(outer=…)`) into the override for every
+   `IA_LocomotionForward` and `IA_LookUp` row (W, A, S, D, Gamepad_Left2D;
+   Mouse2D, Gamepad_Right2D, NumPad 1/2/3/5). Moving the real objects keeps the
+   game's dead zones, response curves and the custom `ApplySensitivity`
+   modifier intact. (Creating new modifier objects and setting their properties
+   fails with "cannot be edited on templates"; do not try.)
+4. Saves. Do **not** call `delete_asset` on the emptied temp asset; it crashes
+   the commandlet. The temp asset is never saved, so nothing is left behind.
+
+The result has 34 rows. `dump_imc.py` prints any context's rows for checking.
+
+### 5.3 BP_Stalker2Character (player pawn)
+
+In the editor: Content Browser → `/Game/GameLite/Blueprints/Characters/Player/BP_Stalker2Character`
+→ right-click → **Checkout selected content to mod plugin folder**. Open the
+mod's copy; the vanilla Event Graph only has a jump-force block and a debug
+teleport key. Add:
+
+**Movement handler**
+
+```
+EnhancedInputAction IA_LocomotionForward
+  Triggered ─► Branch (Condition: Is In Static Dialog)
+                 True ─► Add Movement Input (World Direction = Forward Vector, Scale = X × 0.35)
+                      ─► Add Movement Input (World Direction = Right Vector,   Scale = Y × 0.35)
+                      ─► Set Move Vector (Make Vector (X, Y, 0))
+  Completed ─► Set Move Vector (Make Vector (0, 0, 0))
+```
+where `X`, `Y` = Break Vector2D of the event's Action Value (X forward, Y right),
+and Forward/Right Vector come from `Make Rotator (0, ControlRotation.Yaw, 0)`.
+`Set Move Vector` is the game's own input feed (native `PC` function); the
+`Completed` call stops the character when the key is released.
+
+**Per-tick dialogue upkeep**
+
+```
+Event Tick ─► Branch (Is In Static Dialog)
+  True ─► Cast To PlayerController (Object = Get Controller)
+        ─► Find Camera Modifier By Class (Player Camera Manager, class CameraModifier_LookAt)
+        ─► Is Valid
+              Is Valid     ─► Disable Modifier (Immediate) ─► Remove Camera Modifier ─┐
+              Is Not Valid ───────────────────────────────────────────────────────────┤
+        ┌──────────────────────────────────────────────────────────────────────────────┘
+        └► Branch (Has Mapping Context (IMC_Dialog))      [subsystem = Get EnhancedInputLocalPlayerSubsystem]
+              False ─► Add Mapping Context (IMC_Dialog, Priority 1)
+```
+Pick the `/Game/…/IMC_Dialog` asset in those pins (not the `/ImmersiveDialogue/`
+one); at runtime that path resolves to the override.
+
+### 5.4 AnimBP_Player (player animation Blueprint)
+
+Checkout `/Game/_STALKER2/Animations/Player/AnimBP_Player` the same way.
+
+**Variables:** `DlgMoving` (Boolean), `DlgFwd` (Float), `DlgRight` (Float),
+`CamAbs` (Boolean), `SavedOrient` (Boolean), `SavedCamRot` (Rotator),
+`DbgState` (String, diagnostic only).
+
+**Event Graph** (was empty). One chain off `Event Blueprint Update Animation`:
+
+```
+Try Get Pawn Owner ─► Cast To PC ─► Is In Static Dialog ─► Branch
+```
+
+*True (in dialogue), in order:*
+1. `Get Velocity` (pawn) → `Vector Length` → `> 10` → **Set DlgMoving**.
+2. `Unrotate Vector (A = Velocity, B = Get Actor Rotation)` → `Normalize` →
+   `Break Vector` → X × 0.86 → **Set DlgFwd**; Y × 0.86 → **Set DlgRight**.
+3. Branch (`Is Any Montage Playing`): True → **Set DlgRight = 0** → Branch
+   (DlgMoving) True → **Set DlgFwd = 0.86**. (Gesture playing: legs go straight
+   ahead so the torso never twists under the gesture.)
+4. Branch (NOT CamAbs): True → **Set SavedCamRot** = camera `Get Relative
+   Rotation`; **Set SavedOrient** = CharacterMovement `Orient Rotation To
+   Movement`. (One-time capture on entry.)
+5. Camera `Set Absolute` (Rotation only) → camera `Set World Rotation (Get
+   Control Rotation)` → **Set CamAbs = true** → CharacterMovement `Set Orient
+   Rotation To Movement = false`.
+
+Camera = `Get Camera Component` on the PC; CharacterMovement = `Get Character
+Movement`.
+
+*False (not in dialogue):* **Set DlgMoving = false, DlgFwd = 0, DlgRight = 0** →
+Branch (CamAbs) True → camera `Set Absolute` (all off) → camera `Set Relative
+Rotation (SavedCamRot)` → **Set CamAbs = false** → `Set Orient Rotation To
+Movement (SavedOrient)`.
+
+Restoring the *saved* values rather than 0 / true matters: restoring zero
+rotation and `true` left a jittery camera push while strafing after any
+dialogue.
+
+*Diagnostic events (safe to delete):* `AnimNotify_EnterIdle`, `…EnterStartWalk`,
+`…EnterWalk`, `…EnterStopWalk`, `…EnterStartRun`, `…EnterRun`, `…EnterJog`,
+`…EnterLowCrouch`, each → Set DbgState "<name>". They are fired by *Entered
+State Event* names set on the Moving state machine's states.
+
+**AnimGraph → Locomotion → Moving state machine.** Open each transition's rule
+(click the round icon on the arrow):
+
+| Transition | Rule |
+|---|---|
+| Idle → IsMoving | `StateData.bMoving OR DlgMoving` |
+| IsMoving → StartWalk | `(NOT StateData.bWalkingOverride) OR DlgMoving` |
+| IsMoving → StartRun, IsMoving → LowCrouch (any other exit of IsMoving) | original `AND NOT DlgMoving` |
+| Walk → StopWalk | `NOT (StateData.bMoving OR DlgMoving)` |
+| Walk → anything else (StartRun/Run/Jogging/LowCrouch, whichever exist) | original `AND NOT DlgMoving` |
+
+`DlgMoving` is a plain `Get` of the variable; the `StateData…` values are the
+pins already present on the rule's getter node. Rules that use a Blueprint
+node instead of a direct binding show a harmless "uses Blueprint to update its
+values" warning.
+
+**Walk state and StartWalk state.** Each contains several `Blendspace Player`
+nodes whose **X** and **Y** pins are bound to
+`LocomotionData.MovementPlayRate.RightValue` / `.ForwardValue`. For every
+player: click the pin's binding dropdown → *Remove Binding*, then wire:
+
+```
+X ◄── Select Float (Pick A = DlgMoving; A = DlgRight; B = Property Access LocomotionData.MovementPlayRate.RightValue)
+Y ◄── Select Float (Pick A = DlgMoving; A = DlgFwd;   B = Property Access LocomotionData.MovementPlayRate.ForwardValue)
+```
+One pair of Select nodes can feed all players in a state. Leave **Play Rate**
+and **Blend Space** bound. (Property Access nodes are fine inside the
+AnimGraph; see §6 about the event graph.)
+
+**Top-level AnimGraph, "Additional Pose" group:** the dead-body-drag
+`Blend Poses by bool` has its Active Value changed from `StateData.bMoving` to
+`StateData.bMoving OR DlgMoving`. Harmless either way; it can be reverted.
+
+**Do not override `AnimBP_player_bh`** (the bare-hands weapon layer). A recook
+of that asset breaks the unarmed sprint left-hand animation from a fresh load.
+It is not needed.
+
+### 5.5 Tunables
+
+| What | Where | Value |
+|---|---|---|
+| Walk speed in dialogue | pawn BP, both multipliers | 0.35 |
+| Direction strength fed to the blendspaces | anim BP, both multipliers and the gesture forward value | 0.86 |
+| Movement detection threshold | anim BP, `> 10` on velocity length | 10 cm/s |
+| Dialogue FOV | CoreVariables.cfg | 90.0 |
+
+## 6. Editor and pipeline traps
+
+- **The editor crashes when it auto-reopens `AnimBP_Player` at startup**
+  (compile-on-load before the mod's classes exist). Open it by hand after
+  launch instead. If the crash loop starts, delete the `OpenAssetsAtExit=` lines
+  from `%LOCALAPPDATA%\Stalker2\Saved\Config\WindowsEditor\EditorPerProjectUserSettings.ini`
+  with the editor closed.
+- **Opening `BP_Stalker2Character` crashes while the modified `AnimBP_Player`
+  is in the mod folder** (the pawn editor previews the anim class). To edit the
+  pawn, move `AnimBP_Player.uasset` out of the mod folder temporarily, edit,
+  then move it back.
+- **Property Access nodes in the anim Blueprint's Event Graph** crashed the
+  compiler once. Use them only inside the AnimGraph / transition rules.
+- **Save before Compile** on big edits; a compiler crash loses unsaved work.
+- The cook picks up **everything** in the mod's `Content` folder regardless of
+  the classifier lists; keep only the files you mean to ship there.
+- The **mod folder is the source of truth** for the editor. After editing, copy
+  the changed `.uasset` back into `zonekit/ImmersiveDialogue/` in the repo.
+- Blueprint "Float" variables are doubles; read them as such from C++.
+
+## 7. Diagnostics
+
+Two probes exist for when something "doesn't animate" and you need to know
+what the anim instance is actually doing. Both need UE4SS installed
+(`ImmDlgProbeCpp : 1` in `ue4ss\Mods\mods.txt`, **listed before
+`UObjectCacheMod`** or object lookups return stale objects).
+
+- `ImmDlgProbeCpp/` — C++ UE4SS mod. Build with the root `CMakeLists.txt`
+  (RE-UE4SS clone required, see §8) and copy
+  `Output\ImmDlgProbeCpp\Game__Shipping__Win64\main.dll` to
+  `ue4ss\Mods\ImmDlgProbeCpp\dlls\main.dll`. While in dialogue it logs, twice a
+  second (every frame for 1.5 s after movement starts), the anim class, our
+  variables, the `DbgState` string, linked layer classes, montage/slot state and
+  the frozen `StateData` / `LocomotionData` values to `ue4ss\UE4SS.log`. All
+  engine calls are SEH-guarded; it reads only while `IsInStaticDialog()`.
+  Calling `GetCurrentStateName` from outside the anim update faults; that is
+  why the anim Blueprint reports the state through `DbgState` instead.
+- `zonekit/tools/probe/main.lua` — Lua version. Property reads only; UE4SS Lua
+  cannot read struct members and calling anim functions from it crashes.
+
+`zonekit/README.md` has the full log of what each probe run showed.
+
+## 8. Legacy: the 1.x UE4SS DLL
+
+Source in `ImmersiveDialogueCpp/dllmain.cpp`. Build: Visual Studio 2022 with
+Desktop C++, CMake 3.22+, Rust (for RE-UE4SS's `patternsleuth`), and a
+recursive clone of <https://github.com/UE4SS-RE/RE-UE4SS> into `RE-UE4SS/`
+(the `UEPseudo` submodule requires a GitHub account linked to Epic Games; set
+`git config --global url."https://github.com/".insteadOf "git@github.com:"`).
+
+```
+cmake -S . -B Output
+cmake --build Output --config Game__Shipping__Win64 --target ImmersiveDialogue
+```
+Only `Game__Shipping__Win64` matches the game's CRT. Output
+`Output\ImmersiveDialogueCpp\Game__Shipping__Win64\main.dll` installs to
+`ue4ss\Mods\ImmersiveDialogueCpp\dlls\main.dll` with `ImmersiveDialogueCpp : 1`
+in `mods.txt`. Do not run the DLL and the pak together.

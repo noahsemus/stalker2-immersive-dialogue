@@ -1,11 +1,15 @@
 # ImmersiveDialogue
 
-A UE4SS C++ mod for **S.T.A.L.K.E.R. 2: Heart of Chornobyl** that lets you move
-and look around freely during interactive NPC dialogue.
+A mod for **S.T.A.L.K.E.R. 2: Heart of Chornobyl** that lets you move, look
+around and keep your walking animation during interactive NPC dialogue.
 
 Vanilla STALKER 2 pins the camera on the NPC and locks you in place the moment
-you press "talk". This mod restores agency: WASD/left-stick walks, mouse/right-
-stick looks, and the camera stays where you point it.
+you press "talk". This mod restores agency: WASD / left stick walks, mouse /
+right stick looks, the camera stays where you point it, and Skif's body
+animates normally while he does it.
+
+**Version 2.0 is a pure pak mod. It does not need UE4SS.** It is built with the
+official S.T.A.L.K.E.R. 2 Zone Kit and installs like any other pak.
 
 Nexus page: <https://www.nexusmods.com/stalker2heartofchornobyl/mods/2698>
 
@@ -14,149 +18,88 @@ Slava Ukraini.
 ## Features
 
 - **Free movement in dialogue.** WASD (keyboard) and left stick (controller)
-  walk Skif at a natural pace, camera-relative. Right stick and mouse look work
-  the same as normal gameplay.
-- **Sensitivity honors your in-game settings.** Reads `MouseSensitivityCoef`,
-  `GamepadSensitivityCoef`, `InvertMouseYAxis`, and `GamepadInvertX/YAxis` from
-  your live `AppliedSettingsWin64.cfg`. Per-mod base multipliers are also
-  exposed in `config.ini` if you want to tune.
+  walk Skif, camera-relative. Movement is available from the moment you press
+  "talk", including during the camera zoom-in.
+- **Free look.** Mouse and right stick look exactly as in normal play, using
+  the game's own sensitivity, dead zones and invert settings. Works with any
+  controller the game supports, including DualSense with native haptics.
 - **Camera stays free.** The vanilla dialogue camera modifier that yanks your
-  view onto the NPC is disabled while in dialogue (toggle via F6 by default,
-  key rebindable in `config.ini`).
-- **Left stick doesn't scroll dialogue options.** The two `Gamepad_LeftStick_Up/Down`
-  bindings on `IA_UI_Dialog_SelectAnswer` are neutralized at runtime, so you can
-  walk with the left stick without accidentally cycling through NPC responses.
-  D-pad Up/Down and the confirm button work as normal.
-- **Wwise footsteps fire during in-dialogue walking.** STALKER 2's anim graph
-  suppresses foot notifies in dialogue; the mod triggers the appropriate
-  `SFX_Skif_Footsteps` event on cadence so you still hear your steps.
-- **Camera stays stable when NPC gestures.** In-dialogue upper-body gestures
-  (Skif waving his hand, shrugging, etc.) animate the head bone that the
-  camera socket is attached to — which in vanilla produces a wild camera swing
-  when combined with strafe input. The mod fixes this with a four-layer
-  approach: force `bOrientRotationToMovement=false` so actor rotation never
-  drags the camera's control rotation, detect an active gesture via the
-  `jnt_camera` socket yaw with adaptive-baseline hysteresis, cut movement
-  input for the gesture window, and engage `SetAbsolute(rot=true)` on the
-  camera component (with a per-tick predictive `RelativeRotation` write that
-  preserves the current view offset) so the head bone can't push the view.
-  See "Known limitations" for the small tradeoff.
-
-## Companion mods (recommended)
-
-- **No Dialogue Zoom** — kills the FOV zoom-in on dialogue entry. The zoom is
-  driven by `DialogFOVDefault` in `CoreVariables.cfg`; a config-based pak mod
-  is the only clean fix (runtime FOV overrides fight the game and flicker).
-  Any of the Nexus variants work — pick one matching your normal in-game FOV:
-  - <https://www.nexusmods.com/stalker2heartofchornobyl/mods/71>
-  - <https://www.nexusmods.com/stalker2heartofchornobyl/mods/1499>
-  - <https://www.nexusmods.com/stalker2heartofchornobyl/mods/1933>
-
-  Drop the `.pak` into `<GAME>\Stalker2\Content\Paks\~mods\` alongside this mod.
-
-- **RE-UE4SS Compatibility Fix for Update 2.0** — required while on STALKER 2
-  Update 2.0 / UE5.5 for any UE4SS install to load at all.
-  <https://www.nexusmods.com/stalker2heartofchornobyl/mods/2341>
-
-## Known limitations
-
-- **Movement is suppressed while a gesture animation is playing.** During the
-  ~1s an NPC-triggered upper-body gesture is playing, WASD / left-stick input
-  is dropped and the character stops walking. Mouse / right-stick look works
-  normally throughout. The alternative was the wild camera swing the vanilla
-  gesture-plus-strafe compound produced.
-- **F confirm glyph on the highlighted dialogue option may render slightly
-  higher than expected.** Purely cosmetic; the confirm key still works normally.
-  Caused by the runtime `IMC_Dialog` patch keeping neutralized entries in the
-  mapping array instead of removing them (removal corrupted UE runtime state
-  and crashed the PDA on v1.0-rc).
+  view onto the NPC is disabled while in dialogue.
+- **Walking and strafing animations play in dialogue.** Vanilla freezes the
+  animation inputs during dialogue; the mod feeds them from your actual
+  movement.
+- **Gestures don't fight the camera.** When Skif plays a dialogue gesture the
+  view stays under your control and the legs run a straight-ahead cycle for
+  the duration, so the gesture stays in frame.
+- **Left stick doesn't scroll dialogue options.** The stick moves you; D-pad,
+  arrow keys and mouse wheel still scroll answers. W and S no longer scroll
+  answers either. F / Enter / click still confirms.
+- **No dialogue FOV zoom.** Bundled: `DialogFOVDefault` is set equal to the
+  normal FOV.
+- Trading and inventory screens opened from a dialogue work as normal.
 
 ## Requirements
 
-- STALKER 2 (Steam or Epic install)
-- [UE4SS](https://github.com/UE4SS-RE/RE-UE4SS) installed to
-  `Stalker2\Binaries\Win64\ue4ss\`. Built and tested against RE-UE4SS
-  v3.0.1.0.0; v3.0.x branches should be ABI-compatible.
-- On STALKER 2 Update 2.0 / UE5.5: also install the
-  [RE-UE4SS Compatibility Fix](https://www.nexusmods.com/stalker2heartofchornobyl/mods/2341)
-  so UE4SS itself will load.
-- To build from source: Visual Studio 2022 with the "Desktop development
-  with C++" workload, CMake 3.22+, Rust (for the `patternsleuth` submodule
-  of RE-UE4SS), and a GitHub account linked to Epic Games (RE-UE4SS's
-  `UEPseudo` submodule is gated behind that link).
+- STALKER 2 (Steam or Epic install), current patch.
+- Nothing else. No UE4SS.
 
 ## Install
 
 ### Vortex
 
-1. Grab the latest `ImmersiveDialogue-vX.Y.Z.zip` (from Nexus or this repo's Releases page)
-   and drop it into Vortex.
-2. Deploy.
-3. Open Vortex's **UE4SS Load Order** tab. `ImmersiveDialogueCpp` will appear
-   in the list, enabled by default. Toggle it off then on (or reorder any
-   entry) to force the Vortex extension to write the mod into UE4SS's
-   `mods.txt`. This is a one-time step required by the STALKER 2 Vortex
-   extension — it defers `mods.txt` writes to that tab rather than firing them
-   on install.
-4. Launch the game.
+1. Download `ImmersiveDialogue-v2.0.0.zip` from Nexus or this repo's Releases
+   page and drop it into Vortex.
+2. Deploy. Done.
 
 ### Manual
 
-1. Grab `main.dll` from the latest release on this repo.
-2. Copy it to:
+1. Get `ImmersiveDialogue-v2.0.0.zip` from the latest release.
+2. Copy the three files
    ```
-   <GAME>\Stalker2\Binaries\Win64\ue4ss\Mods\ImmersiveDialogueCpp\dlls\main.dll
+   zzz_ImmersiveDialogue_20_P.pak
+   zzz_ImmersiveDialogue_20_P.ucas
+   zzz_ImmersiveDialogue_20_P.utoc
    ```
-3. Add this line to `<GAME>\Stalker2\Binaries\Win64\ue4ss\Mods\mods.txt`
-   (above any keybind mods):
-   ```
-   ImmersiveDialogueCpp : 1
-   ```
-   Or drop an empty `enabled.txt` next to the `dlls/` folder.
+   into `<GAME>\Stalker2\Content\Paks\~mods\` (create `~mods` if needed).
+   Keep the three names identical apart from the extension.
 
-## Build from source
+To uninstall, delete the three files.
 
-See [BUILD.md](BUILD.md).
+## Known limitations
 
-## Configuration
-
-`config.ini` lives next to the DLL and is created with defaults on first
-launch. All keys are optional; omitted keys use the built-in defaults.
-
-```ini
-DisableCameraCentering=true
-CameraCenteringToggleKey=F6
-MouseSensitivity=0.10
-GamepadLookSensitivity=0.4
-WalkSpeed=0.15
-```
-
-- `DisableCameraCentering` — whether the vanilla NPC-centering camera modifier
-  is disabled during dialogue. Toggled in-game with `CameraCenteringToggleKey`
-  and persisted back to the file.
-- `CameraCenteringToggleKey` — the hotkey used to toggle the above. Accepts
-  key names like `F1`-`F24`, `A`-`Z`, `0`-`9`, `Home`/`End`/`PageUp`/
-  `PageDown`/`Insert`/`Delete`/`Space`/`Tab`/`Backspace`/`Enter`/`Escape`/
-  `CapsLock`/`NumLock`/`ScrollLock`/`Pause`, or a raw Win32 virtual-key hex
-  code (e.g. `0x71`). Default `F6`. `F5` is the game's quicksave key — don't
-  rebind to that.
-- `MouseSensitivity` / `GamepadLookSensitivity` — base multipliers for
-  mouse / right-stick look while in dialogue. The final applied sensitivity
-  multiplies these by your in-game `MouseSensitivityCoef` /
-  `GamepadSensitivityCoef`, so the in-game sliders still work as expected.
-- `WalkSpeed` — fraction of the character's normal walk speed used while
-  moving in dialogue. Default is a natural in-dialogue pace.
+- **Strafe start in dialogue.** For roughly half a second after you start
+  strafing from a standstill inside a dialogue, the body plays the walk-start
+  before settling into the strafe. Cosmetic.
+- **Camera centering cannot be toggled** in 2.0 (the 1.x DLL had an F6 toggle
+  and a config file). It is always off in dialogue.
+- The walking pace in dialogue is a fixed fraction of walk speed (no config).
 
 ## Compatibility
 
-- No known conflicts with pak mods, gameplay overhauls, or graphics mods —
-  the mod only touches player-pawn properties during a dialogue interaction
-  (`PC:IsInStaticDialog()==true`).
-- Confirmed working alongside NWA (mod
-  [781](https://www.nexusmods.com/stalker2heartofchornobyl/mods/781)) with its
-  `HookEngineTick=1` UE4SS-settings.ini per community report on the mod page.
-- Uses UE4SS's `on_update` callback, which needs at least one tick hook enabled
-  in `UE4SS-settings.ini`. All standard configurations have this.
+- The mod overrides three game assets: `AnimBP_Player` (player animation
+  Blueprint), `BP_Stalker2Character` (player pawn Blueprint) and `IMC_Dialog`
+  (dialogue input mapping), plus `CoreVariables.cfg`. Any other mod that
+  overrides one of those will be overridden by this mod, because the pak is
+  named to load last (`_20_P`). Weapon-positioning mods that ship their own
+  `AnimBP_Player` are the likely conflict.
+- Every game patch requires this mod to be rebuilt against the new Zone Kit.
+  If a patch breaks it, check the Nexus page for an update.
+- Save games are unaffected; the pawn class keeps its vanilla path.
+
+## Versions
+
+- **2.0.0** — rewrite as a Zone Kit pak. No UE4SS. Everything the 1.x DLL
+  did, plus proper walk/strafe animation in dialogue and controller support
+  through the game's own input system.
+- **1.0.x** — UE4SS C++ DLL. Still available under the `v1.0.4` tag and
+  earlier releases; source in `ImmersiveDialogueCpp/`. Not maintained.
+
+## Build from source
+
+See [BUILD.md](BUILD.md). The complete mod source (the Zone Kit plugin folder
+with the edited assets) is in [zonekit/ImmersiveDialogue/](zonekit/ImmersiveDialogue/),
+the tooling in [zonekit/tools/](zonekit/tools/), and the full engineering log
+of how each piece was found is in [zonekit/README.md](zonekit/README.md).
 
 ## Credits
 
