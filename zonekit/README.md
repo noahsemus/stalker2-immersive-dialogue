@@ -132,3 +132,34 @@ Alternative: hybrid pak + slim DLL that only does the anim writes (keeps UE4SS).
   `LinkedInstances` read back empty) or something upstream of it ignores
   `MovingPose`. Next step needs a reliable in-game read of the active state
   and layer (C++ probe, not Lua).
+
+### WALK/STRAFE ANIMATION WORKING (2026-09-13 22:12)
+
+Root cause of every "no change" result: **pak precedence**. Zone Kit paks mount at
+order 3; other installed mods mount at 103/1103 (`_P` / `_10_P` names) and one of
+them ships `AnimBP_Player`, so our anim override never loaded while the IMC and
+pawn overrides did. Fix: install the three OverrideContent files renamed to
+`zzz_ImmersiveDialogue_20_P.{pak,ucas,utoc}` (order 2103). `install_paktest.ps1`
+does this. The DLL's `[ImmDlgProbeCpp]` (C++ UE4SS probe in `ImmDlgProbeCpp/`)
+confirmed it via the `DlgMoving` variable appearing on the live anim instance.
+
+`AnimBP_Player` override, final shape:
+- Vars `DlgMoving` (bool), `DlgFwd`/`DlgRight` (float, stored as double),
+  `DbgState` (string, diagnostic).
+- Event graph (Blueprint Update Animation): Try Get Pawn Owner → Cast To PC →
+  IsInStaticDialog ? (Velocity → length>10 → DlgMoving; UnrotateVector(Velocity,
+  ActorRotation)/150 → DlgFwd (X), DlgRight (Y)) : all zero. State "Entered
+  State Event" tags on Moving-machine states write `DbgState` (can be removed).
+- Moving state machine rules: `Idle→IsMoving` = Moving OR DlgMoving;
+  `IsMoving→StartWalk` = (NOT WalkingOverride) OR DlgMoving; every other exit of
+  IsMoving and Walk = original AND NOT DlgMoving; `Walk→StopWalk` =
+  NOT (Moving OR DlgMoving).
+- Walk state: all 7 BlendSpace players' X/Y pins unbound and fed from
+  Select Float(DlgMoving ? DlgRight/DlgFwd : PropertyAccess
+  LocomotionData.MovementPlayRate.RightValue/ForwardValue). PlayRate left bound.
+- Additional Pose dead-body blend OR'd with DlgMoving (harmless, can revert).
+`AnimBP_player_bh` is NOT overridden (its recook breaks the unarmed sprint hand).
+
+Probe facts in dialogue: native update still runs (`AngleDirection`, `PlayRate`
+follow velocity) but `bMoving`, `MovementPlayRate.R/F` stay 0,
+`bWalkingOverride=1`, `dialog_data.dialog=1`; linked layers = bh + dummy.

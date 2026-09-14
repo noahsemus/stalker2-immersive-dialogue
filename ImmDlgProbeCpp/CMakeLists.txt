@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.22)
+set(TARGET ImmDlgProbeCpp)
+project(${TARGET})
+add_library(${TARGET} SHARED "probe.cpp")
+target_include_directories(${TARGET} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(${TARGET} PUBLIC UE4SS)
+set_target_properties(${TARGET} PROPERTIES OUTPUT_NAME "main")

@@ -18,14 +18,6 @@ LoopAsync(1000, function()
         line = line .. " DlgMoving=" .. S(safe(function() return inst.DlgMoving end))
         line = line .. " DlgFwd=" .. S(safe(function() return inst.DlgFwd end))
         if inDlg == "true" then print(line .. "\n") end
-        local states = {}
-        for i = 0, 5 do
-          local n = S(safe(function() return inst:GetCurrentStateName(i):ToString() end))
-          states[#states + 1] = i .. ":" .. n
-        end
-        line = line .. " machines=" .. S(safe(function() return inst:GetStateMachineIndex(FName("Moving")) end))
-        line = line .. " states=[" .. table.concat(states, " ") .. "]"
-        line = line .. " anyMontage=" .. S(safe(function() return inst:IsAnyMontagePlaying() end))
         if inDlg == "true" then print(line .. "\n") end
       else
         line = line .. " animInst=nil"
@@ -41,7 +33,6 @@ LoopAsync(1000, function()
         return "ok"
       end)
       line = line .. " linked=[" .. table.concat(linked, ",") .. "] lerr=" .. S(lerr)
-      line = line .. " layerByTag=" .. S(safe(function() local o = inst:GetLinkedAnimLayerInstanceByGroup(FName("WeaponLayer")); return o and o:IsValid() and o:GetClass():GetName() or "nil" end))
       if inDlg == "true" or line ~= last then print(line .. "\n") end
       last = line
     end)

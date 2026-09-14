@@ -4,3 +4,4 @@ project(ImmersiveDialogueMods)
 # Point this at your local RE-UE4SS clone (see BUILD.md).
 add_subdirectory("RE-UE4SS")
 add_subdirectory("ImmersiveDialogueCpp")
+add_subdirectory("ImmDlgProbeCpp")
