@@ -104,3 +104,31 @@ and rebinding: the Idle→IsMoving rule (`Moving OR DlgMoving`), the
 Walk→StopWalk rule, and the Walk state's blendspace pins to
 `DlgMoving ? Dlg* : MovementPlayRate.*`. Roughly 25 manual edits in the editor.
 Alternative: hybrid pak + slim DLL that only does the anim writes (keeps UE4SS).
+
+### Animation attempt log (2026-09-13 late)
+
+- `AnimBP_Player` override: vars `DlgMoving/DlgFwd/DlgRight` set in
+  *Event Blueprint Update Animation* from `IsInStaticDialog` + pawn velocity
+  (`UnrotateVector(Velocity, ActorRotation)/150`); rules `Idle→IsMoving` and
+  `Walk→StopWalk` OR'd with `DlgMoving`; the Additional-Pose dead-body blend
+  too (harmless). **Result: no walk animation in dialogue.** Probe (UE4SS Lua,
+  `zonekit/tools/probe/main.lua`) confirms the override class is the one on the
+  mesh (it has `DlgMoving`). Sprint/hands outside dialogue are fine with this
+  override alone.
+- `AnimBP_player_bh` override (bare-hands weapon layer, `WeaponLayer` blend on
+  `GetPlayerAnimInstance.StateData.bMoving` OR'd with its own `DlgMoving`):
+  **breaks the unarmed sprint left hand even outside dialogue**, from a fresh
+  load, so recooking that asset alone is lossy. Parked in
+  `zonekit/_parked_anim_bh/`. Still no walk animation with it.
+- Editor gotchas: `AnimBP_Player` crashes the editor when auto-reopened at
+  startup (compile-on-load); open it manually. Property Access nodes in the
+  *event graph* crashed the compiler once; use them only inside AnimGraph
+  rules. UE4SS Lua: `LoopAsync` must wrap work in `ExecuteInGameThread`;
+  calling `GetCurrentStateName` / `GetStateMachineIndex` from Lua crashes the
+  game; BP-added bool/float vars read back as opaque `TrivialObject`.
+- Open question: what selects the visible pose while in dialogue. The Moving
+  state machine's rules now fire on velocity, yet nothing shows, so either the
+  layer that composes Idle/Moving (unknown which class is linked unarmed;
+  `LinkedInstances` read back empty) or something upstream of it ignores
+  `MovingPose`. Next step needs a reliable in-game read of the active state
+  and layer (C++ probe, not Lua).
