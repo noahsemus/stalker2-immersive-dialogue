@@ -34,9 +34,17 @@ Slava Ukraini.
 - **Left stick doesn't scroll dialogue options.** The stick moves you; D-pad,
   arrow keys and mouse wheel still scroll answers. W and S no longer scroll
   answers either. F / Enter / click still confirms.
-- **No dialogue FOV zoom.** Bundled: `DialogFOVDefault` is set equal to the
-  normal FOV.
 - Trading and inventory screens opened from a dialogue work as normal.
+
+## Companion mod (recommended)
+
+The dialogue FOV zoom-in is a config value (`DialogFOVDefault` in
+`CoreVariables.cfg`) and is deliberately not touched by this mod, so it can't
+conflict with other config mods. Install one of the Nexus "No Dialogue Zoom"
+paks alongside, matching your normal FOV:
+<https://www.nexusmods.com/stalker2heartofchornobyl/mods/71>,
+<https://www.nexusmods.com/stalker2heartofchornobyl/mods/1499>,
+<https://www.nexusmods.com/stalker2heartofchornobyl/mods/1933>.
 
 ## Requirements
 
@@ -78,7 +86,7 @@ To uninstall, delete the three files.
 
 - The mod overrides three game assets: `AnimBP_Player` (player animation
   Blueprint), `BP_Stalker2Character` (player pawn Blueprint) and `IMC_Dialog`
-  (dialogue input mapping), plus `CoreVariables.cfg`. Any other mod that
+  (dialogue input mapping). No config files are touched. Any other mod that
   overrides one of those will be overridden by this mod, because the pak is
   named to load last (`_20_P`). Weapon-positioning mods that ship their own
   `AnimBP_Player` are the likely conflict.
