@@ -197,6 +197,19 @@ after a dialogue, reload fixes it", both **pak only** (the 1.x DLL is fine):
   trade, the backpack button on the pad does nothing; opening it once from the
   keyboard and switching back to the pad clears it.
 
+Two more the same afternoon:
+
+- BaneSixEcho (pad): X, Y, D-pad up and D-pad down stop working after talking
+  to Screw (repairs/upgrades); quicksave + quickload brings them back until the
+  next conversation.
+- Unnamed (keyboard/mouse): "2.0 disables custom keybinds" — lean rebound to
+  Q / E stops leaning, quick wheel on middle mouse stops opening, and the
+  headlamp on L or middle mouse toggles **without the hand animation, "as if
+  you are in dialogue"**. Reverting to 1.0.4 fixes it. That last detail is the
+  smoking gun: `IMC_Dialog` binds L (and middle mouse) to `IA_UI_Flashlight`,
+  the dialogue-only flashlight action, so a leaked context makes the free-play
+  headlamp behave like the in-dialogue one. Not a keybind problem at all.
+
 Diagnosis (no in-game repro yet, from the assets): the vanilla `IMC_Dialog`
 name table (parsed from the override `.uasset`, `zonekit/tools/dump_names.py`,
 which until now missed 1-2 character key names) binds exactly the keys that die:
