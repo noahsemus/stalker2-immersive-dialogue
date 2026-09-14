@@ -221,6 +221,33 @@ node (drag from its data pin). Removing a context that the game already removed
 is a no-op, so the order of the game's own removal versus ours does not matter.
 Keep `Add`/`Remove` on the same asset pin (`/Game/…/IMC_Dialog`).
 
+This cannot affect trading: the trade screen opens *inside* the dialogue, where
+`IsInStaticDialog()` is still true, so the False branch (and the removal) only
+runs once the whole conversation is over.
+
+**No walking while the trade window is open (2.0.1, same edit session)**
+
+Also in dialogue, but independent of the leak: with `IMC_Dialog` active, WASD /
+the left stick still reach the move handler while the player is browsing the
+trade (or any other inventory-style) screen. The 1.x DLL gated on the fact,
+verified in-game, that every inventory-style screen shows the mouse cursor
+while plain dialogue keeps it hidden (answers are key / scroll driven). Do the
+same here with one extra condition in two places:
+
+```
+UiBusy = Get Controller ─► Cast To PlayerController ─► Show Mouse Cursor   (the variable, not a function)
+
+IA_LocomotionForward  Triggered ─► Branch (Is In Static Dialog AND NOT UiBusy) ─► … Add Movement Input …
+                                    False ─► Set Move Vector (0, 0, 0)
+Event Tick, True branch:           Branch (Has Mapping Context (IMC_Dialog) OR UiBusy)
+                                    False ─► Add Mapping Context (IMC_Dialog, 1) ─► Set DlgImcAdded = true
+```
+
+The `False ─► Set Move Vector (0,0,0)` on the Triggered branch stops the
+character the moment the trade screen opens with a key still held. The tick's
+extra `OR UiBusy` keeps us from re-adding `IMC_Dialog` on top of the trade
+screen's own contexts; the game re-adds it itself when the screen closes.
+
 ### 5.4 AnimBP_Player (player animation Blueprint)
 
 Checkout `/Game/_STALKER2/Animations/Player/AnimBP_Player` the same way.
