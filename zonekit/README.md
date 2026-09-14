@@ -163,3 +163,15 @@ confirmed it via the `DlgMoving` variable appearing on the live anim instance.
 Probe facts in dialogue: native update still runs (`AngleDirection`, `PlayRate`
 follow velocity) but `bMoving`, `MovementPlayRate.R/F` stay 0,
 `bWalkingOverride=1`, `dialog_data.dialog=1`; linked layers = bh + dummy.
+
+### Camera + gestures (2026-09-13 23:49) — all in `AnimBP_Player` event graph
+
+- Camera: in dialogue each update, `GetCameraComponent → SetAbsolute(rotation)` +
+  `SetWorldRotation(GetControlRotation)`; on exit `SetAbsolute(off)` +
+  `SetRelativeRotation(0)` (tracked by `CamAbs`). Gestures no longer move the view.
+- `bOrientRotationToMovement` false in dialogue / true on exit (kept; harmless).
+- Gestures are montages on the MAIN instance (`IsAnyMontagePlaying` true, UpperBody
+  slot active; the DLL-era "not montages" note was wrong). While one plays:
+  `DlgRight = 0`, `DlgFwd = 0.86` if moving → straight-ahead legs, torso never
+  twists under the gesture, movement stays enabled. Chosen over the DLL's freeze.
+- Curve `AdditiveMovingUpperBody` reads 0 on all instances — not a usable signal.
