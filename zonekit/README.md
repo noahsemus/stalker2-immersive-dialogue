@@ -175,3 +175,13 @@ follow velocity) but `bMoving`, `MovementPlayRate.R/F` stay 0,
   `DlgRight = 0`, `DlgFwd = 0.86` if moving → straight-ahead legs, torso never
   twists under the gesture, movement stays enabled. Chosen over the DLL's freeze.
 - Curve `AdditiveMovingUpperBody` reads 0 on all instances — not a usable signal.
+
+### Release candidate 1 (2026-09-14 00:44) — `zonekit/builds/rc1-2026-09-14/`
+
+Fixes since checkpoint-2: on dialogue entry the anim BP now captures the camera's
+relative rotation and `bOrientRotationToMovement` (once, guarded by `CamAbs`) and
+restores *those* values on exit instead of 0,0,0 / true (that leftover caused a
+jittery camera push while strafing after any dialogue). Direction inputs are
+`Normalize(UnrotateVector(Velocity, ActorRotation)) * 0.86`; StartWalk's blendspace
+X/Y are rebound like Walk's. Trading inside dialogue works. Known cosmetic: ~0.5 s
+of straight walk-start before a strafe begins in dialogue.
