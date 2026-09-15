@@ -198,7 +198,7 @@ Event Tick ─► Branch (Is In Static Dialog)
 Pick the `/Game/…/IMC_Dialog` asset in those pins (not the `/ImmersiveDialogue/`
 one); at runtime that path resolves to the override.
 
-**Dialogue-exit cleanup (2.0.1, in progress — not yet in the committed asset)**
+**Dialogue-exit cleanup (2.0.1)**
 
 The `Add Mapping Context` above runs on every tick where `IsInStaticDialog()` is
 true, which includes the ticks *after* the dialogue UI has already removed
@@ -210,7 +210,7 @@ stop working after talking to NPCs" (Zenzi0) and "can't open the backpack on a
 PS5 pad after a trade" (Saigaiii866). Fix: remember that *we* added it and take
 it back out the first tick after dialogue ends.
 
-Add a Boolean variable `DlgImcAdded` (default false) and change the tick chain to:
+The committed asset has this. A Boolean variable `DlgImcAdded` (default false) and the tick chain is:
 
 ```
 Event Tick ─► Branch (Is In Static Dialog)

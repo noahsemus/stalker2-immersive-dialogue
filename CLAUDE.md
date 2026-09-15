@@ -2,7 +2,7 @@
 
 Purpose: mod for **S.T.A.L.K.E.R. 2 (UE5.5)** giving free movement, look and walking animation during interactive NPC dialogue.
 
-## Current shipped state: **v2.0.0 — Zone Kit pak, no UE4SS** (2026-09-14)
+## Current shipped state: **v2.0.1 — Zone Kit pak, no UE4SS** (2026-09-14)
 
 Source of truth for 2.0 is `zonekit/ImmersiveDialogue/` (the Zone Kit plugin: three overridden game assets, no config files) plus `zonekit/tools/`. **`BUILD.md` documents every edit node-by-node and the cook/install pipeline; keep it current.** `zonekit/README.md` is the engineering log of how each mechanism was found. Cooked paks of each checkpoint/release live in `zonekit/builds/`.
 
@@ -13,7 +13,7 @@ Key 2.0 facts (details in BUILD.md):
 - Editor traps: `AnimBP_Player` crashes on auto-reopen; opening the pawn BP crashes while the anim override is in the mod folder (move it out to edit the pawn); Property Access nodes only in AnimGraph, not the event graph.
 - Cook: `zonekit/tools/cook_and_install.ps1` (RunUAT `GSCCookMod` with `-UnrealExe=<kit>\Stalker2\Binaries\Win64\Stalker2ModEditor-Win64-Shipping-Cmd.exe`), 5-6 min. The editor may stay open.
 - Diagnostics: `ImmDlgProbeCpp/` (UE4SS C++ probe; must be listed before `UObjectCacheMod` in mods.txt; reads only in dialogue; SEH-guarded). Not shipped.
-- **Open bug (2.0.1 WIP, branch `th-/dazzling-meitner-jis1gq`):** `IMC_Dialog` leaks into free play after dialogue exit (the pawn tick re-adds it after the UI removed it; nothing removes it) → Q/E/L/middle-mouse and pad X/Y/D-pad up/down dead (headlamp toggles without animation: L is bound to the dialogue-only `IA_UI_Flashlight` in that context) until a save reload (Nexus reports 2026-09-14: Zenzi0, Saigaiii866, BaneSixEcho, one unnamed). Fix = `DlgImcAdded` flag + `RemoveMappingContext` on the first non-dialogue tick; steps in BUILD.md §5.3. Trading is unaffected (the removal only runs after the conversation ends; 2.0.0 already does not walk the player in the trade screen, so no cursor guard). Needs an editor edit of the pawn BP (move `AnimBP_Player.uasset` out of the mod folder first), cook, in-game check.
+- v2.0.1 (2026-09-14): fixed `IMC_Dialog` leaking into free play after dialogue exit (the pawn tick re-added it after the UI removed it; Q/E/L/middle-mouse and pad X/Y/D-pad dead until a save reload; four Nexus reports on release day). Pawn BP now has a `DlgImcAdded` flag and calls `RemoveMappingContext` on the first non-dialogue tick (BUILD.md §5.3). Dev test paks install as `_30_P` so they beat the Vortex-installed `_20_P` release copy.
 - Known cosmetic: ~0.5 s walk-start before a strafe begins in dialogue. Tried and discarded: direct IsMoving→Walk transition, blend durations, `GetLastMovementInputVector`, constant PlayRate (broke gestures). Needs a recording before another attempt.
 
 ### Collaboration workflow for 2.0
