@@ -265,6 +265,14 @@ issue (it would show as *no walking in dialogue*, not dead quick slots).
   (soft hang: game ticks, menu works, no crash dump). Not ours; see the memory
   note from 2026-09-12 and CLAUDE.md. Lesson: `Content/Paks/` is scanned
   recursively, so "parking" paks in a sibling of `~mods` does not disable them.
+  Later the same night, properly: **vanilla (no paks, UE4SS and Achievements
+  Enabler DLL proxies renamed away) sleeps fine**, so it is a mod. Ruled out
+  one at a time: our paks; the four UE4SS Lua mods (all off, still hangs);
+  UltraPlus pak, RemoveInventoryBlur, BetterNVG (Noah, still hangs); Dynamic
+  Weather Overhaul is no longer installed. Never tested: UE4SS core itself and
+  Achievements Enabler (`winmm.dll` proxy, MinHook code patches) with paks on,
+  and the pak halving. Noah stopped the bisect there and everything was
+  restored. Not our bug; only pick it up if he asks.
 
 ### Next: arms in dialogue (planned, not started)
 
