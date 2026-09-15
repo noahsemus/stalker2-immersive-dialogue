@@ -405,3 +405,9 @@ name (we ship no GameFeature data, so the ModKit has nothing of ours to parse).
    without ours. Expected: dead with ours (`AnimBP_Player`), alive without.
 If ALT dies in test 1 only with ours, the next step is runtime state (applied
 contexts and priorities after dialogue exit), not another blind build.
+
+**Result (Noah, 2026-09-15, v2.0.2 + Immersive HUD 4.2.0 + ZST):** Immersive HUD's
+ALT works every time, before and after conversations. ZST's watch key does not
+(the `AnimBP_Player` conflict, as expected). Immersive HUD is compatible; the
+reporter's dead ALT is not reproducible with our mod and points at their setup
+(ZST variant / MCM / load order), or at the 2.0.0 leak if they were on 2.0.0.

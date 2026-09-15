@@ -101,6 +101,8 @@ To uninstall, delete the files you copied.
   `AnimBP_Player`, so with both installed the watch check does nothing. A
   compatibility build is being worked out with its author. Until then it's one
   or the other.
+- **Immersive HUD:** compatible (tested with 2.0.2). Its compass / HUD keys keep
+  working before and after conversations.
 - Every game patch requires this mod to be rebuilt against the new Zone Kit.
   If a patch breaks it, check the Nexus page for an update.
 - Save games are unaffected; the pawn class keeps its vanilla path.
