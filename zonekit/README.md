@@ -411,3 +411,107 @@ ALT works every time, before and after conversations. ZST's watch key does not
 (the `AnimBP_Player` conflict, as expected). Immersive HUD is compatible; the
 reporter's dead ALT is not reproducible with our mod and points at their setup
 (ZST variant / MCM / load order), or at the 2.0.0 leak if they were on 2.0.0.
+
+## Plan: 2.1 — compatibility, optimization, MCM, talk distance (2026-09-15)
+
+### Where conflicts come from today
+
+| Our override | Who else touches it | Effect |
+|---|---|---|
+| `AnimBP_Player` | ZST, weapon / animation mods | whole-asset replacement; the loser loses all its edits |
+| `BP_Stalker2Character` | any mod editing the player pawn | same |
+| `IMC_Dialog` | mods adding dialogue keys | same |
+| `W_SkipHintView` (optional add-on) | dialogue UI mods | same, opt-in |
+
+### Compatibility, in order of payoff / risk
+
+1. **Move the pawn logic into a ModKit world subsystem + actor; drop the
+   `BP_Stalker2Character` override.** Pattern proven in the wild: Immersive HUD
+   (`BP_ModWorldImp` spawns `BP_ModActorImp`, `EnableInput`, EnhancedInputAction
+   events) and ZST (`BP_ZoneWatchSubsystem.OnTick`). The actor does what the pawn
+   does now: move handler (`AddMovementInput` on the pawn + `SetMoveVector`),
+   LookAt modifier removal, mapping-context add/remove. Ships as a NewContent
+   container under `/ImmersiveDialogue/` (unique paths, no mount-order fight; keep
+   the kit's file name so the ModKit registers the mount point). Risk: low-medium.
+2. **Our own mapping context instead of overriding `IMC_Dialog`.**
+   `IMC_ImmersiveDialogue` with the move / look rows (W A S D, left stick, mouse,
+   right stick), added above the game's dialogue context on entry and removed on
+   exit. A higher-priority context consumes its keys, so `IMC_Dialog`'s W / S /
+   left-stick "select answer" rows are shadowed without editing it; arrows, D-pad
+   and wheel still pick answers. Also retires the 2.0.1 leak class for good: we
+   only ever add/remove our own asset. Risk: low; verify the shadowing in game.
+3. **`AnimBP_Player`: keep the override unless an experiment removes it.**
+   - (a) Status quo + publish the edit list (BUILD.md §5.4) so anim mods can merge;
+     ZST compat pak as planned.
+   - (b) Experiment: dialogue-only anim class. Duplicate to
+     `/ImmersiveDialogue/AnimBP_PlayerDialogue`; the actor swaps the mesh's anim
+     class on dialogue entry and restores it on exit, so nothing is overridden
+     outside dialogue. Risks: native code caching the anim instance (crash),
+     gesture montages lost on swap, linked weapon layers need relinking, pose pop.
+     Own single-purpose test build; roll back at the first crash.
+   - (c) Linked anim layer (ZST uses `LinkAnimClassLayers`): only works for graph
+     sections that live in a layer. The Moving state machine is in the main graph,
+     so probably not viable.
+4. **Config only as patch files** (`{bpatch}`, `*_patch_ImmersiveDialogue.cfg`),
+   never whole files; the pattern grEdit and Better Vaulting already use.
+5. Keep the `_20_P` rename only on containers that still override something.
+
+### Optimizations (hygiene; frame cost today is already tiny)
+
+- Delete the diagnostic `AnimNotify_Enter*` events and `DbgState` sets.
+- Anim graph fast path: the edited transition rules and Select nodes "use
+  Blueprint to update", so they run in the Blueprint VM every frame. Compute
+  `MovingAny`, `BlendX`, `BlendY` once in the update event and bind the rules /
+  pins straight to those variables.
+- Tick: treat dialogue entry / exit as edges. LookAt removal and context add on
+  entry (re-checked a few times a second, not every frame); outside dialogue one
+  `IsInStaticDialog` read and nothing else. The anim update event likewise stops
+  re-setting variables every frame once the camera state is restored.
+
+### MCM (parity with the 1.x config.ini, plus talk distance)
+
+| 1.x key | 1.x default | 2.1 setting | How |
+|---|---|---|---|
+| `DisableCameraCentering` | true | Camera centering in dialogue (on/off) | skip the LookAt removal when on |
+| `CameraCenteringToggleKey` | F6 | Keybind, default F6 | actor checks `WasInputKeyJustPressed` while in dialogue |
+| `WalkSpeed` | 0.15 (2.0 uses 0.35) | Walk speed in dialogue, slider 0.1-1.0 | replaces the 0.35 constants |
+| `MouseSensitivity` | 0.10 x game | Look sensitivity in dialogue, 0.25-2.0 x game | needs our own look action in our context so we can scale it (the native handler applies IA_LookUp unscaled). Optional: 2.0 already follows the game's sensitivity |
+| `GamepadLookSensitivity` | 0.4 x game | same slider (or a pad-only one) | same |
+| (new) | on | Free movement in dialogue (master toggle) | actor idles when off |
+| (new) | 1.3 m | Talk distance, 1.3-3.5 m | see below |
+
+**MCM stays optional.** Immersive HUD hard-imports MCM's interfaces, so its
+logic can't load without MCM. We avoid that: the main mod keeps its defaults in
+actor variables and imports nothing from MCM. A separate `ImmersiveDialogueMCM`
+plugin (third option in the zip) implements `BPI_MCM_SettingsProvider`,
+registers the settings and writes values into our actor on load and on change.
+API surface seen in IHUD: `RegisterMCMSettings`, `RegisterModSetting`,
+`RegisterDefaultModSetting`, `GetModSetting` (bool / float / int / keybind /
+combobox), `OnCheckStateChanged`, `OnSliderValueChange`, `OnMCMButtonPressed`,
+`AddUniqueModID`. Needs MCM's author guide and example mod (linked from its Nexus
+page, mod 2225) and its interface assets available in the Zone Kit to compile.
+
+**Talk distance.** Vanilla: base object prototype `[0]` in `ObjPrototypes.cfg`
+has `MinDialogInteractDistance = 75`, `MaxDialogInteractDistance = 130`; about
+75 named NPCs override it (mostly 250, a few 150-350, two scripted at 10).
+- Without MCM: optional cfg patch variants (2 / 2.5 / 3 m) raising
+  `MaxDialogInteractDistance` on `[0]` only. To verify: the patch reaches NPCs that
+  inherit through `refkey` chains, and the player's `MaxInteractionDistance = 200`
+  (CoreVariables) doesn't cap it (traders at 250 suggest it doesn't). Don't raise
+  `MaxInteractionDistance` itself: it applies to every interaction.
+- With MCM: runtime `InteractionComponent.SetInteractionDistance(min, max)` on
+  NPCs near the player (sphere overlap every ~0.5 s, never an all-actors scan).
+  Unverified that it drives the dialogue distance; one test build first. If not,
+  the slider is dropped and the cfg variants stay.
+
+### Order (one change per build, Noah tests each)
+
+1. Talk-distance cfg patch at 2.5 m (independent, tiny).
+2. Subsystem actor replicating today's pawn logic exactly; drop the pawn override.
+3. Own mapping context; drop the `IMC_Dialog` override.
+4. Anim fast path + diagnostic cleanup.
+5. Settings as actor variables, then the MCM add-on (+ talk-distance slider test).
+6. Dialogue-only anim class experiment.
+
+Release 2.1 after 1-5; 6 only if it proves stable.
+
