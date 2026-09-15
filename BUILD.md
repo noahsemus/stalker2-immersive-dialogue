@@ -28,7 +28,7 @@ A Zone Kit "plain mod" plugin named `ImmersiveDialogue` that **overrides three
 game assets** by placing edited copies at the same relative path under the mod's
 `Content` folder. The kit cooks them into an "OverrideContent" pak; at runtime
 they replace the originals. A second, optional plugin `ImmersiveDialogueNoSkipHint`
-overrides one more asset (§5.6) and ships as its own pak so users can opt in.
+overrides one more asset (§5.6) and cooks to its own pak, shipped in the same zip under `Optional-NoSkipHint/` so users can opt in (Vortex shows a file chooser when a zip holds more than one pak set).
 
 | File (under `Content/`) | Kind | What the edit does |
 |---|---|---|

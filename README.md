@@ -57,17 +57,17 @@ paks alongside, matching your normal FOV:
 
 1. Download `ImmersiveDialogue-v2.0.2.zip` from Nexus or this repo's Releases
    page and drop it into Vortex.
-2. Optional: also download `ImmersiveDialogue-NoSkipHint-v2.0.2.zip` if you
-   want the "press X to skip" prompt gone from dialogue (with free look, moving
-   or looking around kept making it pop up). Drop it into Vortex the same way.
-3. Deploy. Done.
+2. Vortex sees more than one pak in the zip and asks which files to install:
+   tick the three `zzz_ImmersiveDialogue_20_P` files for the mod alone, or
+   **Install All** to also get the optional add-on that hides the
+   "press X to skip" prompt in dialogue (with free look, moving or looking
+   around kept making it pop up; the skip key still works either way).
+3. Deploy. Done. To change your choice later, reinstall from the zip.
 
 ### Manual
 
-1. Get `ImmersiveDialogue-v2.0.2.zip` from the latest release (and, optionally,
-   `ImmersiveDialogue-NoSkipHint-v2.0.2.zip`; same steps, its files are named
-   `zzz_ImmersiveDialogueNoSkipHint_20_P.*`).
-2. Copy the three files
+1. Get `ImmersiveDialogue-v2.0.2.zip` from the latest release.
+2. Copy the three files from its `Main` folder
    ```
    zzz_ImmersiveDialogue_20_P.pak
    zzz_ImmersiveDialogue_20_P.ucas
@@ -76,7 +76,10 @@ paks alongside, matching your normal FOV:
    into `<GAME>\Stalker2\Content\Paks\~mods\` (create `~mods` if needed).
    Keep the three names identical apart from the extension.
 
-To uninstall, delete the three files.
+   Optionally also copy the three `zzz_ImmersiveDialogueNoSkipHint_20_P.*`
+   files from `Optional-NoSkipHint` to hide the dialogue skip prompt.
+
+To uninstall, delete the files you copied.
 
 ## Known limitations
 
@@ -102,8 +105,8 @@ To uninstall, delete the three files.
 
 - **2.0.2** — walk animation in dialogue now follows your input instead of the
   body's velocity: reversing direction (A to D) no longer stops and restarts
-  the walk, and the walk-start delay on a cold start is gone. New optional
-  pak `ImmersiveDialogue-NoSkipHint` hides the dialogue skip prompt.
+  the walk, and the walk-start delay on a cold start is gone. The zip now also
+  carries an optional add-on pak that hides the dialogue skip prompt.
 - **2.0.1** — fixed keys (Q, E, L, middle mouse; pad X, Y, D-pad) going dead
   after a dialogue until a save reload.
 - **2.0.0** — rewrite as a Zone Kit pak. No UE4SS. Everything the 1.x DLL
