@@ -345,3 +345,35 @@ and Immersive HUD) with different override file names; whether the
 everyone. Their zip ships a FOMOD, which the STALKER 2 Vortex extension honours
 (it places files in a subfolder from it), so a FOMOD is an option for our own
 zip if we ever want a real option screen instead of the six-file chooser.
+
+### Immersive HUD (Nexus 1895) compatibility (2026-09-15)
+
+A user reports Immersive HUD's keybinds misbehaving alongside 2.0.0 (report
+text not yet on file). What is known about that mod from its listing (its pages
+are not reachable from the remote session; read from search snippets): a pak
+mod, configured through Mod Configuration Menu (default key **B**), compass
+shown while holding **ALT** / clicking the right stick, ammo counter shown while
+holding the **reload** key/button, keys rebindable from the in-game settings as
+"mod actions" (so it ships its own input actions and mapping-context rows,
+almost certainly an `IMC_Exploration` override plus HUD widgets).
+
+Overlap analysis:
+
+- We do not touch `IMC_Exploration`, widgets or config files, so its bindings
+  are not clobbered statically. The only way it collides with us is if it also
+  overrides `IMC_Dialog`, `BP_Stalker2Character` or `AnimBP_Player`; a HUD mod
+  has no reason to, except an `IMC_Dialog` row so its toggle works inside
+  conversations. If it does, our `_20_P` pak wins and that key dies *only while
+  in dialogue*.
+- The leaked-`IMC_Dialog` bug (fixed in 2.0.1) hits any of its keys that sit in
+  `IMC_Dialog`: on a pad the reload button is **X** (`Gamepad_FaceButton_Left`),
+  so the hold-for-ammo HUD stops working after the first conversation, exactly
+  like BaneSixEcho's dead X. On keyboard B / ALT / R are not in `IMC_Dialog`,
+  but any rebind onto Q, E, F, L, middle mouse, mouse wheel, arrows or D-pad is.
+
+Triage rule for the report: broken only after a conversation and cleared by a
+save load → the leak; 2.0.1 or later fixes it. Broken only *inside* dialogue → it
+overrides `IMC_Dialog` too; would need its rows merged into ours
+(`make_imc_override.py` can start from its asset instead of the vanilla one).
+Broken from a fresh load before any conversation → something else; need its pak
+file list.
