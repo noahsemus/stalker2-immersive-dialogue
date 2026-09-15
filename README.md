@@ -55,13 +55,18 @@ paks alongside, matching your normal FOV:
 
 ### Vortex
 
-1. Download `ImmersiveDialogue-v2.0.0.zip` from Nexus or this repo's Releases
+1. Download `ImmersiveDialogue-v2.0.2.zip` from Nexus or this repo's Releases
    page and drop it into Vortex.
-2. Deploy. Done.
+2. Optional: also download `ImmersiveDialogue-NoSkipHint-v2.0.2.zip` if you
+   want the "press X to skip" prompt gone from dialogue (with free look, moving
+   or looking around kept making it pop up). Drop it into Vortex the same way.
+3. Deploy. Done.
 
 ### Manual
 
-1. Get `ImmersiveDialogue-v2.0.0.zip` from the latest release.
+1. Get `ImmersiveDialogue-v2.0.2.zip` from the latest release (and, optionally,
+   `ImmersiveDialogue-NoSkipHint-v2.0.2.zip`; same steps, its files are named
+   `zzz_ImmersiveDialogueNoSkipHint_20_P.*`).
 2. Copy the three files
    ```
    zzz_ImmersiveDialogue_20_P.pak
@@ -75,9 +80,8 @@ To uninstall, delete the three files.
 
 ## Known limitations
 
-- **Strafe start in dialogue.** For roughly half a second after you start
-  strafing from a standstill inside a dialogue, the body plays the walk-start
-  before settling into the strafe. Cosmetic.
+- **No arms in dialogue.** Look down while walking in a dialogue and Skif's
+  arms are not there; they only appear while he gestures. Cosmetic; planned.
 - **Camera centering cannot be toggled** in 2.0 (the 1.x DLL had an F6 toggle
   and a config file). It is always off in dialogue.
 - The walking pace in dialogue is a fixed fraction of walk speed (no config).
@@ -96,6 +100,12 @@ To uninstall, delete the three files.
 
 ## Versions
 
+- **2.0.2** — walk animation in dialogue now follows your input instead of the
+  body's velocity: reversing direction (A to D) no longer stops and restarts
+  the walk, and the walk-start delay on a cold start is gone. New optional
+  pak `ImmersiveDialogue-NoSkipHint` hides the dialogue skip prompt.
+- **2.0.1** — fixed keys (Q, E, L, middle mouse; pad X, Y, D-pad) going dead
+  after a dialogue until a save reload.
 - **2.0.0** — rewrite as a Zone Kit pak. No UE4SS. Everything the 1.x DLL
   did, plus proper walk/strafe animation in dialogue and controller support
   through the game's own input system.

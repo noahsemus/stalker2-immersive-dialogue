@@ -1,17 +1,17 @@
-# Install the Zone Kit OverrideContent build as a test pak and disable the UE4SS DLL for a clean A/B.
+# Install a mod's Zone Kit OverrideContent build as a dev test pak (and disable the 1.x UE4SS DLL for a clean A/B).
+# Usage:  powershell -File install_paktest.ps1 [-Mod ImmersiveDialogue|ImmersiveDialogueNoSkipHint]
 # Run only while the game is closed. Revert with revert_paktest.ps1.
+param([string]$Mod = "ImmersiveDialogue")
 $kit  = "G:\Epic Games\STALKER2ZoneKit"
 $game = "C:\Program Files (x86)\Steam\steamapps\common\S.T.A.L.K.E.R. 2 Heart of Chornobyl\Stalker2"
-$src  = "$kit\Stalker2\SavedMods\Staged\ImmersiveDialogue\Windows\OverrideContent\Windows\Stalker2\Mods\ImmersiveDialogue\Content\Paks\Windows"
-$dst  = "$game\Content\Paks\~mods\zzz_ImmersiveDialogue_PakTest"
+$src  = "$kit\Stalker2\SavedMods\Staged\$Mod\Windows\OverrideContent\Windows\Stalker2\Mods\$Mod\Content\Paks\Windows"
+$dst  = "$game\Content\Paks\~mods\zzz_${Mod}_PakTest"
 if (Get-Process -Name "Stalker2-Win64-Shipping" -ErrorAction SilentlyContinue) { throw "game is running" }
 New-Item -ItemType Directory -Force $dst | Out-Null
-# Rename to a "_30_P" patch pak (mount order 3103) so the dev test copy beats other mods AND the Vortex-installed
-# release copy of this mod (zzz_ImmersiveDialogue_20_P, order 2103). The release zip keeps the _20_P name.
-# the three IoStore files must share a base name.
+# "_30_P" = mount order 3103: the dev test copy beats other mods AND the Vortex-installed release copy
+# (zzz_<Mod>_20_P, order 2103). Release zips keep the _20_P name. The three IoStore files share a base name.
 Remove-Item "$dst\*" -Force -ErrorAction SilentlyContinue
-foreach ($ext in "pak","ucas","utoc") { Copy-Item "$src\ImmersiveDialogueStalker2-Windows-OverrideContent.$ext" "$dst\zzz_ImmersiveDialogue_30_P.$ext" -Force }
+foreach ($ext in "pak","ucas","utoc") { Copy-Item "$src\${Mod}Stalker2-Windows-OverrideContent.$ext" "$dst\zzz_${Mod}_30_P.$ext" -Force }
 $modsTxt = "$game\Binaries\Win64\ue4ss\Mods\mods.txt"
-(Get-Content $modsTxt) -replace '^ImmersiveDialogueCpp : 1', 'ImmersiveDialogueCpp : 0' | Set-Content $modsTxt -Encoding utf8
+(Get-Content $modsTxt) -replace '^ImmersiveDialogueCpp : 1', 'ImmersiveDialogueCpp : 0' | Set-Content $modsTxt -Encoding ascii
 Get-ChildItem $dst | Select-Object Name, Length, LastWriteTime
-Select-String -Path $modsTxt -Pattern ImmersiveDialogueCpp

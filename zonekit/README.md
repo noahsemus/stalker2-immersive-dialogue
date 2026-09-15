@@ -243,3 +243,62 @@ than 1 (if so the vanilla UI's `Add` on top of ours just updates the priority,
 which is fine); whether Zenzi0's WRP `AnimBP_Player` conflict is a separate
 issue (it would show as *no walking in dialogue*, not dead quick slots).
 
+### 2.0.2 (2026-09-14, late)
+
+- **Walk driven by input, not velocity.** Noah: "hold A, then immediately D: the
+  animation fully stops and the walk-start bug reappears". Velocity passes
+  through zero on a reversal, `DlgMoving` (velocity > 10) dropped for a frame,
+  Walk->StopWalk fired, then Idle->IsMoving->StartWalk again. Now `DlgFwd/DlgRight`
+  come from the pawn's `MovementInputVector` (the property `SetMoveVector`
+  writes; X fwd, Y right) and `DlgMoving` = input seen within the last 0.15 s.
+  One build, fixed both the flip and the cold-start delay. (The earlier
+  `GetLastMovementInputVector` attempt is a different accessor; not retried.)
+- **Skip prompt.** `W_SkipHintView` (native `SkipHintView` base; BP = layout +
+  fade) pops on any input, so with free look it was always up. Shipped as a
+  separate opt-in plugin/pak with the root panel and `SkipContainer` Collapsed.
+  Second plugin created with `CreatePlainMod.bat`; the editor only discovers it
+  at startup and checks out into the *active* mod (selector in the toolbar).
+- **Probe gotcha:** `Set-Content -Encoding utf8` (PS 5.1) writes a BOM into
+  `mods.txt`, which makes UE4SS skip the first line silently. Scripts now write
+  ASCII.
+- **Sleep black screen, again.** Control test with all our paks off still hangs
+  (soft hang: game ticks, menu works, no crash dump). Not ours; see the memory
+  note from 2026-09-12 and CLAUDE.md. Lesson: `Content/Paks/` is scanned
+  recursively, so "parking" paks in a sibling of `~mods` does not disable them.
+
+### Next: arms in dialogue (planned, not started)
+
+Symptom: in dialogue, looking down while walking shows legs but no arms; arms
+appear only while a gesture montage plays, then vanish.
+
+Two candidate mechanisms; the evidence below decides which before any build:
+1. **Separate hands mesh hidden in dialogue.** The first-person hands are a
+   separate skeletal mesh component (the bare-hands layer `AnimBP_player_bh`
+   drives it). Vanilla dialogue locks the camera on the NPC, so the game may
+   simply hide that component; gestures play on the full-body mesh, which is
+   why arms show only then. Fix would be: un-hide the component while
+   `IsInStaticDialog` and no montage is playing, from the pawn BP tick.
+2. **Anim graph parks the arms.** A `dialog_data.dialog`-gated branch in
+   `AnimBP_Player` (or the bh layer) blends the arm bones to an off-screen
+   pose. Fix would be a Select on our `DlgMoving`/dialog flag inside that
+   branch, like the Walk blendspace rebinding.
+
+Evidence to collect (all independent):
+- `AnimBP_Player` AnimGraph: Ctrl+F `Dialog`; list every node that reads
+  `DialogData`; screenshot the chain into *Output Pose* (Layered blend per
+  bone / Slot / Blend Poses by Bool / Linked Anim Layer nodes and their
+  switch pins).
+- `AnimBP_player_bh` (open read-only from /Game, do NOT check out; a recook
+  of it breaks the unarmed sprint hand): same Ctrl+F `Dialog`, same screenshot.
+- Vanilla `BP_Stalker2Character` Components panel (open the /Game one, not the
+  mod copy): list the skeletal mesh components and their mesh assets.
+- Probe extension (C++, read-only, SEH-guarded like the rest): in dialogue log
+  every `SkeletalMeshComponent` on the pawn (name, mesh asset, anim class,
+  `bHiddenInGame`, `IsVisible`) and the world location of every bone whose name
+  contains `hand`/`arm` relative to the camera. Hidden-vs-posed in one run.
+- In-game: during a gesture, are the arms the detailed first-person hands
+  (sleeves/gloves) or the body mesh's arms, and do they cut or fade out?
+
+Constraints: any change runs only while `IsAnyMontagePlaying` is false (the
+existing gesture gate); one build per hypothesis; do not override
+`AnimBP_player_bh`.
