@@ -327,3 +327,13 @@ users who don't have ZoneWatch). Best path: the author runs their injection on
 our uncooked `AnimBP_Player.uasset` (public in this repo), or sends the edit
 list and we rebuild it by hand. Load-order flips don't help: whichever copy
 wins, the other mod's animation breaks. Coordination with the author pending.
+
+ZST's own README (v1.0.1, "COMPATIBILITY FOR MOD AUTHORS") lists exactly these
+three shared assets and states load order does not merge them. Author:
+**dannicroax** (Nexus mod 2721), Zone Kit pipeline with versioned builds
+("accepted042" new content / "original037" overrides), two variants (Standard
+and Immersive HUD) with different override file names; whether the
+`AnimBP_Player` edit is identical across both decides if one compat pak covers
+everyone. Their zip ships a FOMOD, which the STALKER 2 Vortex extension honours
+(it places files in a subfolder from it), so a FOMOD is an option for our own
+zip if we ever want a real option screen instead of the six-file chooser.
