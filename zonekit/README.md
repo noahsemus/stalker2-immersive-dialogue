@@ -346,34 +346,62 @@ everyone. Their zip ships a FOMOD, which the STALKER 2 Vortex extension honours
 (it places files in a subfolder from it), so a FOMOD is an option for our own
 zip if we ever want a real option screen instead of the six-file chooser.
 
-### Immersive HUD (Nexus 1895) compatibility (2026-09-15)
+### Immersive HUD (Nexus 1895) + ZST keybinds (2026-09-15)
 
-A user reports Immersive HUD's keybinds misbehaving alongside 2.0.0 (report
-text not yet on file). What is known about that mod from its listing (its pages
-are not reachable from the remote session; read from search snippets): a pak
-mod, configured through Mod Configuration Menu (default key **B**), compass
-shown while holding **ALT** / clicking the right stick, ammo counter shown while
-holding the **reload** key/button, keys rebindable from the in-game settings as
-"mod actions" (so it ships its own input actions and mapping-context rows,
-almost certainly an `IMC_Exploration` override plus HUD widgets).
+Report (QziDiKay): with Immersive Dialogue installed, **ALT** (Immersive HUD)
+and **Mouse 5** (ZST watch, Immersive HUD variant) do nothing; fine without it.
 
-Overlap analysis:
+Inspected the real paks (Noah installed IHUD 4.2.0 via Vortex; containers
+extracted with `UnrealPak <utoc> -Extract`, names and imports read with
+`zonekit/tools/zen_names.py`):
 
-- We do not touch `IMC_Exploration`, widgets or config files, so its bindings
-  are not clobbered statically. The only way it collides with us is if it also
-  overrides `IMC_Dialog`, `BP_Stalker2Character` or `AnimBP_Player`; a HUD mod
-  has no reason to, except an `IMC_Dialog` row so its toggle works inside
-  conversations. If it does, our `_20_P` pak wins and that key dies *only while
-  in dialogue*.
-- The leaked-`IMC_Dialog` bug (fixed in 2.0.1) hits any of its keys that sit in
-  `IMC_Dialog`: on a pad the reload button is **X** (`Gamepad_FaceButton_Left`),
-  so the hold-for-ammo HUD stops working after the first conversation, exactly
-  like BaneSixEcho's dead X. On keyboard B / ALT / R are not in `IMC_Dialog`,
-  but any rebind onto Q, E, F, L, middle mouse, mouse wheel, arrows or D-pad is.
+- **IHUD NewContent** (`/ImmersiveModePlus/`): actions `IA_CompassGlimpse`,
+  `IA_CompassToggle`, `IA_ShowAmmo`, `IA_MeleeFix`; context `IMC_ImmersiveHUD`
+  (LeftAlt, R, Gamepad_FaceButton_Left, Gamepad_RightThumbstick, player-mappable).
+  World subsystem `BP_ModWorldImp` spawns `BP_ModActorImp`, which calls
+  `EnableInput`, `Add/RemoveMappingContext`, binds its actions plus
+  IA_QuickSlot1-4 / IA_Inventory / IA_UI_Inventory_Close as EnhancedInputAction
+  events, imports `IMC_Inventory`, and **hard-imports Mod Configuration Menu**
+  (`/ModConfigurationMenu/BPI_MCM_API`, `BPI_MCM_SettingsProvider`, `E_MCM_SettingType`).
+- **IHUD OverrideContent** (order 3): `IMC_Exploration` (vanilla rows plus the
+  four IHUD actions, including a LeftAlt row), `DA_InputElementsModels` (Controls
+  menu entries), `W_GameHUD`, `W_UpdatedStatPanel`, `StatPanelDataAsset`, quest
+  notification data assets.
+- **ZST** (1.0.x): `BP_ZoneWatchSubsystem` → `BP_ZoneWatch`. It binds no input
+  events; it calls `QueryKeysMappedToAction(IA_ZoneWatchHold/Toggle)` and polls
+  those keys, gated on `HasMappingContext(IMC_Exploration)`, `IsMoveInputIgnored`,
+  `IsInCinematic`, vaulting, and an anim-instance cast to its `BPI_WatchPose013`.
+  Overrides `AnimBP_Player`, `IMC_Exploration` (vanilla + the two watch actions),
+  `DA_InputElementsModels`. Default key is **K**, so Mouse 5 in the report is the
+  user's own rebind. The Immersive HUD variant names its override
+  `ZoneWatchStalker2-Windows-OverrideContent_P` (order 103) so its merged
+  `IMC_Exploration` / `DA_InputElementsModels` beat IHUD's order-3 copies.
 
-Triage rule for the report: broken only after a conversation and cleared by a
-save load → the leak; 2.0.1 or later fixes it. Broken only *inside* dialogue → it
-overrides `IMC_Dialog` too; would need its rows merged into ours
-(`make_imc_override.py` can start from its asset instead of the vanilla one).
-Broken from a fresh load before any conversation → something else; need its pak
-file list.
+**Overlap with us.** A scan of every container in Noah's `~mods` for
+`IMC_Exploration`, `IMC_Dialog`, `BP_Stalker2Character`, `AnimBP_Player`,
+`DA_InputElementsModels`, `W_GameHUD`: only ours, IHUD and ZST touch any.
+- Immersive HUD: **none.** It touches nothing we override, and no IHUD blueprint
+  imports anything we override.
+- ZST: `AnimBP_Player` only (section above). Ours mounts at 2103 over its 103, so
+  the watch's pose interface is missing and the check never starts. That alone
+  explains "Mouse 5 does nothing"; the compat `AnimBP_Player` fixes it.
+
+**Ruled out for ALT:** key shadowing by our `IMC_Dialog` (it has no LeftAlt or
+thumb-button row, and Enhanced Input only shadows the same key in a
+higher-priority context); the 2.0.0 leak (same reason); mod discovery by pak
+name (we ship no GameFeature data, so the ModKit has nothing of ours to parse).
+
+**Not reproducible on Noah's install yet:**
+- MCM is not installed. IHUD's mod actor hard-imports it, so IHUD's key
+  handling may not load at all, with or without us.
+- The installed ZST is the Standard variant (1.0.0) beside IHUD. Both
+  `IMC_Exploration` overrides sit at order 3, so one mod's rows are missing
+  regardless of us (ZST's README says not to combine them).
+
+**Test plan** once MCM 2.0 and ZST's Immersive HUD variant are installed:
+1. ZST disabled; IHUD + MCM + ours: load a save, hold ALT; talk to an NPC, leave,
+   hold ALT. Repeat with ours disabled.
+2. ZST (HUD variant) enabled: watch key before and after a dialogue, with and
+   without ours. Expected: dead with ours (`AnimBP_Player`), alive without.
+If ALT dies in test 1 only with ours, the next step is runtime state (applied
+contexts and priorities after dialogue exit), not another blind build.

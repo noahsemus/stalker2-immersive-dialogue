@@ -9,6 +9,10 @@ Replace `<SCRATCH>` with a writable output folder.
   entry header is 53 bytes). Needs a `pak_index_subset.txt` produced by
   `UnrealPak.exe <pak> -List | grep <paths>`.
 - `dump_names.py` — poor man's `strings` for a `.uasset` (key / action names).
+- `zen_names.py` — FName table or imported package paths (`--imports`) of
+  *cooked* packages, for reading other mods' paks. Extract first with
+  `<kit>\Engine\Binaries\Win64\UnrealPak.exe <mod>.utoc -Extract <dir>`, then
+  `zen_names.py <dir> [--imports] [--filter REGEX]`.
 - `dump_imc.py`, `make_imc_override.py` — run *inside* the editor:
   ```
   Stalker2ModEditor-Win64-Shipping-Cmd.exe "<kit>\Stalker2\Stalker2.uproject" -run=pythonscript -script=<file> -unattended -nosplash -stdout -NoShaderCompile
