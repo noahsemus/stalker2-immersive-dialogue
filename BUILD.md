@@ -239,7 +239,7 @@ this edit does nothing until the conversation is over.
 Checkout `/Game/_STALKER2/Animations/Player/AnimBP_Player` the same way.
 
 **Variables:** `DlgMoving` (Boolean), `DlgFwd` (Float), `DlgRight` (Float),
-`CamAbs` (Boolean), `SavedOrient` (Boolean), `SavedCamRot` (Rotator),
+`LastInputTime` (Float), `CamAbs` (Boolean), `SavedOrient` (Boolean), `SavedCamRot` (Rotator),
 `DbgState` (String, diagnostic only).
 
 **Event Graph** (was empty). One chain off `Event Blueprint Update Animation`:
@@ -249,9 +249,20 @@ Try Get Pawn Owner ─► Cast To PC ─► Is In Static Dialog ─► Branch
 ```
 
 *True (in dialogue), in order:*
-1. `Get Velocity` (pawn) → `Vector Length` → `> 10` → **Set DlgMoving**.
-2. `Unrotate Vector (A = Velocity, B = Get Actor Rotation)` → `Normalize` →
-   `Break Vector` → X × 0.86 → **Set DlgFwd**; Y × 0.86 → **Set DlgRight**.
+1. `Get Movement Input Vector` (the pawn property that `Set Move Vector` writes;
+   X forward, Y right, control space) → `Vector Length` → `> 0.01` → Branch:
+   - True → **Set LastInputTime** = `Get Game Time in Seconds` → `Normalize`
+     (same vector) → `Break Vector` → X × 0.86 → **Set DlgFwd**; Y × 0.86 →
+     **Set DlgRight**.
+   - False → nothing (the last direction is kept).
+2. **Set DlgMoving** = `(Get Game Time in Seconds − LastInputTime) < 0.15`.
+
+   Input, not velocity, drives this (changed after 2.0.1). Velocity dips through
+   zero when the player flips A→D, which fired Walk→StopWalk and restarted the
+   walk from Idle with a visible walk-start; it also lagged on a cold start while
+   the body accelerates. The 0.15 s hold covers the frame or two between a key
+   release and the next key press. Confirmed in-game: A↔D flips reverse without
+   stopping and the cold-start walk-start is gone.
 3. Branch (`Is Any Montage Playing`): True → **Set DlgRight = 0** → Branch
    (DlgMoving) True → **Set DlgFwd = 0.86**. (Gesture playing: legs go straight
    ahead so the torso never twists under the gesture.)
