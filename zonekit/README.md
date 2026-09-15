@@ -302,3 +302,28 @@ Evidence to collect (all independent):
 Constraints: any change runs only while `IsAnyMontagePlaying` is false (the
 existing gesture gate); one build per hypothesis; do not override
 `AnimBP_player_bh`.
+
+### ZoneWatch conflict (2026-09-14, reported by WellFedpool; Noah sees it too)
+
+Both mods override `AnimBP_Player`; ours mounts last (`_20_P`), so ZoneWatch's
+copy loses and its watch check does nothing. Their cooked override (extracted
+with the kit's `UnrealPak <utoc> -Extract`; `zonekit/tools` notes) shows what
+they add to the anim BP: interface `/ZoneWatch/Runtime/BPI_WatchPose013`
+(function `SetWatchPose013`), variables `WatchAlpha013`, `WatchBobScale013`,
+`WatchPoseInstalled013`, `WatchPreserveGrip013`, `W13Camera/W13Native/W13Source`,
+custom events `Alpha` and `PreserveGrip`, and a block of AnimGraph nodes named
+`WatchInline013_*` (SequencePlayer on `/ZoneWatch/Runtime/AS_WatchCameraSource012`,
+ApplyMeshSpaceAdditive, BlendBoneByChannel, BlendListByBool,
+BoneDrivenController, Local/Component space converts, Save/UseCachedPose).
+The `013` suffixes and `Inline` naming look tool-generated, so the author
+probably has a patcher that injects the block into any `AnimBP_Player`.
+Their other overrides (`IMC_Exploration`, `DA_InputElementsModels`) don't
+collide with ours.
+
+Only fix: one `AnimBP_Player` carrying both sets of edits, shipped as a
+compatibility pak that requires both mods (their block references
+`/ZoneWatch/Runtime/*`, so it cannot go into our main pak without breaking
+users who don't have ZoneWatch). Best path: the author runs their injection on
+our uncooked `AnimBP_Player.uasset` (public in this repo), or sends the edit
+list and we rebuild it by hand. Load-order flips don't help: whichever copy
+wins, the other mod's animation breaks. Coordination with the author pending.

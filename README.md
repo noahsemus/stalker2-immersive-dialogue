@@ -97,6 +97,10 @@ To uninstall, delete the files you copied.
   overrides one of those will be overridden by this mod, because the pak is
   named to load last (`_20_P`). Weapon-positioning mods that ship their own
   `AnimBP_Player` are the likely conflict.
+- **Known conflict: ZoneWatch (ZST watch mod).** It also overrides
+  `AnimBP_Player`, so with both installed the watch check does nothing. A
+  compatibility build is being worked out with its author. Until then it's one
+  or the other.
 - Every game patch requires this mod to be rebuilt against the new Zone Kit.
   If a patch breaks it, check the Nexus page for an update.
 - Save games are unaffected; the pawn class keeps its vanilla path.
