@@ -614,7 +614,7 @@ public:
 
     ImmersiveDialogue() {
         ModName        = STR("ImmersiveDialogue");
-        ModVersion     = STR("1.0.4");
+        ModVersion     = STR("1.0.5");
         ModAuthors     = STR("Noah");
         ModDescription = STR("Free movement + mouse/pad look during NPC dialogue.");
     }
@@ -3418,8 +3418,13 @@ public:
             m_camEngageOffsetYaw = 0.0;
             m_camEngageOffsetPitch = 0.0;
         }
+        // v1.0.5: keep walking during a gesture. Only the animation-facing direction is
+        // forced straight ahead (strafe 0, forward 1) so the torso never twists under
+        // the gesture — the same rule the 2.0 pak's anim BP uses. Movement input itself
+        // is untouched, so the character still goes where the keys point.
+        double animFwd = fwd, animStrafe = strafe;
         if (gesture && moving) {
-            fwd = 0.0; strafe = 0.0; moving = false;
+            animFwd = 1.0; animStrafe = 0.0;
         }
         if (moving) {
             double yawDeg = ControlRotation(pawn).Yaw;
@@ -3454,8 +3459,8 @@ public:
             // smoothly. AddMovementInput above uses the raw values because the CMC
             // already ramps velocity via its own acceleration curve.
             constexpr double INPUT_RAMP_ALPHA = 0.25;
-            m_smoothFwd    += (fwd    - m_smoothFwd)    * INPUT_RAMP_ALPHA;
-            m_smoothStrafe += (strafe - m_smoothStrafe) * INPUT_RAMP_ALPHA;
+            m_smoothFwd    += (animFwd    - m_smoothFwd)    * INPUT_RAMP_ALPHA;
+            m_smoothStrafe += (animStrafe - m_smoothStrafe) * INPUT_RAMP_ALPHA;
             bool smoothMoving = (std::abs(m_smoothFwd) > 0.01 || std::abs(m_smoothStrafe) > 0.01);
             // Call the game's own input-feed primitive with the smoothed WASD/stick vector.
             // Outside dialogue the game's input pipeline calls this every frame; in dialogue
