@@ -12,6 +12,12 @@ New-Item -ItemType Directory -Force $dst | Out-Null
 # (zzz_<Mod>_20_P, order 2103). Release zips keep the _20_P name. The three IoStore files share a base name.
 Remove-Item "$dst\*" -Force -ErrorAction SilentlyContinue
 foreach ($ext in "pak","ucas","utoc") { Copy-Item "$src\${Mod}Stalker2-Windows-OverrideContent.$ext" "$dst\zzz_${Mod}_30_P.$ext" -Force }
+# NewContent (mod-only assets under /<Mod>/, e.g. the ModKit subsystem) keeps the kit's file name: its package
+# paths exist nowhere else, so mount order doesn't matter, and it matches how other Zone Kit mods ship it.
+$newSrc = "$kit\Stalker2\SavedMods\Staged\$Mod\Windows\NewContent\Windows\Stalker2\Mods\$Mod\Content\Paks\Windows"
+if (Test-Path "$newSrc\${Mod}Stalker2-Windows-NewContent.utoc") {
+    foreach ($ext in "pak","ucas","utoc") { Copy-Item "$newSrc\${Mod}Stalker2-Windows-NewContent.$ext" "$dst\${Mod}Stalker2-Windows-NewContent.$ext" -Force }
+}
 $modsTxt = "$game\Binaries\Win64\ue4ss\Mods\mods.txt"
 (Get-Content $modsTxt) -replace '^ImmersiveDialogueCpp : 1', 'ImmersiveDialogueCpp : 0' | Set-Content $modsTxt -Encoding ascii
 Get-ChildItem $dst | Select-Object Name, Length, LastWriteTime

@@ -1,1 +1,3 @@
 /ImmersiveDialogue/ImmersiveDialogue
+/ImmersiveDialogue/Runtime/BP_ImmDlgSubsystem
+/ImmersiveDialogue/_STALKER2/Animations/Player/AnimBP_PlayerDialogue
