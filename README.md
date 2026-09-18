@@ -118,7 +118,7 @@ To uninstall, delete the files you copied.
 - **2.0.0** — rewrite as a Zone Kit pak. No UE4SS. Everything the 1.x DLL
   did, plus proper walk/strafe animation in dialogue and controller support
   through the game's own input system.
-- **1.0.x** — UE4SS C++ DLL. Still available under the `v1.0.5` tag and
+- **1.0.x** — UE4SS C++ DLL. Still available under the `v1.0.6` tag and
   earlier releases; source in `ImmersiveDialogueCpp/`. Not maintained.
 
 ## Build from source
