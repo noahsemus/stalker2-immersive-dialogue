@@ -430,8 +430,8 @@ public:
     // ini or via MCM, the game default (centering ON) is restored.
     bool       m_camCenteringDisabled = true;       // toggled by F6
     // v1.0.6: optional — collapse the "hold to skip" hint (W_SkipHintView) in dialogue,
-    // like the 2.0 pak's NoSkipHint add-on. Off by default; `HideSkipHint=true` in config.ini.
-    bool       m_hideSkipHint = false;
+    // like the 2.0 pak's NoSkipHint add-on. On by default (1.0.7); `HideSkipHint=false` in config.ini.
+    bool       m_hideSkipHint = true;
 
     // Camera dialog-lock (v1.1). STALKER 2's CameraComponent is parented to `jnt_camera`
     // on the mesh, so dialog gestures animate bones that drag the camera around when
@@ -619,13 +619,13 @@ public:
         f << "WalkSpeed="               << m_walkScale    << "\n";
         f << "\n";
         f << "; Hide the 'hold to skip' hint while in dialogue (same as the 2.0 NoSkipHint\n";
-        f << "; add-on). Default: false\n";
+        f << "; add-on). Default: true\n";
         f << "HideSkipHint=" << (m_hideSkipHint ? "true" : "false") << "\n";
     }
 
     ImmersiveDialogue() {
         ModName        = STR("ImmersiveDialogue");
-        ModVersion     = STR("1.0.6");
+        ModVersion     = STR("1.0.7");
         ModAuthors     = STR("Noah");
         ModDescription = STR("Free movement + mouse/pad look during NPC dialogue.");
     }
