@@ -429,6 +429,9 @@ public:
     // Config file overrides this on load; if user sets DisableCameraCentering=false in the
     // ini or via MCM, the game default (centering ON) is restored.
     bool       m_camCenteringDisabled = true;       // toggled by F6
+    // v1.0.6: optional — collapse the "hold to skip" hint (W_SkipHintView) in dialogue,
+    // like the 2.0 pak's NoSkipHint add-on. Off by default; `HideSkipHint=true` in config.ini.
+    bool       m_hideSkipHint = false;
 
     // Camera dialog-lock (v1.1). STALKER 2's CameraComponent is parented to `jnt_camera`
     // on the mesh, so dialog gestures animate bones that drag the camera around when
@@ -450,6 +453,8 @@ public:
     double     m_smoothFwd    = 0.0;
     double     m_smoothStrafe = 0.0;
     bool       m_prevMoving   = false;
+    bool       m_prevGesture  = false;   // v1.0.6: gesture-end edge
+    uint64_t   m_postExitZeroUntilMs = 0; // v1.0.6: keep the game's move vector at zero briefly after dialogue exit
     double     m_camEngageOffsetYaw   = 0.0;
     double     m_camEngageOffsetPitch = 0.0;
     // Direct-owned controller rotation for dialogue. Initialized to the current
@@ -588,6 +593,8 @@ public:
                 try { m_padLookScale = std::stod(v); } catch (...) {}
             } else if (k == "WalkSpeed") {
                 try { m_walkScale = std::stod(v); } catch (...) {}
+            } else if (k == "HideSkipHint") {
+                m_hideSkipHint = (v == "true" || v == "1");
             }
         }
     }
@@ -610,11 +617,15 @@ public:
         f << "MouseSensitivity="        << m_mouseSens    << "\n";
         f << "GamepadLookSensitivity="  << m_padLookScale << "\n";
         f << "WalkSpeed="               << m_walkScale    << "\n";
+        f << "\n";
+        f << "; Hide the 'hold to skip' hint while in dialogue (same as the 2.0 NoSkipHint\n";
+        f << "; add-on). Default: false\n";
+        f << "HideSkipHint=" << (m_hideSkipHint ? "true" : "false") << "\n";
     }
 
     ImmersiveDialogue() {
         ModName        = STR("ImmersiveDialogue");
-        ModVersion     = STR("1.0.5");
+        ModVersion     = STR("1.0.6");
         ModAuthors     = STR("Noah");
         ModDescription = STR("Free movement + mouse/pad look during NPC dialogue.");
     }
@@ -2907,7 +2918,33 @@ public:
     // the reproducible crash on re-entering dialogue after a PDA cycle: STALKER 2's
     // PDA flow rebuilds parts of the player's component tree, which orphans our
     // caches. Writing through the dangling pointers crashes the game.
+    // v1.0.6: skip-hint collapse. FindFirstOf walks the whole object array, so the widget is
+    // looked up at most 8 times per dialogue (every 500 ms until found); once found it is
+    // re-collapsed every tick because the game shows it again on each new line.
+    UObject*   m_skipHint          = nullptr;
+    UFunction* m_skipHintSetVis    = nullptr;
+    int        m_skipHintTries     = 0;
+    uint64_t   m_skipHintLastTryMs = 0;
+    void HideSkipHintTick() {
+        if (!m_hideSkipHint) return;
+        if (m_skipHint && m_skipHint->IsUnreachable()) { m_skipHint = nullptr; m_skipHintSetVis = nullptr; }
+        if (!m_skipHint) {
+            uint64_t now = GetTickCount64();
+            if (m_skipHintTries >= 8 || (now - m_skipHintLastTryMs) < 500) return;
+            m_skipHintLastTryMs = now; ++m_skipHintTries;
+            m_skipHint = UObjectGlobals::FindFirstOf(STR("W_SkipHintView_C"));
+            if (!m_skipHint) return;
+            m_skipHintSetVis = m_skipHint->GetFunctionByNameInChain(FName(STR("SetVisibility")));
+            Output::send<LogLevel::Verbose>(STR("[ImmDlg] skip hint widget found (SetVisibility {})\n"),
+                m_skipHintSetVis ? STR("ok") : STR("missing"));
+        }
+        if (!m_skipHintSetVis) return;
+        struct { uint8_t InVisibility; } p{1};   // ESlateVisibility::Collapsed
+        m_skipHint->ProcessEvent(m_skipHintSetVis, &p);
+    }
+
     void InvalidateCachesOnDialogueExit() {
+        m_skipHint = nullptr; m_skipHintSetVis = nullptr; m_skipHintTries = 0;
         m_pawn = nullptr;
         m_pawnMesh = nullptr;
         m_animInstance = nullptr;
@@ -3194,6 +3231,12 @@ public:
             // leaving dialogue mid-walk with no key held kept Skif walking until the
             // next movement key event (present in v1.0.2 too).
             SetMoveVector(pawn, 0.0, 0.0, 0.0);
+            // v1.0.6: one zero on the exit tick is not enough — something in the game's
+            // own dialogue-end sequence lands a non-zero vector after it (a key released
+            // during the exit is the usual case), and outside dialogue that vector is only
+            // rewritten on the next key event. Keep re-zeroing for 1.5 s while no key or
+            // stick is held; stop as soon as the player gives a real input.
+            m_postExitZeroUntilMs = GetTickCount64() + 1500;
             ForceAnimState(false);
             ForceLocomotionData(false, 0.0, 0.0);
             ForceShadowAnimState(false);
@@ -3261,6 +3304,19 @@ public:
             g_dx.exchange(0); g_dy.exchange(0);
             m_pending_dx = 0.0; m_pending_dy = 0.0;
             m_prevInDialog = false;
+            if (m_postExitZeroUntilMs) {
+                if (GetTickCount64() >= m_postExitZeroUntilMs) {
+                    m_postExitZeroUntilMs = 0;
+                } else {
+                    bool held = (GetAsyncKeyState('W') & 0x8000) || (GetAsyncKeyState('A') & 0x8000)
+                             || (GetAsyncKeyState('S') & 0x8000) || (GetAsyncKeyState('D') & 0x8000);
+                    double px = 0.0, py = 0.0, lx = 0.0, ly = 0.0;
+                    ReadPadSticks(px, py, lx, ly);
+                    if (px != 0.0 || py != 0.0) held = true;
+                    if (held) m_postExitZeroUntilMs = 0;   // real input: the game owns the vector again
+                    else      SetMoveVector(pawn, 0.0, 0.0, 0.0);
+                }
+            }
             return;
         }
 
@@ -3317,6 +3373,7 @@ public:
             PollHotkeys();
             return;
         }
+        HideSkipHintTick();
 
         ResetIgnore(pawn);
 
@@ -3426,6 +3483,15 @@ public:
         if (gesture && moving) {
             animFwd = 1.0; animStrafe = 0.0;
         }
+        // v1.0.6: the game's own pipeline only rewrites the move vector on key events, so
+        // any non-zero value we leave in it keeps Skif walking once the game takes over
+        // again (seen as auto-walk after a gesture). On the gesture-end tick with no key
+        // held, hand it an exact zero and drop the ramp state.
+        if (m_prevGesture && !gesture && !moving) {
+            m_smoothFwd = 0.0; m_smoothStrafe = 0.0;
+            SetMoveVector(pawn, 0.0, 0.0, 0.0);
+        }
+        m_prevGesture = gesture;
         if (moving) {
             double yawDeg = ControlRotation(pawn).Yaw;
             double r = yawDeg * 3.14159265358979323846 / 180.0;
@@ -3461,6 +3527,12 @@ public:
             constexpr double INPUT_RAMP_ALPHA = 0.25;
             m_smoothFwd    += (animFwd    - m_smoothFwd)    * INPUT_RAMP_ALPHA;
             m_smoothStrafe += (animStrafe - m_smoothStrafe) * INPUT_RAMP_ALPHA;
+            // v1.0.6: the ramp never reaches zero on its own; snap it so the move vector we
+            // hand the game is exactly zero once no key is held.
+            if (!moving) {
+                if (std::abs(m_smoothFwd)    < 0.05) m_smoothFwd    = 0.0;
+                if (std::abs(m_smoothStrafe) < 0.05) m_smoothStrafe = 0.0;
+            }
             bool smoothMoving = (std::abs(m_smoothFwd) > 0.01 || std::abs(m_smoothStrafe) > 0.01);
             // Call the game's own input-feed primitive with the smoothed WASD/stick vector.
             // Outside dialogue the game's input pipeline calls this every frame; in dialogue
@@ -3468,7 +3540,13 @@ public:
             // signal. Feeding it ourselves lets the game's natural locomotion pipeline drive
             // the anim graph — same class of bypass as the Wwise footstep fix.
             //   Pawn-relative convention: X=forward, Y=right (strafe), Z=0
-            SetMoveVector(pawn, m_smoothFwd, m_smoothStrafe, 0.0);
+            // v1.0.6: the game gets an exact zero the moment no key is held (the pak does
+            // the same on the action's Completed event). The ramp keeps feeding the anim
+            // writes below, but the game's own copy of the vector must never hold a
+            // decaying non-zero value: it snapshots it during the dialogue-exit tail and
+            // keeps walking on it until the next key event.
+            if (moving) SetMoveVector(pawn, m_smoothFwd, m_smoothStrafe, 0.0);
+            else        SetMoveVector(pawn, 0.0, 0.0, 0.0);
             ForceAnimState(smoothMoving);
             ForceLocomotionData(smoothMoving, m_smoothFwd, m_smoothStrafe);
             ForceShadowAnimState(smoothMoving);
