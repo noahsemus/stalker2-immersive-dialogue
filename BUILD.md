@@ -239,6 +239,24 @@ Trading itself needs no change: in 2.0.0 the player does not walk while the
 trade screen is open (confirmed in play; the screen takes UI-only input), and
 this edit does nothing until the conversation is over.
 
+**Cinematic guard (2.0.3)**
+
+Story cutscenes that run through the dialogue system report `IsInStaticDialog()`
+as true, so the mod treated them as conversations and took the camera over.
+The pawn now has a **pure function `ImmDlgActive`** (one Boolean output `Active`):
+
+```
+Active = Is In Static Dialog
+         AND NOT ( Is In Cinematic
+                   OR  Get Controller -> Cast To PlayerController (pure) -> Is Look Input Ignored )
+```
+
+`Is In Cinematic` is on the pawn's native base class (`Obj`). Both Branches that
+used `Is In Static Dialog` directly (the one after `IA_LocomotionForward` ->
+Triggered and the one after `Event Tick`) take `ImmDlgActive` as their Condition
+instead. When the guard turns false mid-scene the Tick's False path runs, so the
+mapping context we added is removed as on a normal dialogue exit.
+
 ### 5.4 AnimBP_Player (player animation Blueprint)
 
 Checkout `/Game/_STALKER2/Animations/Player/AnimBP_Player` the same way.
@@ -252,6 +270,14 @@ Checkout `/Game/_STALKER2/Animations/Player/AnimBP_Player` the same way.
 ```
 Try Get Pawn Owner ─► Cast To PC ─► Is In Static Dialog ─► Branch
 ```
+
+Since 2.0.3 the Branch's Condition is not `Is In Static Dialog` alone but the same
+guard as the pawn, built inline in a comment box "Cinematic Guard" (the anim
+Blueprint does not reference the pawn Blueprint):
+`Is In Static Dialog AND NOT (Is In Cinematic OR Is Look Input Ignored)`, with
+`Is In Cinematic` from **As PC** and `Is Look Input Ignored` from **As PC** ->
+`Get Controller` -> `Cast To PlayerController` (pure). When it goes false the
+False path below restores the camera exactly as on dialogue exit.
 
 *True (in dialogue), in order:*
 1. `Get Movement Input Vector` (the pawn property that `Set Move Vector` writes;
@@ -368,8 +394,9 @@ the hint is gone.
   launch instead. If the crash loop starts, delete the `OpenAssetsAtExit=` lines
   from `%LOCALAPPDATA%\Stalker2\Saved\Config\WindowsEditor\EditorPerProjectUserSettings.ini`
   with the editor closed.
-- **Opening `BP_Stalker2Character` crashes while the modified `AnimBP_Player`
-  is in the mod folder** (the pawn editor previews the anim class). To edit the
+- **Opening `BP_Stalker2Character` crashed while the modified `AnimBP_Player`
+  was in the mod folder** (not reproduced since 2026-09-17; for 2.0.3 both were
+  edited in one session. If it comes back:) (the pawn editor previews the anim class). To edit the
   pawn, move `AnimBP_Player.uasset` out of the mod folder temporarily, edit,
   then move it back.
 - **Property Access nodes in the anim Blueprint's Event Graph** crashed the

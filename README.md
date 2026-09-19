@@ -109,6 +109,11 @@ To uninstall, delete the files you copied.
 
 ## Versions
 
+- **2.0.3** — the mod now stands down during cutscenes. Story scenes that run
+  through the dialogue system (the prologue's dog and Richter scenes, "Back to
+  the Slag Heap", the DLC's "Distant Mirage") could end up with the camera stuck
+  facing one way or unable to tilt up and down. The mod only acts when the game
+  is not in a cinematic and has not taken look control away.
 - **2.0.2** — walk animation in dialogue now follows your input instead of the
   body's velocity: reversing direction (A to D) no longer stops and restarts
   the walk, and the walk-start delay on a cold start is gone. The zip now also
