@@ -345,3 +345,39 @@ and Immersive HUD) with different override file names; whether the
 everyone. Their zip ships a FOMOD, which the STALKER 2 Vortex extension honours
 (it places files in a subfolder from it), so a FOMOD is an option for our own
 zip if we ever want a real option screen instead of the six-file chooser.
+
+### 2.0.3 — cutscene camera reports (2026-09-18/19)
+
+Three Nexus reports against 2.0.2: Candyshot (prologue: the dog-bite scene and
+waking up next to Richter — view stuck facing one way, no look control),
+wyf2003121 (cutscene perspective wrong, intermittent stutter), Zenzi0 (every
+cutscene follows its scripted path but the camera cannot pitch; very visible in
+"Back to the Slag Heap" and the DLC's "Distant Mirage", where Skif should look up
+the stairs and down at a card). Noah cannot reproduce with the same mod list on
+patch 2.0.6 (game updated 09-18, build 25382007; kit files dated 09-11).
+
+Working explanation: those scenes run through the dialogue system, so
+`IsInStaticDialog()` is true and the mod does its two camera jobs in them —
+removes `CameraModifier_LookAt` and, in the anim BP, sets the camera absolute and
+writes `ControlRotation` into it every frame. In a cutscene ControlRotation only
+follows the scripted yaw (or nothing at all), so the head-bone pitch the scene
+relies on is overridden.
+
+Fix shipped: the "in dialogue" condition everywhere is now
+`IsInStaticDialog AND NOT (IsInCinematic OR controller.IsLookInputIgnored)`
+(BUILD.md §5.3/5.4). Verified in the cooked assets with `zen_names.py`; normal
+dialogue regression-tested by Noah. Whether it cures the reports is unconfirmed.
+
+If reports continue, next hypotheses, with the question that separates them
+(asked in the thread): does it survive a fresh game start, going straight to the
+cutscene without talking to anyone?
+- Yes -> the guard flags aren't set in those scenes (find the right flag with the
+  flags probe: `IsInCinematic`, `CinematicSequence`, `CinematicModeCounter`,
+  `IsLookInputIgnored`, `IsMovementEnabled`), or our override copies are stale
+  against the current game patch (rebuild against an updated kit).
+- No -> camera state leaked from an earlier dialogue: the anim BP's restore runs
+  only on the instance that captured `SavedCamRot`; an anim re-init mid-dialogue
+  (armour swap inside a trade) or a quickload mid-dialogue leaves the camera
+  absolute or restores garbage. Fix would be to key capture/restore on the
+  camera's real `IsUsingAbsoluteRotation` and keep the saved values on the pawn.
+
