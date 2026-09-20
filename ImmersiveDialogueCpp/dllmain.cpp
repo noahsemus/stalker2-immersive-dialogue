@@ -455,6 +455,8 @@ public:
     bool       m_prevMoving   = false;
     bool       m_prevGesture  = false;   // v1.0.6: gesture-end edge
     uint64_t   m_postExitZeroUntilMs = 0; // v1.0.6: keep the game's move vector at zero briefly after dialogue exit
+    bool       m_postExitCarry = false;   // v1.0.7: a movement key held through the dialogue exit keeps Skif walking
+    bool       m_rawInDlg = false;        // IsInStaticDialog before the cinematic guard
     double     m_camEngageOffsetYaw   = 0.0;
     double     m_camEngageOffsetPitch = 0.0;
     // Direct-owned controller rotation for dialogue. Initialized to the current
@@ -625,7 +627,7 @@ public:
 
     ImmersiveDialogue() {
         ModName        = STR("ImmersiveDialogue");
-        ModVersion     = STR("1.0.6");
+        ModVersion     = STR("1.0.7");
         ModAuthors     = STR("Noah");
         ModDescription = STR("Free movement + mouse/pad look during NPC dialogue.");
     }
@@ -3198,6 +3200,19 @@ public:
             tl_selfDialogueQuery = true;
             inDlg = CallBool(pawn, STR("IsInStaticDialog"));
             tl_selfDialogueQuery = false;
+            // v1.0.7: cinematic guard (same rule as the 2.0.3 pak). Story cutscenes that run
+            // through the dialogue system report IsInStaticDialog too; in them the mod must
+            // not inject movement, remove the LookAt modifier or force the camera onto
+            // ControlRotation (that froze the cutscene camera's pitch). Treat "in a
+            // cinematic" or "look input taken away" as not-in-dialogue; if it flips
+            // mid-dialogue, the normal exit edge below restores everything.
+            m_rawInDlg = inDlg;
+            if (inDlg) {
+                if (CallBool(pawn, STR("IsInCinematic"))) inDlg = false;
+                else if (UObject* ctrl = GetPawnController(pawn)) {
+                    if (CallBool(ctrl, STR("IsLookInputIgnored"))) inDlg = false;
+                }
+            }
         }
         g_inDialogue.store(inDlg, std::memory_order_relaxed);
 
@@ -3237,6 +3252,10 @@ public:
             // rewritten on the next key event. Keep re-zeroing for 1.5 s while no key or
             // stick is held; stop as soon as the player gives a real input.
             m_postExitZeroUntilMs = GetTickCount64() + 1500;
+            // v1.0.7: if a movement key is held right now, carry the walk across the exit
+            // (see the !inDlg block). Only for a real dialogue end, not when the cinematic
+            // guard is what switched us off.
+            m_postExitCarry = !m_rawInDlg;
             ForceAnimState(false);
             ForceLocomotionData(false, 0.0, 0.0);
             ForceShadowAnimState(false);
@@ -3304,17 +3323,35 @@ public:
             g_dx.exchange(0); g_dy.exchange(0);
             m_pending_dx = 0.0; m_pending_dy = 0.0;
             m_prevInDialog = false;
-            if (m_postExitZeroUntilMs) {
-                if (GetTickCount64() >= m_postExitZeroUntilMs) {
+            if (m_postExitCarry || m_postExitZeroUntilMs) {
+                bool kw = (GetAsyncKeyState('W') & 0x8000) != 0, ks = (GetAsyncKeyState('S') & 0x8000) != 0;
+                bool ka = (GetAsyncKeyState('A') & 0x8000) != 0, kd = (GetAsyncKeyState('D') & 0x8000) != 0;
+                double fwd = (kw ? 1.0 : 0.0) - (ks ? 1.0 : 0.0), strafe = (kd ? 1.0 : 0.0) - (ka ? 1.0 : 0.0);
+                double px = 0.0, py = 0.0, lx = 0.0, ly = 0.0;
+                ReadPadSticks(px, py, lx, ly);
+                if (py != 0.0) fwd = py;
+                if (px != 0.0) strafe = px;
+                bool held = (fwd != 0.0 || strafe != 0.0);
+                if (m_postExitCarry) {
+                    // v1.0.7: the game ignores keys that were already down when it switched its
+                    // input context back, so a key held through the exit never reaches its own
+                    // pipeline and Skif stopped until the key was pressed again. While the
+                    // key (or stick) stays held we keep writing the move vector ourselves;
+                    // the first tick with nothing held ends the carry and hands over to the
+                    // zero window below, by which time the game accepts fresh presses again.
+                    if (held && !m_rawInDlg) {
+                        SetMoveVector(pawn, fwd, strafe, 0.0);
+                    } else {
+                        m_postExitCarry = false;
+                        m_postExitZeroUntilMs = GetTickCount64() + 1500;
+                        SetMoveVector(pawn, 0.0, 0.0, 0.0);
+                    }
+                } else if (GetTickCount64() >= m_postExitZeroUntilMs) {
                     m_postExitZeroUntilMs = 0;
+                } else if (held) {
+                    m_postExitZeroUntilMs = 0;   // fresh input: the game owns the vector again
                 } else {
-                    bool held = (GetAsyncKeyState('W') & 0x8000) || (GetAsyncKeyState('A') & 0x8000)
-                             || (GetAsyncKeyState('S') & 0x8000) || (GetAsyncKeyState('D') & 0x8000);
-                    double px = 0.0, py = 0.0, lx = 0.0, ly = 0.0;
-                    ReadPadSticks(px, py, lx, ly);
-                    if (px != 0.0 || py != 0.0) held = true;
-                    if (held) m_postExitZeroUntilMs = 0;   // real input: the game owns the vector again
-                    else      SetMoveVector(pawn, 0.0, 0.0, 0.0);
+                    SetMoveVector(pawn, 0.0, 0.0, 0.0);
                 }
             }
             return;
