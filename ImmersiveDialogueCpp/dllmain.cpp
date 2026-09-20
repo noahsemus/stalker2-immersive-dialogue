@@ -280,9 +280,17 @@ static LRESULT CALLBACK HookedWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         return CallWindowProc(g_origWndProc, h, msg, w, l);
     }
 
-    // Only swallow W/A/S/D during dialogue so option list doesn't scroll on movement keys.
-    // GetAsyncKeyState still sees them so our movement code still works.
-    if ((msg == WM_KEYDOWN || msg == WM_KEYUP || msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP)
+    // Only swallow W/A/S/D key-DOWNs during dialogue so option list doesn't scroll on
+    // movement keys. GetAsyncKeyState still sees them so our movement code still works.
+    // v1.0.8: key-UPs pass through. Swallowing the release too meant a key that was held
+    // when the dialogue started (walking up to the NPC and pressing the talk key) and
+    // released inside the dialogue stayed "down" in the game's own key state; when the
+    // dialogue ended the game resumed walking on that stale key in the approach direction
+    // until it was pressed again (Noah, 2026-09-20: "don't move in dialogue, dialogue ends,
+    // Skif walks off in a random direction"). A release can't scroll the option list
+    // (that needs a press edge), and a release for a key the game never saw pressed is
+    // harmless.
+    if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN)
         && g_inDialogue.load(std::memory_order_relaxed) && !g_uiBusy.load(std::memory_order_relaxed)) {
         if (w == 'W' || w == 'A' || w == 'S' || w == 'D') return 0;
     }
@@ -627,7 +635,7 @@ public:
 
     ImmersiveDialogue() {
         ModName        = STR("ImmersiveDialogue");
-        ModVersion     = STR("1.0.7");
+        ModVersion     = STR("1.0.8");
         ModAuthors     = STR("Noah");
         ModDescription = STR("Free movement + mouse/pad look during NPC dialogue.");
     }

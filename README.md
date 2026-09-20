@@ -197,8 +197,10 @@ GitHub issues, or the Nexus page (mod 2698).
 - **2.0.0** — rewrite as a Zone Kit pak. No UE4SS. Everything the 1.x DLL
   did, plus proper walk/strafe animation in dialogue and controller support
   through the game's own input system.
-- **1.0.x** — UE4SS C++ DLL. Still available under the `v1.0.7` tag and
-  earlier releases; source in `ImmersiveDialogueCpp/`. Not maintained.
+- **1.0.x** — UE4SS C++ DLL. Still available under the `v1.0.8` tag and
+  earlier releases; source in `ImmersiveDialogueCpp/`. Bug fixes only
+  (1.0.8: no more walking off on your own after a conversation you did not
+  move in).
 
 ## Build from source
 
