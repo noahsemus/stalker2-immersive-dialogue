@@ -381,3 +381,32 @@ cutscene without talking to anyone?
   absolute or restores garbage. Fix would be to key capture/restore on the
   camera's real `IsUsingAbsoluteRotation` and keep the saved values on the pawn.
 
+### 2.0.4 — ZST's combined AnimBP_Player, frozen anim block, marker (2026-09-19)
+
+After installing 2.0.3 through Vortex, dialogue walking stopped animating on
+Noah's install. Cause: ZST 1.0.5 (2026-09-18) ships a combined `AnimBP_Player`
+(their watch block + our 2.0.2 block, credited, MIT) as
+`ZoneWatch...OverrideContent_30_P` (order 3103 > our 2103), and gates our block
+on loading `/Game/__ModKitWwiseCookAnchor_ImmersiveDialogue_1789435301__`. That
+asset is generated per cook with the cook's timestamp, so it exists only in the
+2.0.2 pak: 2.0.2 -> detected, walking animates; any later build -> our block is
+switched off in their copy. (Found by extracting their container and comparing
+name tables with `zen_names.py`; their tool prefixes injected nodes, e.g.
+`Final051_Dialogue051_K2Node_DynamicCast_AsPC`, and adds `DialogueDetected051` /
+`DialogueCompanion051`.) Dev builds never showed it because `_30_P` ties with
+theirs and ours happened to win. Isolation installs: `_40_P` = ours wins (walk
+animates, watch dead), `_25_P` = theirs wins over our dev build (watch works, no
+walk animation, camera fine).
+
+Shipping the old anchor to satisfy their check was rejected: it would also
+re-enable their embedded copy of our pre-2.0.4 camera code, which has no
+cinematic guard.
+
+Design response, so other authors never have to chase our releases again:
+- Everything that changes (camera, guards, later settings) lives in the pawn /
+  future helper. `AnimBP_Player` keeps only the walk wiring and is frozen.
+- Permanent marker `/Game/ImmersiveDialogueCompat/ID_AnimInterface_v1` for
+  detection; interface revision in the name, not the mod version.
+- README "Compatibility for mod authors" documents the block, the marker, the
+  load-order rule and what not to detect.
+

@@ -257,13 +257,54 @@ Triggered and the one after `Event Tick`) take `ImmDlgActive` as their Condition
 instead. When the guard turns false mid-scene the Tick's False path runs, so the
 mapping context we added is removed as on a normal dialogue exit.
 
+**Dialogue camera (2.0.4, moved here from the anim Blueprint)**
+
+Variables: `CamAbs` (Boolean), `SavedCamRot` (Rotator), `SavedOrient` (Boolean),
+`CamRestoreUntil` (Float). "Camera" below is the node `Get Camera Component`
+(Target is PC, self); "Character Movement" is the component getter.
+
+- Comment box **`Cam: init`**: `Event BeginPlay` -> `SET SavedCamRot` (camera ->
+  `Get Relative Rotation`) -> `SET SavedOrient` (Character Movement ->
+  `Get Orient Rotation to Movement`). A clean value always exists before the
+  first dialogue.
+- Comment box **`Cam: in dialogue`** (every tick while `ImmDlgActive`): Branch
+  `cam clean?` = NOT camera -> `Get Absolute Rotation`; True -> re-capture
+  `SavedCamRot` and `SavedOrient`. Then, from both Branch outputs: camera ->
+  `Set Absolute` (only `New Absolute Rotation` ticked) -> camera ->
+  `Set World Rotation` (`Get Control Rotation`) -> `SET CamAbs` true ->
+  Character Movement -> `Set Orient Rotation to Movement` false.
+- Comment box **`Cam: after dialogue`** (every tick while not `ImmDlgActive`), a
+  `Sequence` labelled `seq: cam after`: `Then 0` -> Branch `was abs?` (`CamAbs`)
+  True -> `SET CamAbs` false -> `SET CamRestoreUntil` = `Get Game Time in
+  Seconds` + 0.5 -> `Set Orient Rotation to Movement` (`SavedOrient`). `Then 1`
+  -> Branch `restore window?` (`Get Game Time in Seconds` < `CamRestoreUntil`)
+  True -> camera -> `Set Absolute` (nothing ticked) -> camera ->
+  `Set Relative Rotation` (`SavedCamRot`).
+- Hook-up: the `Event Tick` Branch (`ImmDlgActive`) True -> `Sequence`
+  `seq: in dialogue` (`Then 0` -> `cam clean?`, `Then 1` -> the existing
+  `Cast To PlayerController`); False -> `Sequence` `seq: not in dialogue`
+  (`Then 0` -> the existing `Branch (Dlg Imc Added)`, `Then 1` -> `seq: cam after`).
+
+The half-second restore window and the clean-only capture exist because another
+mod's `AnimBP_Player` may still contain our pre-2.0.4 camera code and run it in
+the same frames; this makes the pawn's result the one that sticks. `Sequence`
+nodes keep the chains from looping or dead-ending.
+
+**Compatibility marker (2.0.4).** `ImmersiveDialogueCompat/ID_AnimInterface_v1`
+in the mod's Content (an empty CurveFloat made by `zonekit/tools/create_marker.py`)
+is listed in `OverridePackages.txt` and cooks to
+`/Game/ImmersiveDialogueCompat/ID_AnimInterface_v1`. Other mods load that path
+to detect us. Never rename or remove it; see the README's mod-author section.
+
 ### 5.4 AnimBP_Player (player animation Blueprint)
 
 Checkout `/Game/_STALKER2/Animations/Player/AnimBP_Player` the same way.
 
+**Frozen from 2.0.4.** Other mods merge this block into their own
+`AnimBP_Player` (ZST does), so it must not change; put new logic in the pawn.
+
 **Variables:** `DlgMoving` (Boolean), `DlgFwd` (Float), `DlgRight` (Float),
-`LastInputTime` (Float), `CamAbs` (Boolean), `SavedOrient` (Boolean), `SavedCamRot` (Rotator),
-`DbgState` (String, diagnostic only).
+`LastInputTime` (Float), `DbgState` (String, diagnostic only).
 
 **Event Graph** (was empty). One chain off `Event Blueprint Update Animation`:
 
@@ -271,13 +312,10 @@ Checkout `/Game/_STALKER2/Animations/Player/AnimBP_Player` the same way.
 Try Get Pawn Owner ─► Cast To PC ─► Is In Static Dialog ─► Branch
 ```
 
-Since 2.0.3 the Branch's Condition is not `Is In Static Dialog` alone but the same
-guard as the pawn, built inline in a comment box "Cinematic Guard" (the anim
-Blueprint does not reference the pawn Blueprint):
-`Is In Static Dialog AND NOT (Is In Cinematic OR Is Look Input Ignored)`, with
-`Is In Cinematic` from **As PC** and `Is Look Input Ignored` from **As PC** ->
-`Get Controller` -> `Cast To PlayerController` (pure). When it goes false the
-False path below restores the camera exactly as on dialogue exit.
+The Branch (comment "In dialogue?") takes `Is In Static Dialog` directly. 2.0.3
+had the cinematic guard inline here; 2.0.4 removed it again because the pawn does
+not write `Movement Input Vector` during cinematics, so this block stays quiet
+there on its own.
 
 *True (in dialogue), in order:*
 1. `Get Movement Input Vector` (the pawn property that `Set Move Vector` writes;
@@ -297,24 +335,11 @@ False path below restores the camera exactly as on dialogue exit.
 3. Branch (`Is Any Montage Playing`): True → **Set DlgRight = 0** → Branch
    (DlgMoving) True → **Set DlgFwd = 0.86**. (Gesture playing: legs go straight
    ahead so the torso never twists under the gesture.)
-4. Branch (NOT CamAbs): True → **Set SavedCamRot** = camera `Get Relative
-   Rotation`; **Set SavedOrient** = CharacterMovement `Orient Rotation To
-   Movement`. (One-time capture on entry.)
-5. Camera `Set Absolute` (Rotation only) → camera `Set World Rotation (Get
-   Control Rotation)` → **Set CamAbs = true** → CharacterMovement `Set Orient
-   Rotation To Movement = false`.
 
-Camera = `Get Camera Component` on the PC; CharacterMovement = `Get Character
-Movement`.
+(Up to 2.0.3 steps 4-5 here captured and took over the camera; that lives in the
+pawn now, see "Dialogue camera" in §5.3.)
 
-*False (not in dialogue):* **Set DlgMoving = false, DlgFwd = 0, DlgRight = 0** →
-Branch (CamAbs) True → camera `Set Absolute` (all off) → camera `Set Relative
-Rotation (SavedCamRot)` → **Set CamAbs = false** → `Set Orient Rotation To
-Movement (SavedOrient)`.
-
-Restoring the *saved* values rather than 0 / true matters: restoring zero
-rotation and `true` left a jittery camera push while strafing after any
-dialogue.
+*False (not in dialogue):* **Set DlgMoving = false, DlgFwd = 0, DlgRight = 0**.
 
 *Diagnostic events (safe to delete):* `AnimNotify_EnterIdle`, `…EnterStartWalk`,
 `…EnterWalk`, `…EnterStopWalk`, `…EnterStartRun`, `…EnterRun`, `…EnterJog`,
