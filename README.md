@@ -97,13 +97,8 @@ To uninstall, delete the files you copied.
   overrides one of those will be overridden by this mod, because the pak is
   named to load last (`_20_P`). Weapon-positioning mods that ship their own
   `AnimBP_Player` are the likely conflict.
-- **Known conflict: ZoneWatch (ZST watch mod).** It also overrides
-  `AnimBP_Player`, so with both installed the watch check does nothing. A
-  compatibility build is being worked out with its author. Until then it's one
-  or the other.
 - **Immersive HUD:** compatible (tested with 2.0.2). Its compass / HUD keys keep
   working before and after conversations.
-
 - **Zone Standard Time (ZST watch mod).** ZST ships its own `AnimBP_Player`
   that includes this mod's walk wiring and loads above ours, so the watch works
   with both installed. ZST 1.0.5 only recognises the 2.0.2 build of this mod;
