@@ -1,3 +1,4 @@
 /ImmersiveDialogue/_Stalker_2/data/input/InputMappingContexts/IMC_Dialog
 /ImmersiveDialogue/GameLite/Blueprints/Characters/Player/BP_Stalker2Character
 /ImmersiveDialogue/_STALKER2/Animations/Player/AnimBP_Player
+/ImmersiveDialogue/ImmersiveDialogueCompat/ID_AnimInterface_v1
