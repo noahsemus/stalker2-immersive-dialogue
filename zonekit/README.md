@@ -644,3 +644,102 @@ Design response, so other authors never have to chase our releases again:
 - README "Compatibility for mod authors" documents the block, the marker, the
   load-order rule and what not to detect.
 
+
+## Plan: universal compatibility — no asset overrides at all (2026-09-21)
+
+Trigger: S-Watch (Nexus 2780, "Alpha", built on ZST) lists Immersive Dialogue
+as incompatible. Same root cause as ZST: it ships its own `AnimBP_Player`. Any
+mod that touches that asset (watches, weapon/animation packs, HUD-on-body mods)
+will keep colliding with us for as long as we override it, and the only remedy
+today is a merged copy from the other author. The goal here is that **no mod
+except a dialogue mod ever needs a patch for us**, which means the mod must
+stop overriding game assets entirely: not `AnimBP_Player`, not
+`BP_Stalker2Character`, not `IMC_Dialog`, and (for the add-on) not
+`W_SkipHintView`.
+
+The pawn and `IMC_Dialog` overrides already have a proven replacement (plan 2.1,
+items 1-2 above: `ModWorldSubsystem` + actor + own mapping context; the
+subsystem was instantiated by the retail game in the 09-17 experiment). The
+open problem was `AnimBP_Player`. Every avenue considered, with the evidence:
+
+### Where the walk animation can come from without touching `AnimBP_Player`
+
+What we know for certain (probe + the 1.x DLL): the vanilla graph animates the
+walk as soon as `StateData.bMoving` / `bWalking` and
+`LocomotionData.MovementPlayRate.{RightValue,ForwardValue,PlayRate}` are
+non-zero; the native update just leaves them at zero in static dialogue. The 1.x
+DLL wrote those fields from C++ and never touched an asset. A Blueprint cannot
+(the members are not `BlueprintReadWrite`). So the pose has to be produced
+somewhere the game does not own, or written through a door the game left open.
+
+| # | Avenue | Verdict | Why |
+|---|---|---|---|
+| A | **Post-process anim Blueprint set at runtime** (`SkeletalMeshComponent.SetOverridePostProcessAnimBP`) | **best; one test build decides** | engine feature, BlueprintCallable, runs *after* the main instance and receives its pose; needs no override and no change to the main instance's class |
+| B | Linked anim layer (`LinkAnimClassLayers` / `LinkAnimGraphByTag`) | maybe; needs one editor check | only works if the vanilla graph has a layer or linked-graph node on the main pose path after the Moving machine; fights the game's own weapon-layer linking |
+| C | Montage on a vanilla slot (`Montage_Play` / `PlaySlotAnimationAsDynamicMontage`) | fallback, forward-walk only | a slot plays one sequence at a time; no direction blend (blend spaces inside montages could not be confirmed as a 5.5 feature) |
+| D | Swap the anim class (`SetAnimInstanceClass`) | **dead** | crashed the game on 09-17: the old instance is destroyed and native code holds it |
+| E | Leader pose: hidden driver mesh with our class, vanilla mesh follows it in dialogue | rejected | a follower does not run its own anim BP, so the gesture montages the game plays on the vanilla instance would freeze |
+| F | Second visible mesh (our class), vanilla mesh hidden in dialogue | possible, heavy | gestures would have to be mirrored by hand, camera socket stays on the hidden mesh; only if A fails |
+| G | Write `StateData` from Blueprint anyway (patch the cooked bytecode: the Kismet VM does not enforce `BlueprintReadOnly` at run time) | last resort | works in principle, but a post-cook binary patch on a zen package, redone every cook, no editor support, fails hard on a game patch |
+| H | cfg patch that makes the game itself not freeze locomotion in dialogue | cheap check, unlikely | nothing found yet; grep the extracted cfgs for `Dialog*` keys near the player prototype before dismissing |
+| I | Ask GSC (Zone Kit feedback) to expose `StateData`/`LocomotionData` or a "move in dialogue" flag | free, slow | would make even A unnecessary |
+| J | Keep the override, ship a merge kit for other authors | status quo | that is exactly the "patch" the user wants gone |
+| K | Slim UE4SS DLL for the anim writes + pak for the rest | universal but re-introduces UE4SS | the 1.x DLL already is universal for UE4SS users; keep it maintained as the fallback |
+
+### Avenue A in detail — post-process anim Blueprint
+
+Engine facts (UE 5.x API reference, mirrored copy; the Zone Kit is 5.5):
+
+- `USkeletalMeshComponent::SetOverridePostProcessAnimBP(TSubclassOf<UAnimInstance> InPostProcessAnimBlueprint, bool ReinitAnimInstances)` — BlueprintCallable. "When an override post-processing AnimBP is set, the one set in the skeletal mesh asset will be ignored." The property behind it (`OverridePostProcessAnimBP`) is transient and per component.
+- `PostProcessAnimInstance`: "Runs after (and receives pose from) the main anim instance." Our graph gets the vanilla output as **Input Pose** and can replace or layer it.
+- `GetPostProcessInstance()`, `GetPostProcessAnimBPClassToBeUsed()`, `GetDisablePostProcessBlueprint()` / `SetDisablePostProcessBlueprint()` — all BlueprintCallable, so a subsystem can detect a missing instance and re-apply.
+- From my reading of the engine source (unverified against 5.5, so this is what the first test build checks): with `ReinitAnimInstances = true` the component runs `InitAnim(true)`; the main instance is **re-initialised, not recreated** (it is only recreated when its class differs), which is the difference from avenue D. Re-initialisation stops any montage and re-runs the graph's initialisation, so it must happen once at spawn, never in dialogue. With `false` the post-process instance only appears at the next `InitAnim` (armour/mesh swap, save load), which is not reliable.
+
+Design:
+
+1. **`ABP_ImmDlgPost`** (NewContent, mod-only path, skeleton = the player's).
+   AnimGraph: `Input Pose` → `Blend Poses by Bool (DlgMoving)`:
+   - false → Input Pose straight through (zero cost outside dialogue).
+   - true → the unarmed walk blend space (the same base-game asset the Walk state uses; X = `DlgRight`, Y = `DlgFwd`, PlayRate 1) with a short blend-in, then `Layered blend per bone` keeping the *Input Pose* from `spine_03`/clavicles up while a gesture montage plays (so gestures are untouched, same gate as today: `IsAnyMontagePlaying` on the **main** instance, reached via `Try Get Pawn Owner → Mesh → Get Anim Instance`).
+   Event graph: the exact 2.0.4 walk wiring (BUILD.md §5.4 steps 1-3) computed from the pawn's `Movement Input Vector`, so the compat marker's meaning (`v1`: our code feeds `Movement Input Vector` in dialogue) stays true.
+   Arms: first build masks them out to reproduce today's look exactly; a later build can let the walk pose's arms through, which may close the "no arms in dialogue" item for free if the arms are the body mesh's own (README § "Next: arms in dialogue").
+2. **`BP_ImmDlgSubsystem`** (`ModWorldSubsystem`, reuse
+   `zonekit/experiments/anim-swap-2026-09-17/BP_ImmDlgSubsystem.uasset`, replacing the `SetAnimInstanceClass` call): on tick, if the player pawn exists and `Mesh → Get Post Process Instance` is null or not our class → `SetOverridePostProcessAnimBP(ABP_ImmDlgPost, true)`, plus `SetDisablePostProcessBlueprint(false)` in case the game had it off. Self-heals after a save load or a pawn respawn.
+3. Drop `AnimBP_Player` from `OverridePackages.txt`. Nothing of ours remains in the game's asset paths except the marker.
+4. Then the already-planned steps: pawn logic into the subsystem's actor (drop `BP_Stalker2Character`), own `IMC_ImmersiveDialogue` (drop `IMC_Dialog`). The NoSkipHint add-on can also stop overriding: the subsystem finds `W_SkipHintView` with `Get All Widgets Of Class` a few times per dialogue and sets it Collapsed each tick, which is what the 1.x DLL does.
+
+What survives from other mods once this ships: a ZST/S-Watch `AnimBP_Player` that still embeds our 2.0.2 block (gated on the old cook anchor, so off) or the frozen 2.0.4 block (ungated) is harmless either way: the post-process graph overwrites the legs, and the masked upper body is whatever their copy produced. No double animation, no missing animation, no load-order rule. The `_20_P` rename becomes unnecessary (keep the kit's own container name so the ModKit registers the mount point).
+
+Risks, each answered by a build or an editor check:
+
+- **Reinit at spawn breaks the linked weapon layers** (bh/dummy re-linked or dropped). Canary already known: unarmed sprint left hand from a fresh load (the `AnimBP_player_bh` incident). If it breaks, try applying before the first weapon link (subsystem `OnWorldBeginPlay`, or on the first tick the pawn exists) or `ReinitAnimInstances = false` plus a deliberate one-time mesh re-init at spawn.
+- **The player mesh already has a post-process ABP** (physics/IK). Our override would replace it. Editor check first; if it does, our graph must reproduce it (`Input Pose` through the same nodes) or we chain it by linking.
+- **GSC stripped the function** from the kit's Blueprint surface. Editor check: drag from a `SkeletalMeshComponent` pin and search *Set Override Post Process Anim BP*.
+- **Camera socket**: the walk pose moves `jnt_camera`; the pawn already holds the camera rotation absolute in dialogue, and vanilla walking bobs the same way. Expected fine.
+- **Shadow mesh** (`AnimBP_Player_Shadow`): reads the main instance's `shadow_data`, so it keeps idling in dialogue as it does today. A second post-process override on that component can fix it later; not a regression.
+- **Cook**: a NewContent anim BP referencing base-game blend spaces and the base skeleton is the same pattern as ZST's NewContent (`AS_WatchCameraSource012`) and IHUD's (`IMC_Inventory`); the 09-17 `AnimBP_PlayerDialogue` cooked and loaded, and the subsystem kept its NewContent reference.
+
+Editor checks Noah does before build A (read-only, nothing checked out):
+
+1. Vanilla `BP_Stalker2Character` → Components: every skeletal mesh component and its mesh asset. Open each mesh asset → Asset Details → *Post Process Anim Blueprint*: empty or set? Also the skeleton asset name (target for `ABP_ImmDlgPost`).
+2. Vanilla `AnimBP_Player` AnimGraph, Walk state: the seven blend space asset names and the node that picks between them (which one plays unarmed).
+3. Same graph: is there a `Linked Anim Layer` or `Linked Anim Graph` node on the main pose path *after* the Moving state machine, and which interface / tag (decides avenue B as a backup); note the Slot node names on the way to Output Pose (avenue C).
+4. In any mod Blueprint, drag from a `Skeletal Mesh Component` reference and search *Set Override Post Process Anim BP* to confirm it exists in the kit.
+
+Build sequence (one change per cook, Noah tests each; probe reads
+`Mesh.PostProcessAnimInstance` class name and `bDisablePostProcessBlueprint`
+since `PrintString` is compiled out of Shipping):
+
+- **A (safety)**: subsystem applies a pass-through `ABP_ImmDlgPost` (Input Pose → Output Pose) once at spawn. Pass = no crash on load, quickload, armour change, weapon swap; sprint hand fine; gestures play; probe shows our class on the mesh.
+- **B (walk)**: real graph, `AnimBP_Player` still overridden (so the two can be compared by toggling our override pak).
+- **C (drop)**: `AnimBP_Player` removed from the cook lists. Pass = walking animates in dialogue with ZST's `_30_P` copy installed (`_25_P`-style isolation as on 09-19) and with S-Watch.
+- Then 2.1 items 1-2 and the NoSkipHint runtime hide, each its own cook.
+
+If A fails on every variant, B (layers) is next, then F (second mesh); G and K stay documented as the only universal options left.
+
+### Sources
+
+- USkeletalMeshComponent API reference (5.7/5.8 mirror: `SetOverridePostProcessAnimBP`, `GetPostProcessInstance`, `PostProcessAnimInstance`, `LinkAnimClassLayers`, `LinkAnimGraphByTag`, `GetDisablePostProcessBlueprint`) — https://github.com/remiphilippe/mcp-unreal/blob/main/docs/ue5.7/api/USkeletalMeshComponent.md
+- Epic docs entries for the same functions (dev.epicgames.com; blocked from the research session, titles/signatures confirmed through search snippets, present in the 5.0-5.4 Python API too).
+- Leader pose: follower components do not run their own animation (ikrima.dev animation notes; Epic community thread 2670913).
+- S-Watch listing and its compatibility note: Nexus mod 2780 (page blocked from the session; summary via search).
