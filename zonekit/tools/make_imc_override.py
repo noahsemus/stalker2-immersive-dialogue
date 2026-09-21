@@ -1,5 +1,33 @@
-import unreal, json, os
+"""Regenerates the mod's IMC_Dialog override (BUILD.md 5.2). Runs inside the editor:
+
+  Stalker2ModEditor-Win64-Shipping-Cmd.exe "<kit>\Stalker2\Stalker2.uproject" -run=pythonscript -script=<this file> -unattended -nosplash -stdout -NoShaderCompile
+
+or in seconds through ue_exec.py against a running editor. Edit LOG first.
+
+What it does:
+  1. duplicates the vanilla IMC_Dialog into the mod plugin at the mirrored path;
+  2. drops the four IA_UI_Dialog_SelectAnswer rows on W / S / left stick up / down;
+  3. duplicates IMC_Exploration to a temporary asset and MOVES (rename outer) the
+     modifier, trigger and player-mappable-settings objects of every
+     IA_LocomotionForward / IA_LookUp row into the override, then adds a copy of each
+     row. Moving the real objects keeps the game's dead zones, response curves and the
+     custom ApplySensitivity modifier intact (new_object + set_editor_property fails
+     with "cannot be edited on templates"). Moving the mappable settings keeps each
+     move row's PlayerMappableOption name (MoveForward / ...), which is how the
+     game's own Options > Controls rebind (CustomizeControls.cfg) reaches the row:
+     without it the dialogue rows were frozen on W / A / S / D and an AZERTY player's
+     ZQSD did nothing in dialogue (Nexus, TheChillPakBoi, 2026-09-21);
+  4. saves the override. The temp asset is never saved; do NOT delete_asset it
+     (crashes the commandlet).
+
+IMMDLG_LAYOUT=azerty in the environment builds the fallback variant with Z / Q in
+place of W / A on the copied move rows (only needed if step 3's mappable settings turn
+out not to be enough in game; see BUILD.md 5.2).
+"""
+import unreal, os, time
 LOG = r"<SCRATCH>/make_imc_override.log"
+LAYOUT = os.environ.get("IMMDLG_LAYOUT", "qwerty").strip().lower()
+KEY_SWAP = {"azerty": {"W": "Z", "A": "Q"}}.get(LAYOUT, {})
 lines = []
 def log(s):
     lines.append(str(s)); unreal.log("[ImmDlg] " + str(s))
@@ -7,14 +35,35 @@ SRC_DIALOG = "/Game/_Stalker_2/data/input/InputMappingContexts/IMC_Dialog"
 SRC_EXPLO  = "/Game/_Stalker_2/data/input/InputMappingContexts/IMC_Exploration"
 DST_DIR    = "/ImmersiveDialogue/_Stalker_2/data/input/InputMappingContexts"
 DST        = DST_DIR + "/IMC_Dialog"
+TMP        = DST_DIR + "/IMC_ExplorationTmp_%d" % int(time.time())   # unique per run, never saved
 EAL = unreal.EditorAssetLibrary
+
+def prop(o, name, default=None):
+    """get_editor_property that returns `default` when the property doesn't exist."""
+    try:
+        return o.get_editor_property(name)
+    except Exception:
+        return default
+
+def mappable_desc(m):
+    beh = prop(m, "setting_behavior")
+    s = prop(m, "player_mappable_key_settings")
+    nm = prop(s, "name") if s else None
+    return "%s/%s" % (str(beh).rsplit(".", 1)[-1] if beh is not None else "-", nm if nm else "-")
+
+def describe(m):
+    a = prop(m, "action"); k = prop(m, "key")
+    return "%-28s %-26s mappable=%-32s mods=%s trig=%s" % (
+        a.get_name() if a else None, str(k.get_editor_property("key_name")), mappable_desc(m),
+        [x.get_class().get_name() for x in prop(m, "modifiers", []) if x],
+        [x.get_class().get_name() for x in prop(m, "triggers", []) if x])
+
 try:
+    log("layout=%s key swap=%s" % (LAYOUT, KEY_SWAP))
     # 1. Is the mod plugin content mounted?
     mounted = EAL.does_asset_exist("/ImmersiveDialogue/ImmersiveDialogue")
     log(f"mod content mounted: {mounted}")
     if not mounted:
-        gfs = unreal.GameFeaturesSubsystem.get_game_feature_subsystem() if hasattr(unreal, "GameFeaturesSubsystem") else None
-        log(f"GameFeaturesSubsystem: {gfs}")
         url = "file:" + os.path.abspath(r"G:/Epic Games/STALKER2ZoneKit/Stalker2/Mods/ImmersiveDialogue/ImmersiveDialogue.uplugin").replace("\\", "/")
         try:
             unreal.GameFeaturesSubsystem.load_and_activate_game_feature_plugin(url, unreal.GameFeaturePluginLoadComplete())
@@ -32,7 +81,6 @@ try:
     dup = EAL.duplicate_asset(SRC_DIALOG, DST)
     log(f"duplicate -> {dup}")
     imc = unreal.load_asset(DST)
-    expl = unreal.load_asset(SRC_EXPLO)
 
     # 3. Remove the mappings that fight free movement.
     REMOVE = {("IA_UI_Dialog_SelectAnswer", "W"), ("IA_UI_Dialog_SelectAnswer", "S"),
@@ -46,50 +94,64 @@ try:
         kept.append(m)
     log(f"removed {removed} mappings, kept {len(kept)}")
 
-    # 4. Copy the move + look mappings from IMC_Exploration (with cloned modifiers/triggers).
+    # 4. Move the move + look rows' objects out of a throwaway copy of IMC_Exploration.
     COPY_ACTIONS = {"IA_LocomotionForward", "IA_LookUp"}
-    PROPS = ["lower_threshold", "upper_threshold", "type", "order", "scalar", "curve", "response_curve",
-             "exponent", "hold_time_threshold", "actuation_threshold", "is_one_shot", "sensitivity",
-             "acceleration_curve", "deadzone", "max_value", "min_value", "curve_exponent", "invert", "axis", "input_type"]
-    def clone(o):
+    tmp_dup = EAL.duplicate_asset(SRC_EXPLO, TMP)
+    log(f"temp exploration copy -> {tmp_dup}")
+    tmp = unreal.load_asset(TMP)
+    def take(o):
+        """Re-parent a subobject of the temp copy into the override; None stays None."""
         if o is None: return None
-        n = unreal.new_object(o.get_class(), outer=imc)
-        copied = []
-        for p in PROPS:
-            try:
-                v = o.get_editor_property(p)
-            except Exception:
-                continue
-            try:
-                n.set_editor_property(p, v); copied.append(p)
-            except Exception as e:
-                log(f"   set {p} on {o.get_class().get_name()} failed: {e}")
-        log(f"   cloned {o.get_class().get_name()} props={copied}")
-        return n
-    added = 0
-    for m in expl.get_editor_property("mappings"):
+        ok = o.rename(outer=imc)
+        if not ok: log(f"   rename(outer=override) FAILED for {o.get_class().get_name()}")
+        return o
+    added = 0; mappable = 0
+    for m in tmp.get_editor_property("mappings"):
         a = m.get_editor_property("action")
         if not a or a.get_name() not in COPY_ACTIONS: continue
         k = m.get_editor_property("key")
-        if str(k.get_editor_property("key_name")) in ("None", "RotationRate"): continue
+        kname = str(k.get_editor_property("key_name"))
+        if kname in ("None", "RotationRate"): continue
+        if kname in KEY_SWAP:
+            k = unreal.Key(); k.set_editor_property("key_name", KEY_SWAP[kname])
+            log(f"  layout swap {kname} -> {KEY_SWAP[kname]}")
         nm = unreal.EnhancedActionKeyMapping()
         nm.set_editor_property("action", a)
         nm.set_editor_property("key", k)
-        nm.set_editor_property("modifiers", [clone(x) for x in m.get_editor_property("modifiers")])
-        nm.set_editor_property("triggers",  [clone(x) for x in m.get_editor_property("triggers")])
-        log(f"  + {a.get_name()} <- {k.get_editor_property('key_name')}")
+        nm.set_editor_property("modifiers", [take(x) for x in m.get_editor_property("modifiers")])
+        nm.set_editor_property("triggers",  [take(x) for x in m.get_editor_property("triggers")])
+        # Player-mappable settings (UE 5.3+ object + behaviour). The game keys its
+        # CustomizeControls.cfg rows on the settings' Name (PlayerMappableOption), so the
+        # copied row must carry the same object as the exploration row.
+        beh = prop(m, "setting_behavior")
+        if beh is not None:
+            try: nm.set_editor_property("setting_behavior", beh)
+            except Exception as e: log(f"   set setting_behavior failed: {e}")
+        s = prop(m, "player_mappable_key_settings")
+        if s is not None:
+            try:
+                nm.set_editor_property("player_mappable_key_settings", take(s)); mappable += 1
+            except Exception as e: log(f"   set player_mappable_key_settings failed: {e}")
+        # Legacy (pre-5.3) struct, editor-only data; best effort so the two never disagree.
+        legacy = prop(m, "player_mappable_options")
+        if legacy is not None:
+            try: nm.set_editor_property("player_mappable_options", legacy)
+            except Exception as e: log(f"   set player_mappable_options failed: {e}")
+        log(f"  + {describe(nm)}")
         kept.append(nm); added += 1
     imc.set_editor_property("mappings", kept)
-    log(f"added {added} mappings; total now {len(kept)}")
+    log(f"added {added} mappings ({mappable} with mappable settings); total now {len(kept)}")
+    if mappable == 0:
+        log("WARNING: no copied row carried player-mappable settings; the game's Move rebind "
+            "will not reach the dialogue rows. Check dump_imc.py on IMC_Exploration.")
 
-    # 5. Save.
+    # 5. Save the override only. The temp copy is left unsaved (never on disk).
     ok = EAL.save_loaded_asset(imc, only_if_is_dirty=False)
     log(f"saved: {ok}")
     # 6. Verify by re-reading.
     imc2 = unreal.load_asset(DST)
     for m in imc2.get_editor_property("mappings"):
-        a = m.get_editor_property("action"); k = m.get_editor_property("key")
-        log(f"  VERIFY {a.get_name() if a else None:28s} {str(k.get_editor_property('key_name')):26s} mods={[x.get_class().get_name() for x in m.get_editor_property('modifiers') if x]} trig={[x.get_class().get_name() for x in m.get_editor_property('triggers') if x]}")
+        log("  VERIFY " + describe(m))
 except Exception as e:
     import traceback
     log("EXCEPTION: " + traceback.format_exc())

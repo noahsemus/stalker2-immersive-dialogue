@@ -88,6 +88,9 @@ To uninstall, delete the files you copied.
 - **Camera centering cannot be toggled** in 2.0 (the 1.x DLL had an F6 toggle
   and a config file). It is always off in dialogue.
 - The walking pace in dialogue is a fixed fraction of walk speed (no config).
+- **Non-QWERTY keyboards (AZERTY and others):** up to 2.0.4 the dialogue
+  movement keys were fixed to W / A / S / D whatever you had bound in Options >
+  Controls. 2.0.5 (in progress) follows your binding.
 
 ## Compatibility
 
@@ -178,6 +181,9 @@ GitHub issues, or the Nexus page (mod 2698).
 
 ## Versions
 
+- **2.0.5** *(in progress)* — dialogue movement follows the keys you bound in
+  Options > Controls, so AZERTY (ZQSD) and other rebinds work. Same fix in
+  1.0.9 for the UE4SS version.
 - **2.0.4** — compatibility release; dialogue feels the same. Camera handling
   moved from the player animation file into the player character, so it keeps
   working when another mod's copy of the animation file is in use. Our part of

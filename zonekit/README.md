@@ -436,7 +436,9 @@ reporter's dead ALT is not reproducible with our mod and points at their setup
 2. **Our own mapping context instead of overriding `IMC_Dialog`.**
    `IMC_ImmersiveDialogue` with the move / look rows (W A S D, left stick, mouse,
    right stick), added above the game's dialogue context on entry and removed on
-   exit. A higher-priority context consumes its keys, so `IMC_Dialog`'s W / S /
+   exit. The move rows must carry the exploration rows' player-mappable settings
+   (`MoveForward` and so on) or the player's rebind never reaches them (see the
+   2026-09-21 AZERTY entry). A higher-priority context consumes its keys, so `IMC_Dialog`'s W / S /
    left-stick "select answer" rows are shadowed without editing it; arrows, D-pad
    and wheel still pick answers. Also retires the 2.0.1 leak class for good: we
    only ever add/remove our own asset. Risk: low; verify the shadowing in game.
@@ -614,6 +616,65 @@ cutscene without talking to anyone?
   (armour swap inside a trade) or a quickload mid-dialogue leaves the camera
   absolute or restores garbage. Fix would be to key capture/restore on the
   camera's real `IsUsingAbsoluteRotation` and keep the saved values on the pawn.
+
+### AZERTY / non-QWERTY keyboards (2026-09-21) — 2.0.5 and 1.0.9
+
+Report (TheChillPakBoi, Nexus): "QWERTY only"; on an AZERTY keyboard they move
+with ZQSD and the mod's dialogue movement does not respond to it.
+
+**How the game rebinds keys.** Unreal names keys by what they type (the key in
+the W position reports as `Z` on AZERTY), and STALKER 2 does not translate
+layouts; AZERTY players rebind in Options > Controls. That store is not
+Unreal's `EnhancedInputUserSettings` but GSC's own
+`%LOCALAPPDATA%\Stalker2\Saved\CustomizeControls.cfg`: one `struct` section per
+mapping context (`Exploration`, `Aiming`, `Journal`, ...), one row per mappable
+mapping with `PlayerMappableOption` (the row's mappable name, e.g. `MoveForward`),
+`InputActionSID` (`IA_LocomotionForward`), `Key`, `OldKey` and `Triggers`. The
+community's ladder fix for AZERTY (Nexus 124: a ladder row that stayed on `W` is
+cured by renaming its `PlayerMappableOption` to `MoveForward`) shows the game
+applies a rebind to every row that carries the same mappable name, across
+contexts. The vanilla `IMC_Dialog` rows are mappable this way too
+(`DialogToTrade`, `DialogToUpgrade` and their `Alt` variants are in the
+override's name table, with `PlayerMappableKeySettings` / `SettingBehavior`).
+
+**Pak root cause.** `make_imc_override.py` built the copied move rows as fresh
+`EnhancedActionKeyMapping` structs with action, key, modifiers and triggers
+only. Without the exploration row's `PlayerMappableKeySettings` the row has no
+mappable name, so it never appears in `CustomizeControls.cfg` and the player's
+rebind cannot reach it: the dialogue rows stayed on the literal W / A / S / D.
+
+**Pak fix (2.0.5, script updated, not yet regenerated or cooked).** The script
+now moves each row's `PlayerMappableKeySettings` object into the override the
+same way as the modifiers and copies `SettingBehavior` (plus the legacy
+`PlayerMappableOptions` struct on a best-effort basis). Verify with
+`dump_imc.py` (`mappable` = `OverrideSettings/MoveForward` etc. on the four
+keyboard rows) and in game with keys rebound to ZQSD. Fallback if the game only
+honours rows it wrote to the cfg itself: `IMMDLG_LAYOUT=azerty` builds a variant
+with `Z` / `Q` in place of `W` / `A`, shipped as `Optional-AZERTY/` (BUILD.md
+§5.2). Note for that variant: vanilla `IMC_Dialog` binds `Q` and `E` to the
+trade / upgrade prompts, and a key mapped twice inside one context fires both
+actions, so an AZERTY player would strafe left when opening trade unless they
+rebound that prompt too. The mappable-name route has no such clash to add
+(the game already lets the player pick the same key for both).
+
+**DLL fix (1.0.9, built from source, not yet installed or tested).** Movement
+keys come from, in order: `config.ini` `MoveForwardKey` / `MoveBackKey` /
+`MoveLeftKey` / `MoveRightKey` when not `auto`; the `IA_LocomotionForward` rows
+of `CustomizeControls.cfg` (matched on `InputActionSID` and the direction word
+in `PlayerMappableOption`; the `Exploration` section wins, gamepad rows are
+skipped, punctuation and accented key names go through `VkKeyScanExW` on the
+game window's layout); else the physical W / S / A / D positions (scan codes
+0x11 / 0x1F / 0x1E / 0x20 through `MapVirtualKeyExW`), which already yields ZQSD
+on AZERTY and `,AOE` on Dvorak. Resolved at startup and on every dialogue
+entry; the WndProc key-down swallow uses the same four keys. Log line
+`[ImmDlg] move keys: ...` (BUILD.md §8). The parser was exercised on Linux with
+a synthetic cfg (Exploration beats Aiming, ladder rows ignored, gamepad skipped).
+
+**Evidence still needed (Noah).** (1) A `CustomizeControls.cfg` from a real
+install, to confirm the section / field names the parser assumes and whether the
+`Dialog` section lists our rows after 2.0.5. (2) In-game check of both builds
+with keys rebound to ZQSD; for the DLL, the `move keys:` log line must show
+`(game)` for all four.
 
 ### 2.0.4 — ZST's combined AnimBP_Player, frozen anim block, marker (2026-09-19)
 

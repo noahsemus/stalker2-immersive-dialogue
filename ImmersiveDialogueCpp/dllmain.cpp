@@ -3,8 +3,12 @@
 // Lets the player move and look freely during interactive NPC dialogue.
 //
 // While PC::IsInStaticDialog() is true:
-//   - WASD (and left stick) walks Skif. Camera-relative, walk speed. W/A/S/D keydown
-//     events are swallowed at WndProc so the dialogue option list doesn't also scroll.
+//   - The movement keys (and left stick) walk Skif. Camera-relative, walk speed. The
+//     keys are the game's own move binding (CustomizeControls.cfg), else the physical
+//     W/S/A/D positions under the active keyboard layout (ZQSD on AZERTY), else what
+//     config.ini says (v1.0.9; before that the letters W/A/S/D were hard-coded). Their
+//     keydown events are swallowed at WndProc so the dialogue option list doesn't also
+//     scroll.
 //   - Raw mouse and right stick look. Sensitivity + invert-Y from the game's own
 //     AppliedSettingsWin64.cfg (mouse + gamepad honored independently).
 //   - Pad sticks come from XInput when a (real or Steam-Input-virtual) Xbox pad is
@@ -48,7 +52,9 @@
 #include <Windows.h>
 #include <Xinput.h>
 #include <atomic>
+#include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <string>
@@ -67,6 +73,13 @@ static std::atomic<bool>  g_inDialogue{false};
 // True while an in-dialogue UI that wants the keyboard is open (trade backpack /
 // inventory, PDA). Movement + look injection and the WASD swallow pause meanwhile.
 static std::atomic<bool>  g_uiBusy{false};
+
+// v1.0.9: the four movement keys as Win32 virtual-key codes, index 0 forward, 1 back,
+// 2 left, 3 right. Written on the game thread by ResolveMoveKeys (startup + every
+// dialogue entry), read by the WndProc thread for the key-down swallow. Until the first
+// resolve they are the old hard-coded letters.
+static std::atomic<int>   g_moveVk[4]{ {'W'}, {'S'}, {'A'}, {'D'} };
+static HWND               g_gameHwnd = nullptr;   // the window SetupInputHook subclassed
 
 // Settings loaded from AppliedSettingsWin64.cfg (refreshed on each dialogue entry).
 static std::atomic<double> g_mouseSensCoef{1.0};
@@ -259,6 +272,160 @@ static void LoadStalker2Settings() {
     }
 }
 
+// ================= Movement keys (v1.0.9) =================
+// The mod used to poll the letters W/A/S/D. Windows names keys by what they type, so
+// on an AZERTY keyboard the key in the W position reports as Z and the A position as
+// Q: the player's ZQSD did nothing in dialogue and the mod was "QWERTY only" (Nexus,
+// TheChillPakBoi, 2026-09-21). The keys now come from, in priority order:
+//   1. config.ini MoveForwardKey / MoveBackKey / MoveLeftKey / MoveRightKey when set
+//      to a key name (default "auto");
+//   2. the game's own binding for IA_LocomotionForward in
+//      %LOCALAPPDATA%\Stalker2\Saved\CustomizeControls.cfg (what Options > Controls
+//      writes; the four rows are PlayerMappableOption MoveForward / ...Back / ...Left /
+//      ...Right);
+//   3. the physical W / S / A / D key positions (scan codes 0x11 / 0x1F / 0x1E / 0x20)
+//      translated through the game window's keyboard layout, so ZQSD on AZERTY and
+//      ,AOE on Dvorak come out right even when the cfg can't be read.
+static std::wstring Widen(const std::string& s) { return std::wstring(s.begin(), s.end()); }
+
+// Win32 virtual key for an Unreal FKey name ("Z", "Nine", "NumPadTwo", "Up", "Comma",
+// "A_AccentGrave", ...). 0 for anything that isn't a keyboard/mouse key (gamepad, None)
+// or that we don't know. Punctuation and accented keys are named by the character they
+// type and Windows assigns their virtual key per layout, so those go through
+// VkKeyScanExW on the game window's layout.
+static int VkFromUeKeyName(std::string name, HKL hkl) {
+    if (name.rfind("EKeys::", 0) == 0) name = name.substr(7);
+    if (name.empty() || name == "None" || name.rfind("Gamepad_", 0) == 0) return 0;
+    if (name.size() == 1) {
+        unsigned char c = (unsigned char)name[0];
+        if (isalpha(c)) return toupper(c);
+        if (isdigit(c)) return c;
+        return 0;
+    }
+    static const struct { const char* n; int vk; } table[] = {
+        {"Zero", '0'}, {"One", '1'}, {"Two", '2'}, {"Three", '3'}, {"Four", '4'},
+        {"Five", '5'}, {"Six", '6'}, {"Seven", '7'}, {"Eight", '8'}, {"Nine", '9'},
+        {"NumPadZero", VK_NUMPAD0}, {"NumPadOne", VK_NUMPAD1}, {"NumPadTwo", VK_NUMPAD2},
+        {"NumPadThree", VK_NUMPAD3}, {"NumPadFour", VK_NUMPAD4}, {"NumPadFive", VK_NUMPAD5},
+        {"NumPadSix", VK_NUMPAD6}, {"NumPadSeven", VK_NUMPAD7}, {"NumPadEight", VK_NUMPAD8},
+        {"NumPadNine", VK_NUMPAD9}, {"Multiply", VK_MULTIPLY}, {"Add", VK_ADD},
+        {"Subtract", VK_SUBTRACT}, {"Decimal", VK_DECIMAL}, {"Divide", VK_DIVIDE},
+        {"Up", VK_UP}, {"Down", VK_DOWN}, {"Left", VK_LEFT}, {"Right", VK_RIGHT},
+        {"SpaceBar", VK_SPACE}, {"Tab", VK_TAB}, {"Enter", VK_RETURN}, {"BackSpace", VK_BACK},
+        {"Escape", VK_ESCAPE}, {"CapsLock", VK_CAPITAL}, {"NumLock", VK_NUMLOCK},
+        {"ScrollLock", VK_SCROLL}, {"Pause", VK_PAUSE}, {"Insert", VK_INSERT},
+        {"Delete", VK_DELETE}, {"Home", VK_HOME}, {"End", VK_END}, {"PageUp", VK_PRIOR},
+        {"PageDown", VK_NEXT}, {"LeftShift", VK_LSHIFT}, {"RightShift", VK_RSHIFT},
+        {"LeftControl", VK_LCONTROL}, {"RightControl", VK_RCONTROL}, {"LeftAlt", VK_LMENU},
+        {"RightAlt", VK_RMENU}, {"LeftCommand", VK_LWIN}, {"RightCommand", VK_RWIN},
+        {"LeftMouseButton", VK_LBUTTON}, {"RightMouseButton", VK_RBUTTON},
+        {"MiddleMouseButton", VK_MBUTTON}, {"ThumbMouseButton", VK_XBUTTON1},
+        {"ThumbMouseButton2", VK_XBUTTON2},
+    };
+    for (auto& e : table) if (name == e.n) return e.vk;
+    if (name[0] == 'F' && name.size() <= 3 && isdigit((unsigned char)name[1])) {
+        try { int n = std::stoi(name.substr(1)); if (n >= 1 && n <= 24) return VK_F1 + (n - 1); } catch (...) {}
+    }
+    static const struct { const char* n; wchar_t ch; } chars[] = {
+        {"Semicolon", L';'}, {"Equals", L'='}, {"Comma", L','}, {"Hyphen", L'-'},
+        {"Period", L'.'}, {"Slash", L'/'}, {"Tilde", L'`'}, {"LeftBracket", L'['},
+        {"Backslash", L'\\'}, {"RightBracket", L']'}, {"Apostrophe", L'\''}, {"Quote", L'"'},
+        {"Ampersand", L'&'}, {"Asterix", L'*'}, {"Caret", L'^'}, {"Colon", L':'},
+        {"Dollar", L'$'}, {"Exclamation", L'!'}, {"LeftParantheses", L'('},
+        {"RightParantheses", L')'}, {"Underscore", L'_'}, {"A_AccentGrave", L'\u00E0'},
+        {"E_AccentGrave", L'\u00E8'}, {"E_AccentAigu", L'\u00E9'}, {"C_Cedille", L'\u00E7'},
+        {"Section", L'\u00A7'},
+    };
+    for (auto& e : chars) {
+        if (name != e.n) continue;
+        SHORT r = VkKeyScanExW(e.ch, hkl);
+        return (r == -1) ? 0 : (r & 0xFF);
+    }
+    return 0;
+}
+
+// Reads the player's IA_LocomotionForward keys out of the game's CustomizeControls.cfg.
+// Fills vk[4] / names[4] (index as g_moveVk; 0 / empty = not found) and returns how many
+// directions were found. The file is the game's struct text format, one section per
+// mapping context:
+//   Exploration : struct.begin
+//      [3] : struct.begin
+//         DefaultID = -1
+//         bIsPlayerMappable = true
+//         PlayerMappableOption = MoveForward
+//         InputActionSID = IA_LocomotionForward
+//         Key = Z
+//         Triggers : struct.begin
+//            [0] = EPlayerActionInputTrigger::Down
+//         struct.end
+//      struct.end
+//   struct.end
+// Rows are matched on InputActionSID and the direction word in PlayerMappableOption, so
+// the exact option names don't matter. The Exploration section wins over any other
+// section that carries the same rows; rows outside a recognisable section only fill
+// gaps. Never throws; a missing or unreadable file just returns 0.
+static int ReadMoveKeysFromGameCfg(int vk[4], std::string names[4], HKL hkl) {
+    const wchar_t* la = _wgetenv(L"LOCALAPPDATA");
+    if (!la) return 0;
+    std::wstring path = std::wstring(la) + L"\\Stalker2\\Saved\\CustomizeControls.cfg";
+    std::ifstream f(path.c_str());
+    if (!f) return 0;
+    std::vector<std::string> stack;           // names of the open structs
+    std::string option, action, key;
+    bool inRow = false, fromExplo[4] = {false, false, false, false};
+    int found = 0;
+    std::string line;
+    while (std::getline(f, line)) {
+        std::string t = trim(line);
+        if (t.size() >= 3 && (unsigned char)t[0] == 0xEF && (unsigned char)t[1] == 0xBB && (unsigned char)t[2] == 0xBF)
+            t = trim(t.substr(3));            // UTF-8 BOM on the first line
+        if (t.empty()) continue;
+        size_t sb = t.find("struct.begin");
+        if (sb != std::string::npos) {
+            std::string name = trim(t.substr(0, sb));
+            while (!name.empty() && (name.back() == ':' || name.back() == ' ' || name.back() == '\t')) name.pop_back();
+            stack.push_back(name);
+            if (!name.empty() && name[0] == '[') { inRow = true; option.clear(); action.clear(); key.clear(); }
+            continue;
+        }
+        if (t == "struct.end") {
+            if (stack.empty()) continue;
+            std::string name = stack.back(); stack.pop_back();
+            if (name.empty() || name[0] != '[' || !inRow) continue;
+            inRow = false;
+            if (action != "IA_LocomotionForward" || key.empty()) continue;
+            std::string u = option;
+            for (auto& c : u) c = (char)toupper((unsigned char)c);
+            int dir = -1;
+            if      (u.find("FORWARD") != std::string::npos) dir = 0;
+            else if (u.find("BACK")    != std::string::npos) dir = 1;
+            else if (u.find("LEFT")    != std::string::npos) dir = 2;
+            else if (u.find("RIGHT")   != std::string::npos) dir = 3;
+            if (dir < 0) continue;
+            std::string section;
+            for (auto it = stack.rbegin(); it != stack.rend(); ++it) {
+                if (!it->empty() && (*it)[0] != '[' && *it != "Triggers") { section = *it; break; }
+            }
+            bool explo = (section == "Exploration");
+            int v = VkFromUeKeyName(key, hkl);
+            if (v == 0) continue;
+            if (vk[dir] == 0 || (explo && !fromExplo[dir])) {
+                if (vk[dir] == 0) found++;
+                vk[dir] = v; names[dir] = key; fromExplo[dir] = explo;
+            }
+            continue;
+        }
+        if (!inRow) continue;
+        auto eq = t.find('=');
+        if (eq == std::string::npos) continue;
+        std::string k = trim(t.substr(0, eq)), v = trim(t.substr(eq + 1));
+        if      (k == "PlayerMappableOption") option = v;
+        else if (k == "InputActionSID")       action = v;
+        else if (k == "Key")                  key    = v;
+    }
+    return found;
+}
+
 // ================= Raw mouse + keyboard WndProc =================
 static LRESULT CALLBACK HookedWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     if (msg == WM_INPUT) {
@@ -280,8 +447,9 @@ static LRESULT CALLBACK HookedWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         return CallWindowProc(g_origWndProc, h, msg, w, l);
     }
 
-    // Only swallow W/A/S/D key-DOWNs during dialogue so option list doesn't scroll on
-    // movement keys. GetAsyncKeyState still sees them so our movement code still works.
+    // Only swallow movement-key key-DOWNs during dialogue so option list doesn't scroll
+    // on them. GetAsyncKeyState still sees them so our movement code still works.
+    // v1.0.9: the keys are whatever ResolveMoveKeys found (ZQSD on AZERTY), not W/A/S/D.
     // v1.0.8: key-UPs pass through. Swallowing the release too meant a key that was held
     // when the dialogue started (walking up to the NPC and pressing the talk key) and
     // released inside the dialogue stayed "down" in the game's own key state; when the
@@ -292,7 +460,9 @@ static LRESULT CALLBACK HookedWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     // harmless.
     if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN)
         && g_inDialogue.load(std::memory_order_relaxed) && !g_uiBusy.load(std::memory_order_relaxed)) {
-        if (w == 'W' || w == 'A' || w == 'S' || w == 'D') return 0;
+        int k = (int)w;
+        if (k == g_moveVk[0].load(std::memory_order_relaxed) || k == g_moveVk[1].load(std::memory_order_relaxed) ||
+            k == g_moveVk[2].load(std::memory_order_relaxed) || k == g_moveVk[3].load(std::memory_order_relaxed)) return 0;
     }
 
     // Everything else — including Escape — passes through to the game's native handling.
@@ -375,6 +545,7 @@ static void SetupInputHook() {
     if (RegisterRawInputDevices(&rid, 1, sizeof(rid))) {
         g_origWndProc = reinterpret_cast<WNDPROC>(
             SetWindowLongPtr(h, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(HookedWndProc)));
+        g_gameHwnd = h;
         g_rawReady = true;
         // Separate call so a failure here can't take the mouse hook down with it.
         SetupHidGamepadInput(h);
@@ -573,6 +744,46 @@ public:
         return buf;
     }
 
+    // v1.0.9: config.ini MoveForwardKey / MoveBackKey / MoveLeftKey / MoveRightKey.
+    // -1 = "auto" (game binding, else physical position). Index as g_moveVk.
+    int         m_cfgMoveVk[4] = {-1, -1, -1, -1};
+    std::string m_moveKeysLogged;
+
+    static bool MoveKeyDown(int dir) {
+        int vk = g_moveVk[dir].load(std::memory_order_relaxed);
+        return vk > 0 && (GetAsyncKeyState(vk) & 0x8000) != 0;
+    }
+
+    // Decide the four movement keys (see "Movement keys" above) and publish them for the
+    // poll and the WndProc swallow. Called at startup and on every dialogue entry, so a
+    // rebind in Options > Controls or a keyboard-layout switch is picked up by the next
+    // conversation. Cheap: one small file read. Logs once per change.
+    void ResolveMoveKeys() {
+        HKL hkl = GetKeyboardLayout(g_gameHwnd ? GetWindowThreadProcessId(g_gameHwnd, nullptr) : 0);
+        static const UINT sc[4]     = { 0x11, 0x1F, 0x1E, 0x20 };   // physical W S A D
+        static const int  letter[4] = { 'W', 'S', 'A', 'D' };
+        int vk[4]; const char* src[4];
+        for (int i = 0; i < 4; ++i) {
+            UINT v = MapVirtualKeyExW(sc[i], MAPVK_VSC_TO_VK_EX, hkl);
+            vk[i] = v ? (int)v : letter[i]; src[i] = "layout";
+        }
+        int gameVk[4] = {0, 0, 0, 0}; std::string gameName[4];
+        int n = ReadMoveKeysFromGameCfg(gameVk, gameName, hkl);
+        for (int i = 0; i < 4; ++i) if (gameVk[i]) { vk[i] = gameVk[i]; src[i] = "game"; }
+        for (int i = 0; i < 4; ++i) if (m_cfgMoveVk[i] > 0) { vk[i] = m_cfgMoveVk[i]; src[i] = "config"; }
+        for (int i = 0; i < 4; ++i) g_moveVk[i].store(vk[i], std::memory_order_relaxed);
+        char buf[256];
+        snprintf(buf, sizeof(buf), "fwd=%s(%s) back=%s(%s) left=%s(%s) right=%s(%s) cfgRows=%d layout=0x%04x",
+            KeyNameFromVk(vk[0]).c_str(), src[0], KeyNameFromVk(vk[1]).c_str(), src[1],
+            KeyNameFromVk(vk[2]).c_str(), src[2], KeyNameFromVk(vk[3]).c_str(), src[3],
+            n, (unsigned)(LOWORD((ULONG_PTR)hkl)));
+        std::string desc(buf);
+        if (desc != m_moveKeysLogged) {
+            m_moveKeysLogged = desc;
+            Output::send<LogLevel::Verbose>(STR("[ImmDlg] move keys: {}\n"), Widen(desc));
+        }
+    }
+
     void LoadConfig() {
         if (m_configLoaded) return;
         m_configLoaded = true;
@@ -605,6 +816,11 @@ public:
                 try { m_walkScale = std::stod(v); } catch (...) {}
             } else if (k == "HideSkipHint") {
                 m_hideSkipHint = (v == "true" || v == "1");
+            } else if (k == "MoveForwardKey" || k == "MoveBackKey" || k == "MoveLeftKey" || k == "MoveRightKey") {
+                int i = (k == "MoveForwardKey") ? 0 : (k == "MoveBackKey") ? 1 : (k == "MoveLeftKey") ? 2 : 3;
+                std::string u = v; for (auto& c : u) c = (char)toupper((unsigned char)c);
+                if (u.empty() || u == "AUTO") m_cfgMoveVk[i] = -1;
+                else { int vk = ParseKeyName(v); if (vk > 0) m_cfgMoveVk[i] = vk; }
             }
         }
     }
@@ -631,11 +847,20 @@ public:
         f << "; Hide the 'hold to skip' hint while in dialogue (same as the 2.0 NoSkipHint\n";
         f << "; add-on). Default: true\n";
         f << "HideSkipHint=" << (m_hideSkipHint ? "true" : "false") << "\n";
+        f << "\n";
+        f << "; Movement keys in dialogue (v1.0.9). 'auto' uses the keys bound to Move in the\n";
+        f << "; game's Options > Controls (read from CustomizeControls.cfg), or if that can't\n";
+        f << "; be read, the physical W/S/A/D positions under your keyboard layout (ZQSD on\n";
+        f << "; AZERTY). Set a key name (same names as CameraCenteringToggleKey) to force one.\n";
+        for (int i = 0; i < 4; ++i) {
+            static const char* keys[4] = { "MoveForwardKey", "MoveBackKey", "MoveLeftKey", "MoveRightKey" };
+            f << keys[i] << "=" << (m_cfgMoveVk[i] > 0 ? KeyNameFromVk(m_cfgMoveVk[i]) : std::string("auto")) << "\n";
+        }
     }
 
     ImmersiveDialogue() {
         ModName        = STR("ImmersiveDialogue");
-        ModVersion     = STR("1.0.8");
+        ModVersion     = STR("1.0.9");
         ModAuthors     = STR("Noah");
         ModDescription = STR("Free movement + mouse/pad look during NPC dialogue.");
     }
@@ -663,6 +888,7 @@ public:
         InstallIsInDialogLieHook();
         LoadStalker2Settings();
         LoadConfig();
+        ResolveMoveKeys();
         Output::send<LogLevel::Verbose>(
             STR("[ImmDlg] unreal init v{} (mouse={}, hidPad={}, mouseSens={}, padSens={}, invertY={})\n"),
             ModVersion,
@@ -3332,8 +3558,8 @@ public:
             m_pending_dx = 0.0; m_pending_dy = 0.0;
             m_prevInDialog = false;
             if (m_postExitCarry || m_postExitZeroUntilMs) {
-                bool kw = (GetAsyncKeyState('W') & 0x8000) != 0, ks = (GetAsyncKeyState('S') & 0x8000) != 0;
-                bool ka = (GetAsyncKeyState('A') & 0x8000) != 0, kd = (GetAsyncKeyState('D') & 0x8000) != 0;
+                bool kw = MoveKeyDown(0), ks = MoveKeyDown(1);
+                bool ka = MoveKeyDown(2), kd = MoveKeyDown(3);
                 double fwd = (kw ? 1.0 : 0.0) - (ks ? 1.0 : 0.0), strafe = (kd ? 1.0 : 0.0) - (ka ? 1.0 : 0.0);
                 double px = 0.0, py = 0.0, lx = 0.0, ly = 0.0;
                 ReadPadSticks(px, py, lx, ly);
@@ -3368,6 +3594,7 @@ public:
         // Refresh in-game sensitivity on each dialogue entry.
         if (!m_prevInDialog) {
             LoadStalker2Settings();
+            ResolveMoveKeys();   // v1.0.9: pick up a rebind / layout switch since last time
             // v1.0.3: the dialogue-entry freeze. Every entry used to run three full
             // scans of the ~420k-object UObject array (footstep probe, anim-instance
             // probe, BH-chain probe) plus a 250-line property dump inside the FIRST
@@ -3435,11 +3662,12 @@ public:
                 g_dsSeen.load() ? 1 : 0);
         }
 
-        // ---- Movement: WASD + left stick (pad overrides keyboard per axis) ----
-        bool w = (GetAsyncKeyState('W') & 0x8000) != 0;
-        bool a = (GetAsyncKeyState('A') & 0x8000) != 0;
-        bool s = (GetAsyncKeyState('S') & 0x8000) != 0;
-        bool d = (GetAsyncKeyState('D') & 0x8000) != 0;
+        // ---- Movement: move keys + left stick (pad overrides keyboard per axis) ----
+        // v1.0.9: the keys are ResolveMoveKeys' (game binding / layout), not W/A/S/D.
+        bool w = MoveKeyDown(0);
+        bool a = MoveKeyDown(2);
+        bool s = MoveKeyDown(1);
+        bool d = MoveKeyDown(3);
         double fwd    = (w ? 1.0 : 0.0) - (s ? 1.0 : 0.0);
         double strafe = (d ? 1.0 : 0.0) - (a ? 1.0 : 0.0);
         if (padMoveY != 0.0) fwd    = padMoveY;

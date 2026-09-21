@@ -153,17 +153,35 @@ editor** as a commandlet (about 4.5 minutes, editor need not be open):
 2. Removes the four `IA_UI_Dialog_SelectAnswer` rows bound to `W`, `S`,
    `Gamepad_LeftStick_Up`, `Gamepad_LeftStick_Down`. (Up / Down arrows, D-pad
    and mouse wheel rows stay.)
-3. Duplicates `IMC_Exploration` to a temporary asset and **moves** its modifier
-   and trigger objects (`rename(outer=…)`) into the override for every
-   `IA_LocomotionForward` and `IA_LookUp` row (W, A, S, D, Gamepad_Left2D;
-   Mouse2D, Gamepad_Right2D, NumPad 1/2/3/5). Moving the real objects keeps the
-   game's dead zones, response curves and the custom `ApplySensitivity`
-   modifier intact. (Creating new modifier objects and setting their properties
-   fails with "cannot be edited on templates"; do not try.)
+3. Duplicates `IMC_Exploration` to a temporary asset and **moves** its modifier,
+   trigger and player-mappable-settings objects (`rename(outer=…)`) into the
+   override for every `IA_LocomotionForward` and `IA_LookUp` row (W, A, S, D,
+   Gamepad_Left2D; Mouse2D, Gamepad_Right2D, NumPad 1/2/3/5). Moving the real
+   objects keeps the game's dead zones, response curves and the custom
+   `ApplySensitivity` modifier intact. (Creating new modifier objects and
+   setting their properties fails with "cannot be edited on templates"; do not
+   try.) Each copied row also keeps the exploration row's `SettingBehavior` and
+   `PlayerMappableKeySettings` (2.0.5): the game's Options > Controls rebind is
+   stored per mappable name (`PlayerMappableOption = MoveForward` and so on in
+   `%LOCALAPPDATA%\Stalker2\Saved\CustomizeControls.cfg`) and only reaches rows
+   that carry that name. Rows built without it were frozen on W / A / S / D, so an
+   AZERTY player's ZQSD did nothing in dialogue (Nexus, TheChillPakBoi, 2026-09-21).
 4. Saves. Do **not** call `delete_asset` on the emptied temp asset; it crashes
    the commandlet. The temp asset is never saved, so nothing is left behind.
 
-The result has 34 rows. `dump_imc.py` prints any context's rows for checking.
+The result has 34 rows. `dump_imc.py` prints any context's rows for checking; its
+`mappable` field must read `OverrideSettings/MoveForward` (Back / Left / Right) on
+the four keyboard move rows, the same as on `IMC_Exploration`. The script logs
+`WARNING: no copied row carried player-mappable settings` if it found none.
+
+**Keyboard-layout check (2.0.5, pending in game).** With keys rebound to
+Z / Q / S / D in Options > Controls, ZQSD must walk in dialogue and W / A must
+not. If the rebind still does not reach the dialogue rows (the game may only
+apply `CustomizeControls.cfg` to rows it listed there itself), the fallback is a
+second pak variant: run the script with `IMMDLG_LAYOUT=azerty` in the
+environment, which writes the copied move rows with `Z` / `Q` in place of
+`W` / `A`, cook it as usual and ship it under `Optional-AZERTY/` in the release
+zip (same file names as `Main/`; the Vortex chooser lets the player pick one).
 
 ### 5.3 BP_Stalker2Character (player pawn)
 
@@ -471,3 +489,14 @@ Only `Game__Shipping__Win64` matches the game's CRT. Output
 `Output\ImmersiveDialogueCpp\Game__Shipping__Win64\main.dll` installs to
 `ue4ss\Mods\ImmersiveDialogueCpp\dlls\main.dll` with `ImmersiveDialogueCpp : 1`
 in `mods.txt`. Do not run the DLL and the pak together.
+
+Movement keys (1.0.9): the DLL no longer polls the letters W / A / S / D. On
+each dialogue entry it reads the player's `IA_LocomotionForward` rows from
+`%LOCALAPPDATA%\Stalker2\Saved\CustomizeControls.cfg` (the game's own Options >
+Controls store) and, if that file cannot be read, uses the physical W / S / A / D
+key positions translated through the game window's keyboard layout (ZQSD on
+AZERTY). `config.ini` keys `MoveForwardKey`, `MoveBackKey`, `MoveLeftKey`,
+`MoveRightKey` (default `auto`) force a key by name. The log line
+`[ImmDlg] move keys: fwd=Z(game) back=S(game) left=Q(game) right=D(game) cfgRows=4 layout=0x040c`
+says which source won per key; `cfgRows=0` means the cfg was not found or not
+understood and the layout fallback is in use.

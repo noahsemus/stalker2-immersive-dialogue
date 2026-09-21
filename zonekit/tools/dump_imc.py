@@ -18,10 +18,24 @@ for path in ["/Game/_Stalker_2/data/input/InputMappingContexts/IMC_Exploration",
                 try: d[prop] = str(o.get_editor_property(prop))
                 except Exception: pass
             return d
+        # Player-mappable settings: the game's CustomizeControls.cfg rows are keyed on the
+        # settings' Name (PlayerMappableOption), e.g. MoveForward on the W row.
+        def mappable(m):
+            try:
+                beh = str(m.get_editor_property("setting_behavior")).rsplit(".", 1)[-1]
+            except Exception:
+                beh = None
+            try:
+                s = m.get_editor_property("player_mappable_key_settings")
+                name = str(s.get_editor_property("name")) if s else None
+            except Exception:
+                name = None
+            return {"behavior": beh, "name": name}
         out.append({"imc": path.rsplit("/",1)[1],
                     "action": act.get_name() if act else None,
                     "action_value_type": str(act.get_editor_property("value_type")) if act else None,
                     "key": str(key.get_editor_property("key_name")),
+                    "mappable": mappable(m),
                     "modifiers": [desc(x) for x in m.get_editor_property("modifiers")],
                     "triggers": [desc(x) for x in m.get_editor_property("triggers")]})
 open(OUT, "w", encoding="utf-8").write(json.dumps(out, indent=1))
