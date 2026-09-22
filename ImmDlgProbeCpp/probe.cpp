@@ -11,6 +11,7 @@
 #include <Unreal/CoreUObject/UObject/UnrealType.hpp>
 #include <Windows.h>
 #include <cstring>
+#include <cmath>
 #include <map>
 #include <string>
 #include <vector>
@@ -29,6 +30,8 @@ public:
     uint64_t m_burstUntilMs = 0, m_burstStartMs = 0;
     bool m_prevMoving = false;
     bool m_prevDlg = false;
+    uint64_t m_lastOrientMs = 0; std::wstring m_lastOrientLine;
+    uint64_t m_lastArmsMs = 0;
 
     static UFunction* Fn(UObject* o, const wchar_t* n) { return o->GetFunctionByNameInChain(FName(n)); }
     static UObject* ObjProp(UObject* o, const wchar_t* n) {
@@ -127,6 +130,59 @@ public:
             m_lastHeartbeatMs = hb;
             Output::send<LogLevel::Verbose>(STR("[Probe] heartbeat via={} controllers={} pcObjs={} pawn={}\n"), how, pcs.size(), pcClass.size(), pawn ? pawn->GetFullName() : StringType(STR("null")));
         }
+        // Post-process instance status on every heartbeat (build A needs it outside dialogue too).
+        if (pawn && hb == m_lastHeartbeatMs) {
+            UObject* meshH = ObjProp(pawn, STR("Mesh"));
+            UObject* ppH = meshH ? ObjProp(meshH, STR("PostProcessAnimInstance")) : nullptr;
+            UObject* mainH = meshH ? ObjProp(meshH, STR("AnimScriptInstance")) : nullptr;
+            Output::send<LogLevel::Verbose>(STR("[Probe] hb postproc class={} main={}\n"), ClassName(ppH), ClassName(mainH));
+            // Hidden-bone state of the first-person body (a mesh swap resets it to all-visible).
+            if (meshH) {
+                StringType hidden;
+                for (const wchar_t* bn : { STR("jnt_head"), STR("jnt_neck"), STR("jnt_spine_03"), STR("jnt_spine_02"), STR("jnt_l_clavicle"), STR("jnt_r_clavicle") }) {
+                    if (UFunction* f = Fn(meshH, STR("IsBoneHiddenByName"))) {
+                        struct { FName BoneName; bool R; } p{}; p.BoneName = FName(bn);
+                        if (GuardedProcessEvent(meshH, f, &p)) { hidden += StringType(bn) + (p.R ? STR("=H ") : STR("=v ")); }
+                    }
+                }
+                Output::send<LogLevel::Verbose>(STR("[Probe] hb bones {}\n"), hidden);
+            }
+        }
+        // Body-turning check, in and out of dialogue: orient-to-movement flag, actor yaw vs control yaw, mesh relative yaw. Logged twice a second when something changes.
+        if (pawn && hb - m_lastOrientMs > 500) {
+            m_lastOrientMs = hb;
+            auto readBit = [&](UObject* o, const wchar_t* n) -> int {
+                if (!o) return -1; FProperty* p = o->GetPropertyByNameInChain(n); if (!p) return -1;
+                FBoolProperty* bp = CastField<FBoolProperty>(p); if (!bp) return -1; uint8_t* raw = p->ContainerPtrToValuePtr<uint8_t>(o); return raw ? (bp->GetPropertyValue(raw) ? 1 : 0) : -1; };
+            struct FR { double P, Y, R; };
+            auto rotFn = [&](UObject* o, const wchar_t* fn, FR* out) -> bool {
+                if (!o) return false; UFunction* f = Fn(o, fn); if (!f) return false; struct { FR R; } p{}; if (!GuardedProcessEvent(o, f, &p)) return false; *out = p.R; return true; };
+            UObject* cmc = ObjProp(pawn, STR("CharacterMovement")); UObject* meshO = ObjProp(pawn, STR("Mesh"));
+            int orient = readBit(cmc, STR("bOrientRotationToMovement")); int useYaw = readBit(pawn, STR("bUseControllerRotationYaw"));
+            FR ar{}, cr{}, mr{}; rotFn(pawn, STR("K2_GetActorRotation"), &ar); rotFn(pawn, STR("GetControlRotation"), &cr); rotFn(meshO, STR("K2_GetComponentRotation"), &mr);
+            wchar_t line[256]; swprintf_s(line, 256, L"orient=%d useCtrlYaw=%d actorYaw=%.0f ctrlYaw=%.0f meshYaw=%.0f", orient, useYaw, ar.Y, cr.Y, mr.Y);
+            if (m_lastOrientLine != line) { m_lastOrientLine = line; Output::send<LogLevel::Verbose>(STR("[Probe] turn {}\n"), StringType(line)); }
+        }
+        // Arms check, in and out of dialogue, once a second: where the hands are relative to the camera and the shoulders
+        // (collapsed = scaled away, far below = posed out of view), plus whether the arm bones are hidden.
+        if (pawn && hb - m_lastArmsMs > 1000) {
+            m_lastArmsMs = hb;
+            struct FV { double X, Y, Z; };
+            UObject* meshA = ObjProp(pawn, STR("Mesh")); UObject* camA = ObjProp(pawn, STR("Camera"));
+            auto sock = [&](const wchar_t* sn, FV* out) -> bool {
+                if (!meshA) return false; UFunction* f = Fn(meshA, STR("GetSocketLocation")); if (!f) return false;
+                struct { FName InSocketName; FV R; } p{}; p.InSocketName = FName(sn); if (!GuardedProcessEvent(meshA, f, &p)) return false; *out = p.R; return true; };
+            auto hid = [&](const wchar_t* bn) -> int {
+                if (!meshA) return -1; UFunction* f = Fn(meshA, STR("IsBoneHiddenByName")); if (!f) return -1;
+                struct { FName BoneName; bool R; } p{}; p.BoneName = FName(bn); return GuardedProcessEvent(meshA, f, &p) ? (p.R ? 1 : 0) : -1; };
+            FV cam{}; if (camA) { if (UFunction* f = Fn(camA, STR("K2_GetComponentLocation"))) { struct { FV R; } p{}; if (GuardedProcessEvent(camA, f, &p)) cam = p.R; } }
+            FV lh{}, rh{}, ls{}, rs{}; sock(STR("jnt_l_hand"), &lh); sock(STR("jnt_r_hand"), &rh); sock(STR("jnt_l_shoulder"), &ls); sock(STR("jnt_r_shoulder"), &rs);
+            auto dist = [](FV a, FV b) { double dx = a.X - b.X, dy = a.Y - b.Y, dz = a.Z - b.Z; return std::sqrt(dx*dx + dy*dy + dz*dz); };
+            bool inDlgA = false; if (UFunction* f = Fn(pawn, STR("IsInStaticDialog"))) { struct { bool R = false; } p; if (GuardedProcessEvent(pawn, f, &p)) inDlgA = p.R; }
+            int vis = -1; if (meshA) if (FProperty* p = meshA->GetPropertyByNameInChain(STR("bVisible"))) if (FBoolProperty* bp = CastField<FBoolProperty>(p)) { uint8_t* raw = p->ContainerPtrToValuePtr<uint8_t>(meshA); if (raw) vis = bp->GetPropertyValue(raw) ? 1 : 0; }
+            Output::send<LogLevel::Verbose>(STR("[Probe] arms dlg={} Lhand-cam dz={:.0f} d={:.0f} Lhand-shoulder={:.0f} | Rhand-cam dz={:.0f} d={:.0f} Rhand-shoulder={:.0f} | hidden arm L={} R={} hand L={} R={} meshVisible={}\n"),
+                inDlgA ? 1 : 0, lh.Z - cam.Z, dist(lh, cam), dist(lh, ls), rh.Z - cam.Z, dist(rh, cam), dist(rh, rs), hid(STR("jnt_l_arm")), hid(STR("jnt_r_arm")), hid(STR("jnt_l_hand")), hid(STR("jnt_r_hand")), vis);
+        }
         if (!pawn) return;
         void* dlgPtr = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(pawn) + 0x650);
         if (!dlgPtr) return;
@@ -150,6 +206,52 @@ public:
         if (!mesh) { Output::send<LogLevel::Verbose>(STR("[Probe] no Mesh\n")); return; }
         UObject* inst = ObjProp(mesh, STR("AnimScriptInstance"));
         if (!inst) { Output::send<LogLevel::Verbose>(STR("[Probe] no AnimScriptInstance\n")); return; }
+
+        // Post-process anim instance on the player mesh (build A of the no-override plan sets it at runtime).
+        {
+            UObject* pp = ObjProp(mesh, STR("PostProcessAnimInstance"));
+            int ppDisabled = -1;
+            if (FProperty* p = mesh->GetPropertyByNameInChain(STR("bDisablePostProcessBlueprint"))) {
+                if (FBoolProperty* bp = CastField<FBoolProperty>(p)) { uint8_t* raw = p->ContainerPtrToValuePtr<uint8_t>(mesh); if (raw) ppDisabled = bp->GetPropertyValue(raw) ? 1 : 0; }
+            }
+            Output::send<LogLevel::Verbose>(STR("[Probe] postproc class={} disabled={} main={}\n"), ClassName(pp), ppDisabled, ClassName(inst));
+            // Walk layer variables live on the post-process instance from the no-override build.
+            if (pp) {
+                int ppMoving = -1; float ppFwd = 0, ppRight = 0, ppWalk = 0, ppGest = 0;
+                if (FProperty* p = pp->GetPropertyByNameInChain(STR("DlgMoving")))   { bool* b = p->ContainerPtrToValuePtr<bool>(pp); if (b) ppMoving = *b ? 1 : 0; }
+                if (FProperty* p = pp->GetPropertyByNameInChain(STR("DlgFwd")))      { double* f = p->ContainerPtrToValuePtr<double>(pp); if (f) ppFwd = (float)*f; }
+                if (FProperty* p = pp->GetPropertyByNameInChain(STR("DlgRight")))    { double* f = p->ContainerPtrToValuePtr<double>(pp); if (f) ppRight = (float)*f; }
+                if (FProperty* p = pp->GetPropertyByNameInChain(STR("WalkAlpha")))   { double* f = p->ContainerPtrToValuePtr<double>(pp); if (f) ppWalk = (float)*f; }
+                if (FProperty* p = pp->GetPropertyByNameInChain(STR("GestureAlpha"))){ double* f = p->ContainerPtrToValuePtr<double>(pp); if (f) ppGest = (float)*f; }
+                Output::send<LogLevel::Verbose>(STR("[Probe] pp vars moving={} fwd={:.2f} right={:.2f} walkAlpha={:.2f} gestureAlpha={:.2f}\n"), ppMoving, ppFwd, ppRight, ppWalk, ppGest);
+            }
+        }
+        // Camera vs jnt_camera socket, world space: tells whether the camera still rides on the head bone.
+        {
+            struct FV { double X, Y, Z; };
+            auto compLoc = [&](UObject* c, FV* out) -> bool {
+                if (!c) return false; UFunction* f = Fn(c, STR("K2_GetComponentLocation")); if (!f) return false;
+                struct { FV R; } p{}; if (!GuardedProcessEvent(c, f, &p)) return false; *out = p.R; return true; };
+            auto sockLoc = [&](UObject* c, const wchar_t* sock, FV* out) -> bool {
+                if (!c) return false; UFunction* f = Fn(c, STR("GetSocketLocation")); if (!f) return false;
+                struct { FName InSocketName; FV R; } p{}; p.InSocketName = FName(sock); if (!GuardedProcessEvent(c, f, &p)) return false; *out = p.R; return true; };
+            UObject* cam = ObjProp(pawn, STR("Camera"));
+            FV c{}, s{}, h{}; bool okC = compLoc(cam, &c); bool okS = sockLoc(mesh, STR("jnt_camera"), &s); bool okH = sockLoc(mesh, STR("jnt_head"), &h);
+            Output::send<LogLevel::Verbose>(STR("[Probe] camsock cam-jnt_camera=({:.1f},{:.1f},{:.1f}) cam-jnt_head=({:.1f},{:.1f},{:.1f}) ok={}{}{}\n"),
+                c.X - s.X, c.Y - s.Y, c.Z - s.Z, c.X - h.X, c.Y - h.Y, c.Z - h.Z, okC ? 1 : 0, okS ? 1 : 0, okH ? 1 : 0);
+        }
+        // Camera/mesh placement, to compare builds when "the body looks different" (read only in dialogue).
+        {
+            auto vec3 = [&](UObject* o, const wchar_t* n, double* out) -> bool {
+                if (!o) return false; FProperty* p = o->GetPropertyByNameInChain(n); if (!p) return false;
+                double* v = p->ContainerPtrToValuePtr<double>(o); if (!v) return false; out[0] = v[0]; out[1] = v[1]; out[2] = v[2]; return true; };
+            UObject* cam = ObjProp(pawn, STR("Camera"));
+            double cl[3] = {0,0,0}, ml[3] = {0,0,0}; float fov = -1;
+            bool okC = vec3(cam, STR("RelativeLocation"), cl); bool okM = vec3(mesh, STR("RelativeLocation"), ml);
+            if (cam) if (FProperty* p = cam->GetPropertyByNameInChain(STR("FieldOfView"))) { float* f = p->ContainerPtrToValuePtr<float>(cam); if (f) fov = *f; }
+            Output::send<LogLevel::Verbose>(STR("[Probe] placement cam=({:.1f},{:.1f},{:.1f}){} mesh=({:.1f},{:.1f},{:.1f}){} fov={:.1f} camParent={}\n"),
+                cl[0], cl[1], cl[2], okC ? STR("") : STR("?"), ml[0], ml[1], ml[2], okM ? STR("") : STR("?"), fov, ClassName(cam ? ObjProp(cam, STR("AttachParent")) : nullptr));
+        }
 
         // Our override variables (only present on the pak build's class).
         int dlgMoving = -1; float dlgFwd = 0, dlgRight = 0;

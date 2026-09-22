@@ -1,1 +1,4 @@
 /ImmersiveDialogue/ImmersiveDialogue
+/ImmersiveDialogue/Runtime/BP_ImmDlgSubsystem
+/ImmersiveDialogue/Runtime/ABP_ImmDlgPost
+/ImmersiveDialogue/Runtime/ABP_ImmDlgBody

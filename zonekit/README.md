@@ -705,3 +705,73 @@ Design response, so other authors never have to chase our releases again:
 - README "Compatibility for mod authors" documents the block, the marker, the
   load-order rule and what not to detect.
 
+
+## No `AnimBP_Player` override: dialogue body as a post-process layer (2026-09-22, checkpoint)
+
+Goal: stop replacing `AnimBP_Player` so watch / animation mods (ZST, S-Watch,
+anything else that ships that file) never need a patch from or for us.
+**Working in game** (Noah, ZST installed, no load-order rule): full 2.0.4-style
+walking, strafing and body turn in dialogue; ZST's own `AnimBP_Player` runs
+outside dialogue. Checkpoint paks: `zonekit/builds/checkpoint-2026-09-22-postprocess-layer/`.
+The old override asset is kept in `zonekit/experiments/animbp-override-2.0.4/`.
+
+### How it works
+
+- `Runtime/BP_ImmDlgSubsystem` (`ModWorldSubsystem`, NewContent) attaches
+  `Runtime/ABP_ImmDlgBody` to the player mesh as its **post-process anim
+  instance** (`SetOverridePostProcessAnimBP`) and switches it on only while
+  `IsInStaticDialog AND NOT IsInCinematic` (`SetDisablePostProcessBlueprint`
+  false/true). A disabled post-process instance is neither updated nor
+  evaluated (engine source, `ShouldEvaluatePostProcessInstance`), so outside
+  dialogue the game (or another mod's `AnimBP_Player`) is untouched.
+- `ABP_ImmDlgBody` is a duplicate of our 2.0.4 `AnimBP_Player` (parent
+  `AnimInstancePlayer`, the frozen walk wiring included) with:
+  - comment box `Copy game data`: every frame, cast the mesh's main anim instance
+    to `AnimInstancePlayer` and copy 23 BlueprintReadWrite data structs
+    (`StateData`, `LocomotionData`, `CameraData`, ...) onto itself. The game only
+    pushes these into the main instance; without them the camera bone sat at the
+    feet.
+  - the `WeaponLayer` linked anim layer node's **Instance Class** set to
+    `AnimBP_player_bh`. The Idle / Moving poses are composed inside that layer
+    (the game links it into the main instance only); unset, the body froze.
+    (`LinkAnimClassLayers` from `BlueprintInitializeAnimation` did not take; the
+    static pin does.)
+  - `Is Any Montage Playing` pointed at the main instance, `GestureAlpha`, and a
+    final `Layered blend per bone` ("gesture from game", `jnt_spine_01`, mesh-space
+    rotation) taking the upper body from `Input Pose` while a gesture montage plays
+    (gestures are montages on the main instance).
+- Attaching at load: `SetOverridePostProcessAnimBP(..., Reinit=true)` crashes
+  (`EXCEPTION_ACCESS_VIOLATION reading 0xac0`, same family as the 09-17 class
+  swap): it calls `InitializeAnimScriptInstance` without waiting for the parallel
+  anim task. The only safe Blueprint path that spawns the post-process instance
+  is a mesh change, so the subsystem, once per world ~1 s after the pawn appears
+  and outside dialogue: saves the hidden bones, override = None, `Set Skeletal
+  Mesh Asset` shadow mesh, override = `ABP_ImmDlgBody`, mesh back,
+  `ToggleFOVAndForegroundRender(true)`, re-hides the saved bones (a mesh change
+  resets bone visibility). Armour changes re-create the instance on their own.
+
+### Dead ends today (don't retry)
+
+- Hand-built walk additive in a small post-process graph (`ABP_ImmDlgPost`,
+  `BS_fp_bh_walk`, leg / spine masks): `BS_fp_bh_walk` is the bare-hands arm-layer
+  additive, not the locomotion; it swung the camera bone (which hangs off
+  `jnt_root`, not the head) and never matched the vanilla body turn.
+- Forced reinit at load (crash, above).
+
+### Tooling
+
+- Blueprint nodes as clipboard text (T3D): Noah copies a sample, Claude reads it
+  with `Get-Clipboard`, generates the block, `Set-Clipboard`, Noah pastes. The
+  same works in reverse: Ctrl+A / Ctrl+C a whole AnimGraph gives every node and
+  wire as text (how the `WeaponLayer` gap was found).
+- Engine source for 5.5 is readable with `gh api repos/EpicGames/UnrealEngine/contents/...?ref=5.5`.
+- Probe (`ImmDlgProbeCpp`) now logs the post-process class, its walk variables,
+  camera vs `jnt_camera` / `jnt_head`, body-turn state, hidden bones and arm
+  positions.
+
+### Open
+
+- Arms in dialogue (measurement run next).
+- ZST's watch pose during dialogue (our layer draws the whole body there).
+- Cleanup: remove `ABP_ImmDlgPost`; then 2.1's pawn / `IMC_Dialog` moves, and
+  the NoSkipHint add-on as a runtime hide, for zero overrides.
