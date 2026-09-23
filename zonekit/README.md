@@ -787,7 +787,7 @@ The old override asset is kept in `zonekit/experiments/animbp-override-2.0.4/`.
   body, which carries the rifle-look offset (gestures too low), and its `GestureAlpha`
   was only ever set to 1 (stuck on after the first gesture, hands gone).
 - Dead end: grafting `fp_bh_idle_stand` onto the shoulders (node "arms: bare-hands idle",
-  weight 0 now); not copying `DialogData` (no effect, restored? no: left out, harmless).
+  weight 0 now); not copying `DialogData` (no effect; it stays out of the copy, harmless).
 
 Checkpoint paks: `zonekit/builds/checkpoint-2026-09-22-dialogue-hands/`.
 

@@ -17,17 +17,20 @@ Slava Ukraini.
 
 ## Features
 
-- **Free movement in dialogue.** WASD (keyboard) and left stick (controller)
-  walk Skif, camera-relative. Movement is available from the moment you press
-  "talk", including during the camera zoom-in.
+- **Free movement in dialogue.** Your movement keys (keyboard) and left stick
+  (controller) walk Skif, camera-relative. Movement is available from the
+  moment you press "talk", including during the camera zoom-in. The keys follow
+  your bindings in Options > Controls, so AZERTY (ZQSD) and other layouts work.
 - **Free look.** Mouse and right stick look exactly as in normal play, using
   the game's own sensitivity, dead zones and invert settings. Works with any
   controller the game supports, including DualSense with native haptics.
 - **Camera stays free.** The vanilla dialogue camera modifier that yanks your
   view onto the NPC is disabled while in dialogue.
-- **Walking and strafing animations play in dialogue.** Vanilla freezes the
-  animation inputs during dialogue; the mod feeds them from your actual
-  movement.
+- **Walking and strafing animations play in dialogue**, with the same body turn
+  as outside a conversation. Vanilla freezes the animation inputs during
+  dialogue; the mod animates the body from your actual movement.
+- **Arms in dialogue.** Look down and Skif's arms are there, and his dialogue
+  gestures play on them.
 - **Gestures don't fight the camera.** When Skif plays a dialogue gesture the
   view stays under your control and the legs run a straight-ahead cycle for
   the duration, so the gesture stays in frame.
@@ -55,10 +58,11 @@ paks alongside, matching your normal FOV:
 
 ### Vortex
 
-1. Download `ImmersiveDialogue-v2.0.2.zip` from Nexus or this repo's Releases
+1. Download `ImmersiveDialogue-v2.1.0.zip` from Nexus or this repo's Releases
    page and drop it into Vortex.
 2. Vortex sees more than one pak in the zip and asks which files to install:
-   tick the three `zzz_ImmersiveDialogue_20_P` files for the mod alone, or
+   tick the six files of the mod (`zzz_ImmersiveDialogue_20_P.*` and
+   `ImmersiveDialogueStalker2-Windows-NewContent.*`) for the mod alone, or
    **Install All** to also get the optional add-on that hides the
    "press X to skip" prompt in dialogue (with free look, moving or looking
    around kept making it pop up; the skip key still works either way).
@@ -66,15 +70,18 @@ paks alongside, matching your normal FOV:
 
 ### Manual
 
-1. Get `ImmersiveDialogue-v2.0.2.zip` from the latest release.
-2. Copy the three files from its `Main` folder
+1. Get `ImmersiveDialogue-v2.1.0.zip` from the latest release.
+2. Copy the six files from its `Main` folder
    ```
    zzz_ImmersiveDialogue_20_P.pak
    zzz_ImmersiveDialogue_20_P.ucas
    zzz_ImmersiveDialogue_20_P.utoc
+   ImmersiveDialogueStalker2-Windows-NewContent.pak
+   ImmersiveDialogueStalker2-Windows-NewContent.ucas
+   ImmersiveDialogueStalker2-Windows-NewContent.utoc
    ```
    into `<GAME>\Stalker2\Content\Paks\~mods\` (create `~mods` if needed).
-   Keep the three names identical apart from the extension.
+   Don't rename them.
 
    Optionally also copy the three `zzz_ImmersiveDialogueNoSkipHint_20_P.*`
    files from `Optional-NoSkipHint` to hide the dialogue skip prompt.
@@ -83,78 +90,61 @@ To uninstall, delete the files you copied.
 
 ## Known limitations
 
-- **No arms in dialogue.** Look down while walking in a dialogue and Skif's
-  arms are not there; they only appear while he gestures. Cosmetic; planned.
 - **Camera centering cannot be toggled** in 2.0 (the 1.x DLL had an F6 toggle
   and a config file). It is always off in dialogue.
 - The walking pace in dialogue is a fixed fraction of walk speed (no config).
-- **Non-QWERTY keyboards (AZERTY and others):** up to 2.0.4 the dialogue
-  movement keys were fixed to W / A / S / D whatever you had bound in Options >
-  Controls. 2.0.5 (in progress) follows your binding.
+- **Rebinding movement:** the game resolves a clash inside the dialogue screen
+  by unbinding the other action. Rebinding "move left" to Q (AZERTY) leaves the
+  dialogue's "open upgrade" prompt without a key until you give it another one
+  in Options > Controls.
 
 ## Compatibility
 
-- The mod overrides three game assets: `AnimBP_Player` (player animation
-  Blueprint), `BP_Stalker2Character` (player pawn Blueprint) and `IMC_Dialog`
-  (dialogue input mapping). No config files are touched. Any other mod that
-  overrides one of those will be overridden by this mod, because the pak is
-  named to load last (`_20_P`). Weapon-positioning mods that ship their own
-  `AnimBP_Player` are the likely conflict.
+- **From 2.1.0 the mod no longer replaces the player animation file
+  (`AnimBP_Player`).** Watch, weapon and animation mods that ship their own
+  copy of it work alongside this one with no patch and no load-order rule. In a
+  conversation this mod animates Skif's body itself; outside conversations the
+  game's (or your other mod's) animation runs untouched.
+- The mod still overrides two game assets: `BP_Stalker2Character` (player pawn
+  Blueprint) and `IMC_Dialog` (dialogue input mapping). No config files are
+  touched. A mod that overrides one of those will be overridden by this one
+  (the pak is named to load late, `_20_P`).
 - **Immersive HUD:** compatible (tested with 2.0.2). Its compass / HUD keys keep
   working before and after conversations.
-- **Zone Standard Time (ZST watch mod).** ZST ships its own `AnimBP_Player`
-  that includes this mod's walk wiring and loads above ours, so the watch works
-  with both installed. ZST 1.0.5 only recognises the 2.0.2 build of this mod;
-  with 2.0.3 or later the watch and the dialogue camera work, but Skif's legs
-  don't animate while walking in dialogue until ZST updates. The UE4SS version
-  (1.x) has no conflict with ZST at all.
+- **Zone Standard Time (ZST) and other watch mods:** compatible from 2.1.0 with
+  no patch (tested with ZST). The watch works as usual; during a conversation
+  Skif's body is animated by this mod.
 - Mod authors: see [Compatibility for mod authors](#compatibility-for-mod-authors).
 - Every game patch requires this mod to be rebuilt against the new Zone Kit.
   If a patch breaks it, check the Nexus page for an update.
 - Save games are unaffected; the pawn class keeps its vanilla path.
+- **Keybinds:** the dialogue movement rows carry the game's own "Move
+  Forward / Back / Left / Right" names, so the game applies your Options >
+  Controls bindings to them.
 
 ## Compatibility for mod authors
 
-Immersive Dialogue replaces three game assets. Unreal loads exactly one copy of
-an asset, so if your mod replaces one of them too, whichever pak loads last wins
-and the other mod's edits to that asset are gone. Load order cannot merge them;
-one file has to carry both sets of edits.
+From 2.1.0 Immersive Dialogue does **not** replace `AnimBP_Player`. It replaces:
 
 | Asset | What we change | Status |
 |---|---|---|
-| `/Game/_STALKER2/Animations/Player/AnimBP_Player` | the dialogue walk wiring (below) | **frozen from 2.0.4**: we do not plan to change it again |
-| `/Game/GameLite/Blueprints/Characters/Player/BP_Stalker2Character` | movement in dialogue, camera handling, cutscene guard | changes between releases; going away in 2.1 (moves to a mod-only helper) |
-| `/Game/_Stalker_2/data/input/InputMappingContexts/IMC_Dialog` | move / look rows added, W / S / left-stick "select answer" rows removed | going away in 2.1 (own mapping context) |
+| `/Game/GameLite/Blueprints/Characters/Player/BP_Stalker2Character` | movement in dialogue, camera handling, cutscene guard | changes between releases; planned to move to the mod-only helper |
+| `/Game/_Stalker_2/data/input/InputMappingContexts/IMC_Dialog` | move / look rows added (with the game's mappable names), W / S / left-stick "select answer" rows removed | planned to become our own context |
 
-Our pak is named `zzz_ImmersiveDialogue_20_P` (load order 2103). A pak that
-carries a combined copy of one of these assets must load above it, e.g. `_30_P`.
+Our pak is named `zzz_ImmersiveDialogue_20_P` (load order 2103).
 
-### Merging our `AnimBP_Player` block into yours
+**How the dialogue body works now.** A mod-only world subsystem attaches our own
+animation Blueprint to the player mesh as its **post-process anim instance**
+(`SetOverridePostProcessAnimBP`) and enables it only while the player is in a
+static dialogue and not in a cinematic. It runs a copy of the player graph fed
+with the main instance's data every frame, so whatever `AnimBP_Player` is loaded
+(vanilla or yours) stays untouched and runs everywhere else. The one new contact
+point: if your mod sets its own post-process anim Blueprint on the player mesh,
+ours replaces it during dialogue.
 
-From 2.0.4 our part of `AnimBP_Player` is only this, and it is meant to be merged
-once and left alone:
-
-- **Variables:** `DlgMoving` (bool), `DlgFwd`, `DlgRight`, `LastInputTime` (float).
-- **Event Graph**, off `Event Blueprint Update Animation`: `Try Get Pawn Owner` ->
-  `Cast To PC` -> `Is In Static Dialog` -> Branch. In dialogue: read the pawn's
-  `Movement Input Vector`; if its length is above 0.01, store the game time in
-  `LastInputTime` and the normalized X / Y times 0.86 in `DlgFwd` / `DlgRight`;
-  `DlgMoving` = game time minus `LastInputTime` is under 0.15; while
-  `Is Any Montage Playing`, `DlgRight` = 0 and (if moving) `DlgFwd` = 0.86.
-  Not in dialogue: all three reset.
-- **AnimGraph**, Moving state machine: `DlgMoving` OR'd / AND-NOT'd into the
-  Idle, IsMoving, Walk and StopWalk transition rules, and the Walk / StartWalk
-  blendspace X / Y inputs switched to `DlgRight` / `DlgFwd` while `DlgMoving`.
-
-Node-by-node detail is in [BUILD.md §5.4](BUILD.md); the source asset is
-`zonekit/ImmersiveDialogue/Content/_STALKER2/Animations/Player/AnimBP_Player.uasset`.
-
-The block needs **no detection gate**. It only reacts to `Movement Input Vector`
-during static dialogue, and nothing writes that in dialogue except our player
-character, so without Immersive Dialogue installed it does nothing. It contains
-no camera code (that moved to the player character in 2.0.4; if you merged an
-earlier version, remove `CamAbs`, `SavedCamRot`, `SavedOrient` and the
-`Set Absolute` / `Set World Rotation` nodes that came with it).
+**If you merged our old `AnimBP_Player` block** (2.0.2 or the frozen 2.0.4 one):
+it is harmless and you can remove it. It only acts on `Movement Input Vector` in
+dialogue, and during dialogue our layer draws the body anyway.
 
 ### Detecting Immersive Dialogue
 
@@ -167,8 +157,7 @@ If you want to know whether we are installed, load this soft object path:
 It is an empty curve asset shipped in the main pak from 2.0.4, and its name is
 an **interface revision, not a mod version**: `v1` means our player character is
 present, feeds `Movement Input Vector` during dialogue and owns the dialogue
-camera, and the animation block is the one described above. It stays `v1` across
-releases for as long as that holds.
+camera. It stays `v1` across releases for as long as that holds.
 
 Do **not** detect us through `/Game/__ModKitWwiseCookAnchor_ImmersiveDialogue_<number>__`.
 The Zone Kit generates that asset on every cook with a new number, so it matches
@@ -181,9 +170,11 @@ GitHub issues, or the Nexus page (mod 2698).
 
 ## Versions
 
-- **2.0.5** *(in progress)* — dialogue movement follows the keys you bound in
-  Options > Controls, so AZERTY (ZQSD) and other rebinds work. Same fix in
-  1.0.9 for the UE4SS version.
+- **2.1.0** — no longer replaces the player animation file, so watch and
+  animation mods (ZST and others) work alongside with no patch. Skif's arms are
+  visible in dialogue and gestures play on them. Dialogue movement follows the
+  keys you bound in Options > Controls (AZERTY and other layouts), including
+  during the zoom-in.
 - **2.0.4** — compatibility release; dialogue feels the same. Camera handling
   moved from the player animation file into the player character, so it keeps
   working when another mod's copy of the animation file is in use. Our part of

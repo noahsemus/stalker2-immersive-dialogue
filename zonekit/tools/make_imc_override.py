@@ -38,6 +38,15 @@ DST        = DST_DIR + "/IMC_Dialog"
 TMP        = DST_DIR + "/IMC_ExplorationTmp_%d" % int(time.time())   # unique per run, never saved
 EAL = unreal.EditorAssetLibrary
 
+def dup(src, dst):
+    """EditorAssetLibrary.duplicate_asset returns None inside a running editor for /Game
+    sources; AssetTools.duplicate_asset works in both the commandlet and the live editor."""
+    r = EAL.duplicate_asset(src, dst)
+    if r is None:
+        folder, name = dst.rsplit("/", 1)
+        r = unreal.AssetToolsHelpers.get_asset_tools().duplicate_asset(name, folder, unreal.load_asset(src))
+    return r
+
 def prop(o, name, default=None):
     """get_editor_property that returns `default` when the property doesn't exist."""
     try:
@@ -78,7 +87,7 @@ try:
     if EAL.does_asset_exist(DST):
         log("override exists already, deleting to rebuild")
         EAL.delete_asset(DST)
-    dup = EAL.duplicate_asset(SRC_DIALOG, DST)
+    dup = dup(SRC_DIALOG, DST)
     log(f"duplicate -> {dup}")
     imc = unreal.load_asset(DST)
 
@@ -96,7 +105,7 @@ try:
 
     # 4. Move the move + look rows' objects out of a throwaway copy of IMC_Exploration.
     COPY_ACTIONS = {"IA_LocomotionForward", "IA_LookUp"}
-    tmp_dup = EAL.duplicate_asset(SRC_EXPLO, TMP)
+    tmp_dup = dup(SRC_EXPLO, TMP)
     log(f"temp exploration copy -> {tmp_dup}")
     tmp = unreal.load_asset(TMP)
     def take(o):

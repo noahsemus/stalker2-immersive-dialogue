@@ -118,6 +118,41 @@ public:
         }
         Output::send<LogLevel::Verbose>(STR("[Probe] diff: {} changed\n"), shown);
     }
+    // ---- Rebind investigation: every InputMappingContext named IMC_Dialog* in memory and its move-row keys ----
+    uint64_t m_imcDlgStart = 0; int m_imcScans = 0;
+    void ScanDialogContexts(const wchar_t* when) {
+        std::vector<UObject*> found;
+        UObjectGlobals::ForEachUObject([&](UObject* obj, int32_t, int32_t) -> LoopAction {
+            if (!obj) return LoopAction::Continue;
+            StringType n = obj->GetName();
+            if (n.rfind(STR("IMC_Dialog"), 0) != 0) return LoopAction::Continue;
+            for (UStruct* w = obj->GetClassPrivate(); w; w = w->GetSuperStruct())
+                if (w->GetName() == STR("InputMappingContext")) { found.push_back(obj); break; }
+            return LoopAction::Continue;
+        });
+        for (UObject* imc : found) {
+            FProperty* mp = imc->GetPropertyByNameInChain(STR("Mappings")); FArrayProperty* ap = mp ? CastField<FArrayProperty>(mp) : nullptr;
+            FStructProperty* ip = ap ? CastField<FStructProperty>(ap->GetInner()) : nullptr;
+            if (!ip) continue;
+            int32_t keyOff = -1, actOff = -1;
+            for (UStruct* w = ip->GetStruct(); w; w = w->GetSuperStruct())
+                for (FProperty* p : TFieldRange<FProperty>(w, EFieldIterationFlags::None)) {
+                    if (p->GetName() == STR("Key")) keyOff = p->GetOffset_ForInternal();
+                    if (p->GetName() == STR("Action")) actOff = p->GetOffset_ForInternal();
+                }
+            uint8_t* hdr = mp->ContainerPtrToValuePtr<uint8_t>(imc); int32_t es = ap->GetInner()->GetElementSize();
+            uint8_t* data = *reinterpret_cast<uint8_t**>(hdr); int32_t num = *reinterpret_cast<int32_t*>(hdr + 8);
+            StringType keys; int total = 0;
+            for (int32_t i = 0; i < num && data; ++i) {
+                uint8_t* e = data + (int64_t)i * es; UObject* act = *reinterpret_cast<UObject**>(e + actOff);
+                total++;
+                if (!act || act->GetName() != STR("IA_LocomotionForward")) continue;
+                keys += reinterpret_cast<FName*>(e + keyOff)->ToString() + STR(" ");
+            }
+            Output::send<LogLevel::Verbose>(STR("[Probe] imc {} {} rows={} move keys=[{}] obj={}\n"), when, imc->GetName(), total, keys, imc->GetFullName());
+        }
+        if (found.empty()) Output::send<LogLevel::Verbose>(STR("[Probe] imc {} none found\n"), when);
+    }
     static bool GuardedProcessEvent(UObject* o, UFunction* fn, void* parms) {
         __try { o->ProcessEvent(fn, parms); return true; }
         __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
@@ -256,6 +291,16 @@ public:
             UObject* meshD = ObjProp(pawn, STR("Mesh")); UObject* instD = meshD ? ObjProp(meshD, STR("AnimScriptInstance")) : nullptr;
             bool inDlgD = false; if (UFunction* f = Fn(pawn, STR("IsInStaticDialog"))) { struct { bool R = false; } p; if (GuardedProcessEvent(pawn, f, &p)) inDlgD = p.R; }
             DiffTick(instD, inDlgD, hb);
+        }
+        // Rebind investigation: scan IMC_Dialog objects at 0.3 s (zoom-in) and 5 s (dialogue UI up) into each dialogue.
+        if (pawn) {
+            bool inD = false; if (UFunction* f = Fn(pawn, STR("IsInStaticDialog"))) { struct { bool R = false; } p; if (GuardedProcessEvent(pawn, f, &p)) inD = p.R; }
+            if (!inD) { m_imcDlgStart = 0; m_imcScans = 0; }
+            else {
+                if (m_imcDlgStart == 0) m_imcDlgStart = hb;
+                if (m_imcScans == 0 && hb - m_imcDlgStart > 300) { m_imcScans = 1; ScanDialogContexts(STR("zoom")); }
+                else if (m_imcScans == 1 && hb - m_imcDlgStart > 5000) { m_imcScans = 2; ScanDialogContexts(STR("ui")); }
+            }
         }
         if (!pawn) return;
         void* dlgPtr = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(pawn) + 0x650);
