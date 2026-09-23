@@ -769,9 +769,32 @@ The old override asset is kept in `zonekit/experiments/animbp-override-2.0.4/`.
   camera vs `jnt_camera` / `jnt_head`, body-turn state, hidden bones and arm
   positions.
 
+### Arms and gestures in dialogue (2026-09-22, same evening, working)
+
+- Probe data diff (main instance, outside vs 2 s into a dialogue) showed one relevant
+  change: `StateData.bForceBindedHandsLookVertical` 0 -> 1. In `AnimBP_player_bh`'s
+  `WeaponLayer` that flag (Blend Poses by bool, True = `fp_ar_stand_lookvertical`
+  sequence evaluator) lays the rifle look-vertical pose over the arms as a mesh-space
+  additive: hands at head height, out of view. That is the vanilla "no arms in dialogue".
+- Fix: `Runtime/ABP_ImmDlgHands` = checkout of `AnimBP_player_bh` renamed and moved to a
+  mod-only path (so the game's own bh is untouched), with that node's Active Value
+  binding removed ("no forced hands look"). `ABP_ImmDlgBody`'s WeaponLayer instance
+  class = `ABP_ImmDlgHands`.
+- Gestures: linked layers with `bUseMainInstanceMontageEvaluationData` read montage data
+  from the component's *main* instance (engine: `FAnimInstanceProxy::InitializeObjects`),
+  so the gesture montages the game plays on its own instance already show in our layer.
+  The "gesture from game" overlay is off (weight 0): it copied the main instance's upper
+  body, which carries the rifle-look offset (gestures too low), and its `GestureAlpha`
+  was only ever set to 1 (stuck on after the first gesture, hands gone).
+- Dead end: grafting `fp_bh_idle_stand` onto the shoulders (node "arms: bare-hands idle",
+  weight 0 now); not copying `DialogData` (no effect, restored? no: left out, harmless).
+
+Checkpoint paks: `zonekit/builds/checkpoint-2026-09-22-dialogue-hands/`.
+
 ### Open
 
-- Arms in dialogue (measurement run next).
-- ZST's watch pose during dialogue (our layer draws the whole body there).
+- Cleanup before release: remove `ABP_ImmDlgPost`, the arms graft nodes and the unused
+  "gesture from game" node; decide whether `DialogData` should be copied again.
+- ZST's watch pose during dialogue (our layer draws the whole body there): untested.
 - Cleanup: remove `ABP_ImmDlgPost`; then 2.1's pawn / `IMC_Dialog` moves, and
   the NoSkipHint add-on as a runtime hide, for zero overrides.

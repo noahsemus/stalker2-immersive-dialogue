@@ -50,6 +50,74 @@ public:
                 if (p) out[p->GetName()] = p->GetOffset_ForInternal();
     }
     // SEH guards: a fault inside becomes a false return instead of a game crash.
+    // ---- Data diff: which AnimInstancePlayer struct members change when a dialogue starts (arms investigation) ----
+    struct DField { StringType name; int32_t off; int32_t size; StringType type; FBoolProperty* bp; };
+    std::vector<DField> m_dfields; UClass* m_dfieldsClass = nullptr;
+    std::vector<uint8_t> m_dsnap; bool m_dsnapValid = false; bool m_ddone = false; uint64_t m_dlgSinceMs = 0; uint64_t m_lastSnapMs = 0;
+    static bool GuardedCopy(const uint8_t* src, uint8_t* dst, int32_t n) { __try { memcpy(dst, src, n); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; } }
+    void BuildFields(UObject* inst) {
+        m_dfields.clear(); m_dfieldsClass = inst->GetClassPrivate();
+        auto addStruct = [&](auto&& self, UStruct* st, const StringType& prefix, int32_t base, int depth) -> void {
+            for (UStruct* w = st; w; w = w->GetSuperStruct())
+                for (FProperty* q : TFieldRange<FProperty>(w, EFieldIterationFlags::None)) {
+                    if (!q) continue;
+                    StringType tn = q->GetClass().GetName();
+                    int32_t off = base + q->GetOffset_ForInternal();
+                    if (FStructProperty* sq = CastField<FStructProperty>(q)) { if (depth < 2) self(self, sq->GetStruct(), prefix + q->GetName() + STR("."), off, depth + 1); continue; }
+                    int32_t sz = q->GetSize(); if (sz > 16) continue;
+                    m_dfields.push_back({ prefix + q->GetName(), off, sz, tn, CastField<FBoolProperty>(q) });
+                }
+        };
+        for (UStruct* w = inst->GetClassPrivate(); w; w = w->GetSuperStruct()) {
+            if (w->GetName() == STR("AnimInstance")) break;
+            for (FProperty* p : TFieldRange<FProperty>(w, EFieldIterationFlags::None)) {
+                FStructProperty* sp = CastField<FStructProperty>(p); if (!sp) continue;
+                StringType sn = sp->GetStruct()->GetName();
+                if (sn.rfind(STR("Anim"), 0) != 0 && sn.rfind(STR("TwoLeg"), 0) != 0) continue;
+                addStruct(addStruct, sp->GetStruct(), p->GetName() + STR("."), p->GetOffset_ForInternal(), 0);
+            }
+        }
+        m_dsnap.assign(m_dfields.size() * 16, 0); m_dsnapValid = false;
+        Output::send<LogLevel::Verbose>(STR("[Probe] diff: {} fields\n"), m_dfields.size());
+    }
+    StringType FmtField(const DField& f, const uint8_t* v) {
+        if (f.bp) return f.bp->GetPropertyValue(const_cast<uint8_t*>(v)) ? STR("1") : STR("0");
+        wchar_t b[64];
+        if (f.type == STR("FloatProperty")) swprintf_s(b, 64, L"%.3f", *(const float*)v);
+        else if (f.type == STR("DoubleProperty")) swprintf_s(b, 64, L"%.3f", *(const double*)v);
+        else if (f.type == STR("IntProperty")) swprintf_s(b, 64, L"%d", *(const int32_t*)v);
+        else if (f.size == 1) swprintf_s(b, 64, L"%u", (unsigned)*v);
+        else if (f.type == STR("ObjectProperty") || f.type == STR("ClassProperty")) { UObject* o = *(UObject* const*)v; return o ? o->GetName() : StringType(STR("null")); }
+        else { swprintf_s(b, 64, L"0x%llx", (unsigned long long)*(const uint64_t*)v); }
+        return b;
+    }
+    void DiffTick(UObject* inst, bool inDlg, uint64_t now) {
+        if (!inst) return;
+        if (inst->GetClassPrivate() != m_dfieldsClass) BuildFields(inst);
+        const uint8_t* base = reinterpret_cast<const uint8_t*>(inst);
+        if (!inDlg) {
+            m_ddone = false; m_dlgSinceMs = 0;
+            if (now - m_lastSnapMs > 1000) {
+                m_lastSnapMs = now; bool ok = true;
+                for (size_t i = 0; i < m_dfields.size() && ok; ++i) ok = GuardedCopy(base + m_dfields[i].off, &m_dsnap[i * 16], m_dfields[i].size);
+                m_dsnapValid = ok;
+            }
+            return;
+        }
+        if (m_dlgSinceMs == 0) m_dlgSinceMs = now;
+        if (m_ddone || !m_dsnapValid || now - m_dlgSinceMs < 2000) return;
+        m_ddone = true; int shown = 0;
+        Output::send<LogLevel::Verbose>(STR("[Probe] diff: members changed by entering dialogue (out -> in):\n"));
+        for (size_t i = 0; i < m_dfields.size(); ++i) {
+            uint8_t cur[16] = {}; if (!GuardedCopy(base + m_dfields[i].off, cur, m_dfields[i].size)) continue;
+            const uint8_t* old = &m_dsnap[i * 16];
+            bool diff = m_dfields[i].bp ? (m_dfields[i].bp->GetPropertyValue(cur) != m_dfields[i].bp->GetPropertyValue(const_cast<uint8_t*>(old))) : memcmp(cur, old, m_dfields[i].size) != 0;
+            if (!diff) continue;
+            if (++shown > 120) break;
+            Output::send<LogLevel::Verbose>(STR("[Probe] diff   {} [{}]: {} -> {}\n"), m_dfields[i].name, m_dfields[i].type, FmtField(m_dfields[i], old), FmtField(m_dfields[i], cur));
+        }
+        Output::send<LogLevel::Verbose>(STR("[Probe] diff: {} changed\n"), shown);
+    }
     static bool GuardedProcessEvent(UObject* o, UFunction* fn, void* parms) {
         __try { o->ProcessEvent(fn, parms); return true; }
         __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
@@ -182,6 +250,12 @@ public:
             int vis = -1; if (meshA) if (FProperty* p = meshA->GetPropertyByNameInChain(STR("bVisible"))) if (FBoolProperty* bp = CastField<FBoolProperty>(p)) { uint8_t* raw = p->ContainerPtrToValuePtr<uint8_t>(meshA); if (raw) vis = bp->GetPropertyValue(raw) ? 1 : 0; }
             Output::send<LogLevel::Verbose>(STR("[Probe] arms dlg={} Lhand-cam dz={:.0f} d={:.0f} Lhand-shoulder={:.0f} | Rhand-cam dz={:.0f} d={:.0f} Rhand-shoulder={:.0f} | hidden arm L={} R={} hand L={} R={} meshVisible={}\n"),
                 inDlgA ? 1 : 0, lh.Z - cam.Z, dist(lh, cam), dist(lh, ls), rh.Z - cam.Z, dist(rh, cam), dist(rh, rs), hid(STR("jnt_l_arm")), hid(STR("jnt_r_arm")), hid(STR("jnt_l_hand")), hid(STR("jnt_r_hand")), vis);
+        }
+        // Data diff (arms investigation): snapshot main-instance data outside dialogue, list what differs 2 s into a dialogue.
+        if (pawn) {
+            UObject* meshD = ObjProp(pawn, STR("Mesh")); UObject* instD = meshD ? ObjProp(meshD, STR("AnimScriptInstance")) : nullptr;
+            bool inDlgD = false; if (UFunction* f = Fn(pawn, STR("IsInStaticDialog"))) { struct { bool R = false; } p; if (GuardedProcessEvent(pawn, f, &p)) inDlgD = p.R; }
+            DiffTick(instD, inDlgD, hb);
         }
         if (!pawn) return;
         void* dlgPtr = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(pawn) + 0x650);
