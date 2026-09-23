@@ -791,6 +791,12 @@ The old override asset is kept in `zonekit/experiments/animbp-override-2.0.4/`.
 
 Checkpoint paks: `zonekit/builds/checkpoint-2026-09-22-dialogue-hands/`.
 
+Follow-up (same night, folded into the 2.1.0 zip): gestures did not follow the
+camera's pitch. The forced hands-look switch is what makes them follow it, so the
+"no forced hands look" node now binds `GetPlayerAnimInstance.IsAnyMontagePlaying`
+(on during gestures only). `StateData.bActionSlotActive` was tried first and is
+not set by dialogue gestures.
+
 ### Open
 
 - Cleanup before release: remove `ABP_ImmDlgPost`, the arms graft nodes and the unused

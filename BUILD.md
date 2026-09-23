@@ -479,9 +479,13 @@ Engineering detail and the dead ends are in `zonekit/README.md` § "No
 
 **`Runtime/ABP_ImmDlgHands`** (checkout of `AnimBP_player_bh`, renamed and moved
 to a mod-only path): in the `WeaponLayer` layer graph, the Blend Poses by bool
-bound to `StateData.bForceBindedHandsLookVertical` ("no forced hands look") has
-its binding removed. The game sets that flag in dialogue and it lays the rifle
-look-vertical pose over the arms (the vanilla "no arms in dialogue").
+was bound to `StateData.bForceBindedHandsLookVertical`; it is now bound to
+`GetPlayerAnimInstance.IsAnyMontagePlaying` ("hands look vertical: gestures only").
+The game sets that flag for the whole dialogue, and the rifle look-vertical
+additive it selects raises idle arms out of view (the vanilla "no arms in
+dialogue"); during a gesture montage the same additive is what makes the
+gesturing arm follow the camera's pitch, so it is on only then.
+(`StateData.bActionSlotActive` is not set by dialogue gestures; tried, no effect.)
 
 Cook lists: NewPackages = `ImmersiveDialogue`, `Runtime/BP_ImmDlgSubsystem`,
 `Runtime/ABP_ImmDlgBody`, `Runtime/ABP_ImmDlgHands`; OverridePackages = the

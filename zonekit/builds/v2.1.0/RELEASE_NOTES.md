@@ -2,7 +2,7 @@ ImmersiveDialogue 2.1.0: no more conflicts with watch and animation mods, arms i
 
 **For players**
 - **Works with watch and animation mods, no patch needed.** The mod no longer replaces the player animation file. Zone Standard Time (tested) and other mods that ship their own copy of it (S-Watch and similar) now work alongside this one, whatever their load order.
-- **Arms in dialogue.** Look down in a conversation and Skif's arms are there. His dialogue gestures play on them and stay at the right height.
+- **Arms in dialogue.** Look down in a conversation and Skif's arms are there. His dialogue gestures play on them, at the right height, and follow your view when you look up or down.
 - **Your keybinds.** Dialogue movement follows Options > Controls, so AZERTY (ZQSD) and other layouts work, from the first moment of the zoom-in. If you bind "move left" to Q, the game takes Q away from the dialogue's "open upgrade" prompt; give that prompt another key in the same menu.
 - Walking, strafing and the body turn in dialogue look the same as outside a conversation.
 
