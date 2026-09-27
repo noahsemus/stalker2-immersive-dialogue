@@ -330,6 +330,25 @@ off the end of `Cam: init` (BeginPlay): `Make Soft Object Path`
 instead of an asset pick (see §5.2b for why). The Add node's `Notify User
 Settings` option is ticked; the game ignores it, harmless.
 
+**Stale move-input watchdog (2.1.1).** Nexus report 2026-09-25
+(wyruzzah1987): footsteps looped nonstop after walking far from the NPC, until
+the next conversation. Rare (Noah reproduced it once). Cause: the handler's
+`Completed` never fired (probably the game ended the dialogue, `DialogDistance =
+5.0` in CoreVariables, and swapped the mapping context while a key was held), so
+`Movement Input Vector` stayed non-zero. Variables `DlgMoveFed` (Boolean) and
+`DlgMoveFedTime` (Float).
+- Comment box **`Move feed: stamp`**: after the handler's in-dialogue
+  `Set Move Vector`, `SET DlgMoveFed` true (`fed: true`) -> `SET DlgMoveFedTime`
+  = `Get Game Time in Seconds` (`fed: time`). `Triggered` fires every tick while
+  a key/stick is held.
+- Comment box **`Move feed: stale watchdog`**: Branch `move feed stale?` =
+  `DlgMoveFed AND (Get Game Time in Seconds - DlgMoveFedTime > 0.2)`; True ->
+  `Set Move Vector` (`stale move: zero`, `In Move Vector` from a `Make Vector`
+  0,0,0 labelled `zero vector`; the pin is by-ref and must be wired) ->
+  `SET DlgMoveFed` false (`fed: cleared`). Driven from **Then 2** of both
+  `seq: in dialogue` and `seq: not in dialogue`, so it also runs after exit.
+  Only zeroes input the mod wrote, once.
+
 ### 5.4 AnimBP_Player (player animation Blueprint, up to 2.0.4)
 
 Checkout `/Game/_STALKER2/Animations/Player/AnimBP_Player` the same way.
