@@ -797,6 +797,31 @@ camera's pitch. The forced hands-look switch is what makes them follow it, so th
 (on during gestures only). `StateData.bActionSlotActive` was tried first and is
 not set by dialogue gestures.
 
+### Nonstop footsteps after a conversation (2026-10-03)
+
+Reports: wyruzzah1987 (09-25, again 10-02 on 2.1.1), JayeAntee (10-01); Noah saw it too. Footsteps repeat
+while standing still after "moving away" in a conversation; only another conversation stops them. First seen
+three days after 2.1.0 (the post-process body layer), never on 2.0.x.
+
+- 2.1.1's move-input watchdog did not fix it. Its premise (the game ends the conversation at `DialogDistance`)
+  was wrong: `DialogDistance = 5.0` sits under "LookAt Manager" in `CoreVariables.cfg`, and walking away never
+  ends a conversation.
+- Player footsteps are `AnimNotify_AnyFootOnGround` one-shots on the `ar/common` walk / run / crouch sequences
+  (and `bh` run additives; `bh` walk has none). No looping notify state on any locomotion sequence (headless scan
+  of 71 player sequences).
+- UE 5.5 source: `USkeletalMeshComponent::ConditionallyDispatchQueuedAnimEvents` calls
+  `PostProcessAnimInstance->DispatchQueuedAnimEvents()` every frame with no disabled check;
+  `TriggerAnimNotifies` does not clear `NotifyQueue`; only `PreUpdateAnimation` (an update) or
+  `UninitializeAnimation` (inside `InitializeAnimation`, run by `SetDisablePostProcessBlueprint(false)`) resets it.
+  So when the subsystem switches `ABP_ImmDlgBody` off on a frame where its walk queued a footstep, that footstep
+  fires every frame until the next conversation switches the layer on. Fits every report detail: rare (the
+  conversation has to end on the one frame a foot lands), needs walking in the conversation, cured by talking
+  to any NPC.
+- Shipped in 2.1.2 (Noah: nothing broken in game; the footstep fix itself is unconfirmed, released as an optimistic fix): `Body layer: flush stale notifies` in `BP_ImmDlgSubsystem` (BUILD.md §5.7): one tick after
+  the layer goes off, switch it on and straight off (re-init clears the queue). Probe lines `[Probe] nq
+  dlg= layerOff= queued= [sources] staleFor=`: with the fix, `layerOff=1` must never stay at `queued>0` for more
+  than a tick or two.
+
 ### Open
 
 - Cleanup before release: remove `ABP_ImmDlgPost`, the arms graft nodes and the unused

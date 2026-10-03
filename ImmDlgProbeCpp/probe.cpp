@@ -222,6 +222,69 @@ public:
         return reinterpret_cast<FName*>(buf + offRet)->ToString();
     }
 
+    // ---- Stale notify check (nonstop footsteps, 2026-10-03): notifies left queued on the post-process instance ----
+    // A disabled post-process instance is not updated, but the mesh still dispatches its NotifyQueue every frame,
+    // so a footstep queued on its last updated frame repeats until the queue is emptied. Logs the queue whenever the
+    // layer is off and it is not empty (once a second while that lasts), and every on/off switch.
+    uint64_t m_lastNqMs = 0, m_staleSinceMs = 0, m_lastStaleLogMs = 0; int m_prevPpDis = -2, m_prevNq = -2;
+    int32_t m_nqArrOff = -1, m_nqElemSize = 0, m_nqSrcOff = -1; UClass* m_nqClass = nullptr;
+    static bool GuardedArrayHeader(uint8_t* hdr, uint8_t** data, int32_t* num) {
+        __try { *data = *reinterpret_cast<uint8_t**>(hdr); *num = *reinterpret_cast<int32_t*>(hdr + 8); return true; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+    static bool GuardedPtr(uint8_t* at, UObject** out) {
+        __try { *out = *reinterpret_cast<UObject**>(at); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+    static bool GuardedFName(UObject* o, FName* out) {
+        __try { *out = o->GetNamePrivate(); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+    void NotifyQueueTick(UObject* pawn, bool inDlg, uint64_t now) {
+        if (now - m_lastNqMs < 30) return;
+        m_lastNqMs = now;
+        UObject* mesh = ObjProp(pawn, STR("Mesh")); if (!mesh) return;
+        UObject* pp = ObjProp(mesh, STR("PostProcessAnimInstance"));
+        int dis = -1;
+        if (FProperty* p = mesh->GetPropertyByNameInChain(STR("bDisablePostProcessBlueprint")))
+            if (FBoolProperty* bp = CastField<FBoolProperty>(p)) { uint8_t* raw = p->ContainerPtrToValuePtr<uint8_t>(mesh); if (raw) dis = bp->GetPropertyValue(raw) ? 1 : 0; }
+        int n = -1; StringType names;
+        if (pp) {
+            if (pp->GetClassPrivate() != m_nqClass) {
+                m_nqClass = pp->GetClassPrivate(); m_nqArrOff = -1; m_nqSrcOff = -1;
+                FStructProperty* qp = CastField<FStructProperty>(pp->GetPropertyByNameInChain(STR("NotifyQueue")));
+                if (qp) for (FProperty* q : TFieldRange<FProperty>(qp->GetStruct(), EFieldIterationFlags::None)) {
+                    FArrayProperty* ap = CastField<FArrayProperty>(q);
+                    if (!ap || q->GetName() != STR("AnimNotifies")) continue;
+                    m_nqArrOff = qp->GetOffset_ForInternal() + q->GetOffset_ForInternal();
+                    m_nqElemSize = ap->GetInner()->GetElementSize();
+                    if (FStructProperty* ep = CastField<FStructProperty>(ap->GetInner()))
+                        for (FProperty* e : TFieldRange<FProperty>(ep->GetStruct(), EFieldIterationFlags::None))
+                            if (e->GetName() == STR("NotifySource")) m_nqSrcOff = e->GetOffset_ForInternal();
+                }
+                Output::send<LogLevel::Verbose>(STR("[Probe] nq layout class={} arrOff={} elem={} srcOff={}\n"), ClassName(pp), m_nqArrOff, m_nqElemSize, m_nqSrcOff);
+            }
+            uint8_t* data = nullptr; int32_t num = -1;
+            if (m_nqArrOff >= 0 && GuardedArrayHeader(reinterpret_cast<uint8_t*>(pp) + m_nqArrOff, &data, &num) && num >= 0 && num < 4096) {
+                n = num;
+                for (int32_t i = 0; i < num && i < 6 && data && m_nqSrcOff >= 0; ++i) {
+                    UObject* src = nullptr; StringType sn = STR("?");
+                    FName fn;
+                    if (GuardedPtr(data + (int64_t)i * m_nqElemSize + m_nqSrcOff, &src) && src && GuardedFName(src, &fn)) sn = fn.ToString();
+                    names += sn + STR(" ");
+                }
+            }
+        }
+        if (dis == 1 && n > 0) { if (!m_staleSinceMs) m_staleSinceMs = now; } else m_staleSinceMs = 0;
+        bool switched = dis != m_prevPpDis;
+        bool staleChanged = dis == 1 && n != m_prevNq;
+        bool staleRepeat = m_staleSinceMs && now - m_lastStaleLogMs > 1000;
+        if (switched || staleChanged || staleRepeat) {
+            m_lastStaleLogMs = now;
+            Output::send<LogLevel::Verbose>(STR("[Probe] nq dlg={} layerOff={} queued={} [{}] staleFor={}ms\n"),
+                inDlg ? 1 : 0, dis, n, names, m_staleSinceMs ? now - m_staleSinceMs : 0);
+        }
+        m_prevPpDis = dis; m_prevNq = n;
+    }
+
     auto on_update() -> void override {
         uint64_t hb = GetTickCount64();
         // Same lookup the shipped DLL uses; it must load before UObjectCacheMod in mods.txt.
@@ -229,6 +292,10 @@ public:
         const wchar_t* how = pawn ? STR("FindFirstOf(PC)") : STR("none");
         std::vector<UObject*> pcs; std::vector<UObject*> pcClass;
         if (pawn && pawn->IsUnreachable()) { pawn = nullptr; how = STR("unreachable"); }
+        if (pawn) {
+            bool inDlgN = false; if (UFunction* f = Fn(pawn, STR("IsInStaticDialog"))) { struct { bool R = false; } p; if (GuardedProcessEvent(pawn, f, &p)) inDlgN = p.R; }
+            NotifyQueueTick(pawn, inDlgN, hb);
+        }
         if (hb - m_lastHeartbeatMs > 5000) {
             m_lastHeartbeatMs = hb;
             Output::send<LogLevel::Verbose>(STR("[Probe] heartbeat via={} controllers={} pcObjs={} pawn={}\n"), how, pcs.size(), pcClass.size(), pawn ? pawn->GetFullName() : StringType(STR("null")));

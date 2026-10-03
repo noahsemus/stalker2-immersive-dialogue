@@ -332,10 +332,11 @@ Settings` option is ticked; the game ignores it, harmless.
 
 **Stale move-input watchdog (2.1.1).** Nexus report 2026-09-25
 (wyruzzah1987): footsteps looped nonstop after walking far from the NPC, until
-the next conversation. Rare (Noah reproduced it once). Cause: the handler's
-`Completed` never fired (probably the game ended the dialogue, `DialogDistance =
-5.0` in CoreVariables, and swapped the mapping context while a key was held), so
-`Movement Input Vector` stayed non-zero. Variables `DlgMoveFed` (Boolean) and
+the next conversation. Rare (Noah reproduced it once). Assumed cause (wrong, see
+§5.7 "Notify flush"; reports continued on 2.1.1): the handler's `Completed` never
+fired, so `Movement Input Vector` stayed non-zero. (`DialogDistance = 5.0` in
+CoreVariables is the LookAt manager's distance; walking away does not end a
+conversation.) Kept: harmless. Variables `DlgMoveFed` (Boolean) and
 `DlgMoveFedTime` (Float).
 - Comment box **`Move feed: stamp`**: after the handler's in-dialogue
   `Set Move Vector`, `SET DlgMoveFed` true (`fed: true`) -> `SET DlgMoveFedTime`
@@ -483,6 +484,18 @@ Engineering detail and the dead ends are in `zonekit/README.md` § "No
   (crash, parallel anim task not awaited).
 - `Body layer: dialogue only` — `Is In Static Dialog AND NOT Is In Cinematic` →
   `Set Disable Post Process Blueprint` false / true.
+- `Body layer: flush stale notifies` (2.1.2, pasted from
+  `zonekit/tools/gen_subsystem_notify_flush.py`; variables `BodyLayerWasOn`,
+  `BodyLayerFlush` from `add_flush_vars.py`). "body layer on" → `SET BodyLayerWasOn`
+  true; "body layer off" → Branch `layer just went off?` true → was-on false, flush
+  true; false → Branch `flush now?` → `SET Disable Post Process Blueprint` false
+  ("flush: re-init clears stale notifies") → true ("flush: off again") → flush false.
+  **Why:** the mesh dispatches a disabled post-process instance's queued notifies
+  every frame and nothing empties them until it updates or re-initialises, so a
+  conversation ending on a footstep frame left that footstep repeating until the
+  next conversation (Nexus "nonstop footsteps", 09-25 and 10-02). Re-enabling runs
+  `InitializeAnimation`, which resets the queue; done one tick after switching off,
+  when the layer is not being evaluated (same state as every dialogue start).
 
 **`Runtime/ABP_ImmDlgBody`** (duplicate of the 2.0.4 `AnimBP_Player`, parent
 `AnimInstancePlayer`):

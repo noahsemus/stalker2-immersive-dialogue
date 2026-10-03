@@ -58,7 +58,7 @@ paks alongside, matching your normal FOV:
 
 ### Vortex
 
-1. Download `ImmersiveDialogue-v2.1.1.zip` from Nexus or this repo's Releases
+1. Download `ImmersiveDialogue-v2.1.2.zip` from Nexus or this repo's Releases
    page and drop it into Vortex.
 2. Vortex sees more than one pak in the zip and asks which files to install:
    tick the six files of the mod (`zzz_ImmersiveDialogue_20_P.*` and
@@ -70,7 +70,7 @@ paks alongside, matching your normal FOV:
 
 ### Manual
 
-1. Get `ImmersiveDialogue-v2.1.1.zip` from the latest release.
+1. Get `ImmersiveDialogue-v2.1.2.zip` from the latest release.
 2. Copy the six files from its `Main` folder
    ```
    zzz_ImmersiveDialogue_20_P.pak
@@ -170,6 +170,9 @@ GitHub issues, or the Nexus page (mod 2698).
 
 ## Versions
 
+- **2.1.2** — the real fix for stuck footsteps: a conversation that ended on the
+  exact frame of a footstep left that footstep repeating until the next
+  conversation.
 - **2.1.1** — fixes footsteps that could keep playing nonstop after walking
   away from an NPC in a conversation, until the next conversation. Rare.
 - **2.1.0** — no longer replaces the player animation file, so watch and
